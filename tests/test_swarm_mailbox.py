@@ -48,6 +48,14 @@ class TestMailbox(unittest.TestCase):
         with self.assertRaises(ValueError):
             mb.post("run3", "seatA", "gossip", "not a valid kind")
 
+    def test_invalid_unicast_recipient_refused(self):
+        """A unicast to a garbage seat must fail loudly, never mint a
+        malformed @topic (kills BRANCH_FORCE_FALSE on the _valid_seat guard)."""
+        mb.init("run3u")
+        with self.assertRaises(ValueError) as ctx:
+            mb.post("run3u", "seatA", "reply", "text", to="../escape")
+        self.assertIn("invalid recipient seat", str(ctx.exception))
+
     def test_every_valid_kind_posts(self):
         """The full closed vocabulary, enumerated here on purpose (checker
         duplicates the list rather than importing intent from prose)."""
