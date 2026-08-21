@@ -51,6 +51,14 @@ out="$("$COMMS" init "$RUN" 2>&1)"; rc=$?
 check "init reaches mailbox, honors COMMS_ROOT" 0 "$rc" "$out" "$COMMS_ROOT/comms-$RUN"
 out="$("$COMMS" post "$RUN" alpha bogus-kind "x" 2>&1)"; rc=$?
 check "post invalid kind preserves mailbox exit 1" 1 "$rc" "$out" "invalid kind"
+out="$("$COMMS" post "$RUN" alpha banana "x" 2>&1)"; rc=$?
+check "post unknown kind banana still fails loud" 1 "$rc" "$out" "invalid kind"
+out="$("$COMMS" post "$RUN" alpha comment "mid-run comment" --topic t0 2>&1)"; rc=$?
+check "post kind comment exits 0" 0 "$rc" "$out" "mid-run comment"
+out="$("$COMMS" post "$RUN" alpha reply "mid-run reply" --topic t0 2>&1)"; rc=$?
+check "post kind reply exits 0" 0 "$rc" "$out" "mid-run reply"
+out="$("$COMMS" post "$RUN" alpha status "progress note" --topic t0 2>&1)"; rc=$?
+check "post kind status exits 0" 0 "$rc" "$out" "progress note"
 out="$("$COMMS" post "$RUN" alpha finding "hello-topic" --topic t1 2>&1)"; rc=$?
 check "post valid finding exits 0" 0 "$rc" "$out" "hello-topic"
 out="$("$COMMS" read "$RUN" beta --topic t1 2>&1)"; rc=$?
