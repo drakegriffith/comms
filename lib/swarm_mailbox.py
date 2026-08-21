@@ -68,6 +68,16 @@ pre-subscription whole-board behavior. read_siblings and its --topic filter are
 unchanged. New rows are byte-identical to old ones except a unicast row carries
 one extra "to" key; a fan-out row is unchanged.
 
+DISCOVERY: run_ids() lists every runid currently under the mailbox root, for
+callers that mirror or poll ALL runs rather than one named runid (e.g. a
+--follow-all loop that does not know the runid set up front and must notice a
+new run appearing). Like every path helper in this module it reads _root()
+fresh on each call rather than caching it -- a cached root is the same footgun
+_root()'s own docstring warns about: an import-time snapshot pins whatever
+COMMS_ROOT was (or was not) set before the first import, so a caller that sets
+COMMS_ROOT afterward -- the normal case for a test fixture or a per-invocation
+env override -- would silently keep discovering runs in the wrong root.
+
 CLI:
   swarm_mailbox.py init <runid>
   swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]      # register a seat's topic set
@@ -108,6 +118,30 @@ def _root():
 
 def _dir(runid):
     return os.path.join(_root(), "comms-%s" % runid)
+
+
+def run_ids():
+    """Sorted list of every runid currently present under the mailbox root
+    (every "comms-*" directory, prefix stripped).
+
+    Discovery helper for adapters that mirror across ALL runs at once (e.g.
+    a --follow-all poll loop) instead of one runid at a time. Calls _root()
+    fresh -- same reason as every other call in this module: caching it
+    would pin whatever root was set at import time and silently ignore
+    COMMS_ROOT set afterward (see _root docstring).
+    """
+    root = _root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    prefix = "comms-"
+    ids = [
+        name[len(prefix):]
+        for name in names
+        if name.startswith(prefix) and os.path.isdir(os.path.join(root, name))
+    ]
+    return sorted(ids)
 
 
 def init(runid):
