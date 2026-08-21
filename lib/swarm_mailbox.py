@@ -93,6 +93,14 @@ import sys
 
 VALID_KINDS = ("finding", "claim", "blocker", "comment", "reply", "status")
 
+# The subset of VALID_KINDS that count as agent-to-agent CONVERSATION rather
+# than a status/progress broadcast -- the discord mirror's convo lane uses
+# this (plus any unicast row, any kind) to decide what mirrors to the
+# conversation channel. Lives next to VALID_KINDS, not in the mirror, so the
+# two vocabularies (what a row CAN be vs. what counts as chatter) stay next
+# to each other and a future kind addition forces a look at both.
+CONVO_KINDS = ("comment", "reply")
+
 # A unicast row (a message to one seat) rides a reserved topic "@<seat>". A real
 # topic must never start with this, or a fan-out topic could impersonate a direct
 # address. Enforced in post() for the `to` path; real topics are caller-supplied

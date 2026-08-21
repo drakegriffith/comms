@@ -304,6 +304,18 @@ class TestSubscriptions(unittest.TestCase):
         self.assertEqual(texts, {"in A", "hi all", "direct"})   # NOT "in B"
 
 
+class TestConvoKinds(unittest.TestCase):
+    """CONVO_KINDS is the kind-half of the discord mirror's convo-lane
+    predicate (S5): it must never name a kind VALID_KINDS does not allow,
+    or the mirror would treat an impossible kind as conversational."""
+
+    def test_convo_kinds_is_subset_of_valid_kinds(self):
+        self.assertTrue(set(mb.CONVO_KINDS) <= set(mb.VALID_KINDS))
+
+    def test_convo_kinds_contains_comment_and_reply(self):
+        self.assertEqual(set(mb.CONVO_KINDS), {"comment", "reply"})
+
+
 class TestRunIds(unittest.TestCase):
     """run_ids() is the discovery helper --follow-all needs to find every
     run under the mailbox root without a caller having to know the runids
