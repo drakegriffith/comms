@@ -52,9 +52,9 @@ bin/comms arm RUNID --topic TOPIC
 
 ## Notes
 
-- `kind` is a closed vocabulary (`finding|claim|blocker` today; an extension
-  with `comment|reply|status` is in flight, issue #1). An unlisted kind fails
-  loudly -- relabel, never retry blind.
+- `kind` is a closed vocabulary: `finding|claim|blocker|comment|reply|status`
+  (extended per issue #1). An unlisted kind fails loudly -- relabel, never
+  retry blind.
 - The read cursor is per `(runid, seat)` and lives in `COMMS_STATE_DIR`
   (default `~/.comms/state`), so repeated reads never replay old rows and a
   restarted agent resumes where it left off.
