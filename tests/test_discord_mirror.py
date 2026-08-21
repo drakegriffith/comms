@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "discord"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
 
 import mirror  # noqa: E402
+import swarm_arm  # noqa: E402
 import swarm_mailbox  # noqa: E402
 
 RUNID = "mirror-test"
@@ -104,6 +105,75 @@ def test_machine_label_falls_back_to_short_hostname(monkeypatch):
     monkeypatch.delenv("COMMS_MACHINE_LABEL", raising=False)
     label = mirror.machine_label()
     assert label and "." not in label
+
+
+# ---- enrollment identity (display-only; joined by seat at format time) ----
+
+
+def test_format_row_with_full_identity():
+    row = {"seat": "kimi1", "kind": "finding", "text": "hook rot in leg 2"}
+    identity = {"model": "Kimi K3", "project": "agent-os", "area": "hooks/"}
+    assert (
+        mirror.format_row(row, "macbook", identity)
+        == "[macbook] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: hook rot in leg 2"
+    )
+
+
+def test_format_row_with_partial_identity_drops_absent_parts():
+    row = {"seat": "kimi1", "kind": "finding", "text": "t"}
+    assert (
+        mirror.format_row(row, "macbook", {"model": "Opus 5"})
+        == "[macbook] Opus 5 | seat kimi1 | finding: t"
+    )
+    assert (
+        mirror.format_row(row, "macbook", {"project": "agent-os"})
+        == "[macbook] on agent-os | seat kimi1 | finding: t"
+    )
+
+
+def test_format_row_without_identity_is_byte_identical_to_old_format():
+    row = {"seat": "alpha", "kind": "finding", "text": "cursor landed"}
+    old = "[studio/alpha] finding: cursor landed"
+    assert mirror.format_row(row, "studio") == old
+    assert mirror.format_row(row, "studio", None) == old
+    assert mirror.format_row(row, "studio", {}) == old
+
+
+def test_enroll_identity_roundtrips_through_roster():
+    swarm_arm.arm(RUNID)
+    assert swarm_arm.enroll(
+        RUNID, "agent-k", seat="kimi1",
+        model="Kimi K3", project="agent-os", area="hooks/",
+    )
+    assert swarm_arm.seat_identities(RUNID) == {
+        "kimi1": {"model": "Kimi K3", "project": "agent-os", "area": "hooks/"}
+    }
+
+
+def test_enroll_without_identity_yields_empty_roster_map():
+    swarm_arm.arm(RUNID)
+    assert swarm_arm.enroll(RUNID, "agent-a", seat="alpha", topics="t1")
+    assert swarm_arm.seat_identities(RUNID) == {}
+    # And with no arm state at all (the common pre-identity case): still {}.
+    assert swarm_arm.seat_identities("never-armed") == {}
+
+
+def test_once_joins_identity_from_enrollment(webhook):
+    swarm_arm.arm(RUNID)
+    swarm_arm.enroll(
+        RUNID, "agent-k", seat="kimi1",
+        model="Kimi K3", project="agent-os", area="hooks/",
+    )
+    swarm_mailbox.post(RUNID, "kimi1", "finding", "identity rendered")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "no identity here")
+    assert mirror.run_once(RUNID) == 0
+    content = webhook.requests[0]["content"]
+    # Enrolled seat: rich line. Un-enrolled sibling in the SAME batch: old line.
+    assert (
+        "[studio] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: identity rendered"
+        in content
+    )
+    assert "[studio/alpha] finding: no identity here" in content
 
 
 # ---- mirroring, batching, cursor -----------------------------------------

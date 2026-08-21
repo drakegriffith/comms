@@ -13,6 +13,12 @@ is the write-side gate, and it is being extended on a parallel branch
 (comment|reply|status). A mirror that hardcoded the vocabulary would silently
 drop the new kinds; this one renders whatever the row carries.
 
+IDENTITY: a seat that enrolled with --model/--project/--area (lib/swarm_arm)
+renders as human-readable prose -- "[machine] Kimi K3 on agent-os (hooks/) |
+seat kimi1 | finding: ..." -- joined row.seat -> roster at format time. A seat
+without identity renders in the pre-identity "[machine/seat] kind: text"
+format, byte-identical. Identity is display-only and never gates anything.
+
 WHAT IS NOT MIRRORED: claims, arming, subscriptions, cursors -- machine-local
 state stays machine-local. Command direction (Discord -> machine) is out of
 scope; durable commands go through the GitHub board.
@@ -57,6 +63,7 @@ import urllib.request
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
 
 # Reserved observer seat name handed to read_siblings so the mirror sees every
@@ -125,15 +132,36 @@ def machine_label():
     return os.environ.get("COMMS_MACHINE_LABEL") or socket.gethostname().split(".")[0]
 
 
-def format_row(row, machine):
-    """One line per row: [machine/seat] kind: first 300 chars of text."""
+def format_row(row, machine, identity=None):
+    """One line per row, first 300 chars of text.
+
+    IDENTITY: `identity` is the seat's enrollment metadata (swarm_arm
+    seat_identities: {model, project, area}, declared keys only), joined to
+    the row BY SEAT at format time. It is display-only prose for the human
+    watching the channel -- never parsed, never gating. With identity:
+
+        [machine] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: text
+
+    Any subset of the three fields renders (absent parts drop out). Without
+    identity the line is the pre-identity format, byte-identical:
+
+        [machine/seat] finding: text
+    """
     text = str(row.get("text", ""))[:TEXT_CAP].replace("\n", " ")
-    return "[%s/%s] %s: %s" % (
-        machine,
-        row.get("seat", "?"),
-        row.get("kind", "?"),
-        text,
-    )
+    seat = row.get("seat", "?")
+    kind = row.get("kind", "?")
+    if identity:
+        parts = []
+        if identity.get("model"):
+            parts.append(str(identity["model"]))
+        if identity.get("project"):
+            parts.append("on %s" % identity["project"])
+        if identity.get("area"):
+            parts.append("(%s)" % identity["area"])
+        return "[%s] %s | seat %s | %s: %s" % (
+            machine, " ".join(parts), seat, kind, text
+        )
+    return "[%s/%s] %s: %s" % (machine, seat, kind, text)
 
 
 def _load_cursor(runid):
@@ -175,14 +203,15 @@ def collect_new(runid):
     return fresh, new_cursor
 
 
-def chunk_rows(rows, machine, cap=CONTENT_CAP):
+def chunk_rows(rows, machine, cap=CONTENT_CAP, identities=None):
     """Batch rows into as few Discord messages as fit under the content cap.
     Returns a list of (content, rows_in_chunk) so a failed POST can name
-    exactly which rows it skipped."""
+    exactly which rows it skipped. `identities` (optional) maps seat ->
+    enrollment identity for format_row; omitted = identity-free rendering."""
     chunks = []
     cur_lines, cur_rows, size = [], [], 0
     for row in rows:
-        line = format_row(row, machine)
+        line = format_row(row, machine, (identities or {}).get(row.get("seat")))
         if cur_lines and size + 1 + len(line) > cap:
             chunks.append(("\n".join(cur_lines), cur_rows))
             cur_lines, cur_rows, size = [], [], 0
@@ -261,8 +290,12 @@ def run_once(runid):
     fresh, new_cursor = collect_new(runid)
     if not fresh:
         return 0
+    # Enrollment identity, read once per pass and joined by seat in
+    # format_row. A run with no arm state (or a pre-identity roster) yields
+    # {} and every line renders in the identity-free format.
+    identities = swarm_arm.seat_identities(runid)
     skipped = False
-    for content, chunk in chunk_rows(fresh, machine):
+    for content, chunk in chunk_rows(fresh, machine, identities=identities):
         if not post_content(url, content):
             _log_skipped(runid, chunk, "webhook delivery failed")
             skipped = True

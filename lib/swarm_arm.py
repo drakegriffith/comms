@@ -131,7 +131,11 @@ def _as_topics(topics):
     return [t.strip() for t in topics if t and t.strip()]
 
 
-def enroll(runid, agent_id, topics=None, seat=None, state_dir=None):
+IDENTITY_FIELDS = ("model", "project", "area")
+
+
+def enroll(runid, agent_id, topics=None, seat=None, state_dir=None,
+           model=None, project=None, area=None):
     """Record agent_id as a participant of runid. Idempotent, write-once so a
     later empty subscription never clobbers an earlier one. Returns True on
     enroll, False if the run is not armed (you cannot join a run that does not
@@ -142,6 +146,14 @@ def enroll(runid, agent_id, topics=None, seat=None, state_dir=None):
     the subscription-set filter the heartbeat header documents; it subsumes the
     single-topic case (a one-element set) and the comma-set case. `seat`
     (optional) lets the reader also receive its own unicast topic "@<seat>".
+
+    `model`/`project`/`area` are IDENTITY metadata: free-text prose describing
+    who this seat is for a human reading a dashboard (e.g. "Kimi K3" working
+    "agent-os" in "hooks/"). Display-only by design -- identity never gates
+    routing, delivery, or enrollment, so it is an open vocabulary, not a
+    closed one. Written only when declared, so a roster row enrolled without
+    identity stays byte-identical to the pre-identity format. New kwargs sit
+    AFTER state_dir so every existing positional caller is untouched.
     """
     if not is_armed(runid, state_dir):
         return False
@@ -149,9 +161,46 @@ def enroll(runid, agent_id, topics=None, seat=None, state_dir=None):
     os.makedirs(pdir, exist_ok=True)
     path = os.path.join(pdir, _safe(agent_id))
     if not os.path.exists(path):
+        data = {"topics": _as_topics(topics), "seat": (seat or None)}
+        for key, val in zip(IDENTITY_FIELDS, (model, project, area)):
+            if val:
+                data[key] = val
         with open(path, "w") as fh:
-            json.dump({"topics": _as_topics(topics), "seat": (seat or None)}, fh)
+            json.dump(data, fh)
     return True
+
+
+def seat_identities(runid, state_dir=None):
+    """Map seat -> identity dict ({model, project, area}, declared keys only)
+    for every enrolled participant that declared a seat and any identity field.
+
+    This is the read side of the identity metadata above: a consumer (the
+    Discord mirror) joins mailbox rows to it BY SEAT NAME at format time.
+    Participants without a seat or without identity are simply absent, so a
+    pre-identity roster yields {} and every consumer falls back to its
+    identity-free rendering. First seat occurrence wins (participants are read
+    in sorted filename order, so the winner is deterministic); seats are
+    unique per run in practice.
+    """
+    pdir = _participants_dir(runid, state_dir)
+    try:
+        names = sorted(os.listdir(pdir))
+    except OSError:
+        return {}
+    out = {}
+    for name in names:
+        try:
+            with open(os.path.join(pdir, name)) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        seat = data.get("seat")
+        ident = {k: data[k] for k in IDENTITY_FIELDS if data.get(k)}
+        if seat and ident and seat not in out:
+            out[seat] = ident
+    return out
 
 
 def is_participant(runid, agent_id, state_dir=None):
@@ -236,7 +285,7 @@ def sub_from_command(payload):
     return (topics, seat)
 
 
-_FLAGS = ("--topic", "--topics", "--agent-id", "--seat")
+_FLAGS = ("--topic", "--topics", "--agent-id", "--seat", "--model", "--project", "--area")
 
 
 def _usage():
@@ -244,6 +293,7 @@ def _usage():
         "usage: swarm_arm.py arm <runid> [--topic <set>]\n"
         "       swarm_arm.py disarm <runid>\n"
         "       swarm_arm.py enroll <runid> [--agent-id <id>] [--topics <set>] [--seat <name>]\n"
+        "                    [--model <name>] [--project <repo>] [--area <path>]\n"
         "       swarm_arm.py is-participant <runid> <agent_id>\n"
         "       swarm_arm.py status [<runid>]\n"
     )
@@ -288,7 +338,8 @@ def main(argv):
             # this WITHOUT --agent-id: the command is then only the observable
             # opt-in marker, and the heartbeat does the roster write with the
             # agent_id from the live payload.
-            ok = enroll(runid, agent_id, topics=opt("--topics"), seat=opt("--seat"))
+            ok = enroll(runid, agent_id, topics=opt("--topics"), seat=opt("--seat"),
+                        model=opt("--model"), project=opt("--project"), area=opt("--area"))
             print("enrolled" if ok else "not-armed")
             return 0 if ok else 1
         # Marker-only invocation.

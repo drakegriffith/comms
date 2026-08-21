@@ -44,6 +44,9 @@ arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):
   arm       <runid> [--topic <set>]
   disarm    <runid>
   enroll    <runid> [--agent-id <id>] [--topics <set>] [--seat <name>]
+            [--model <name>] [--project <repo>] [--area <path>]
+            (model/project/area: free-text identity for dashboards, e.g.
+             --model "Kimi K3" --project agent-os --area hooks/)
   status    [<runid>]
 
 claims (lib/swarm_claims.py; exit 0 ok, 1 conflict/refused/nothing-reaped,

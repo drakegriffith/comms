@@ -93,6 +93,17 @@ out="$("$COMMS" enroll "$RUN" --agent-id agent-a --topics t1 --seat alpha 2>&1)"
 check "enroll with agent-id on armed run exits 0" 0 "$rc" "$out" "enrolled"
 out="$("$COMMS" enroll "$RUN" 2>&1)"; rc=$?
 check "marker-only enroll on armed run exits 0" 0 "$rc" "$out" "enrollment signalled"
+out="$("$COMMS" enroll "$RUN" --agent-id agent-k --seat kimi1 \
+      --model "Kimi K3" --project agent-os --area hooks/ 2>&1)"; rc=$?
+check "enroll with identity metadata exits 0" 0 "$rc" "$out" "enrolled"
+out="$(python3 -c "
+import sys, json
+sys.path.insert(0, '$SELF_DIR/../lib')
+import swarm_arm
+print(json.dumps(swarm_arm.seat_identities('$RUN'), sort_keys=True))
+" 2>&1)"; rc=$?
+check "identity metadata roundtrips through the roster" 0 "$rc" "$out" \
+      '"kimi1": {"area": "hooks/", "model": "Kimi K3", "project": "agent-os"}'
 
 # ---- claims routing on the armed run ---------------------------------------
 out="$("$COMMS" claim "$RUN" alpha /tmp/x 2>&1)"; rc=$?

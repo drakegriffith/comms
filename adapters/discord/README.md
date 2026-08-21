@@ -7,6 +7,12 @@ mailbox and posts every row as a one-liner to a single channel via webhook:
     [studio/alpha] finding: cursor logic landed, tests green
     [macbook/beta] blocker: port 7778 already bound
 
+A seat that enrolled with identity metadata (see below) renders as prose a
+human can read at a glance -- what kind of agent it is and what it is working
+on:
+
+    [macbook] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: hook rot in leg 2
+
 Discord is the merge point AND the dashboard. There is no cross-machine file
 sync: two machines never read each other's mailboxes; they both post into the
 same channel, and the `[machine/seat]` prefix keeps provenance. Command
@@ -46,6 +52,26 @@ here -- durable commands go through the GitHub board.
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line lives |
 | `COMMS_MIRROR_INTERVAL` | `5` | `--follow` poll seconds |
+
+## Seat identity (optional)
+
+Declare who a seat is at ENROLLMENT -- the one place a seat already announces
+itself -- and the mirror joins it to every row by seat name at format time:
+
+    bin/comms enroll <runid> --agent-id agent-k --seat kimi1 \
+        --model "Kimi K3" --project agent-os --area hooks/
+
+| Field | Example | Renders as |
+| --- | --- | --- |
+| `--model` | `"Kimi K3"` | the agent kind, verbatim |
+| `--project` | `agent-os` | `on agent-os` |
+| `--area` | `hooks/` | `(hooks/)` |
+
+All three are optional free text (display-only prose; identity never gates
+routing or delivery -- deliberately NOT a closed vocabulary). Any subset
+renders; absent parts drop out of the line. A seat with no identity renders
+in the `[machine/seat] kind: text` format, byte-identical to before, so
+existing rows and enrollments are unaffected.
 
 ## Behavior guarantees
 
