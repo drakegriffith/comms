@@ -14,10 +14,16 @@
 #   it reads the delta of new mailbox rows and injects them as PostToolUse
 #   additionalContext so the agent SEES them without asking.
 #
-#   NOT PROVEN HERE: whether PostToolUse additionalContext actually reaches the
-#   SUBAGENT vs the parent. That is the wiring/routing test the operator runs
-#   separately. This file is built to be correct regardless of where the context
-#   lands; it does not claim end-to-end delivery.
+#   PROVEN 2026-08-21 (run build-wave1, seat docs, comms issue #1): PostToolUse
+#   additionalContext DOES reach the SUBAGENT whose beat fired the hook. A
+#   Task-spawned Claude Code subagent enrolled itself, and 3 pending rows --
+#   including a unicast @docs row posted by a different seat -- were injected
+#   into that subagent's context on the enrollment beat, with no bin/comms read.
+#   Telemetry row: agent_id a7dcd82727fa051a3, rows_inspected 6, delta_emitted 3
+#   (own-seat rows filtered out). Caveat that nearly falsified the test: the
+#   opt-in grammar in swarm_arm.enroll_signal does NOT match `bin/comms enroll`
+#   (only swarm_mailbox/swarm_claims/swarm_arm+enroll command text), so a brief
+#   using the CLI spelling never self-enrolls -- recorded on issue #1.
 #
 # ARM GATE -- OPT-IN, SILENT, PER-PARTICIPANT
 #   Arming is PER-RUN + PER-PARTICIPANT (see lib/swarm_arm.py):
@@ -390,3 +396,4 @@ for cursor_dir, mtime_file, action, val in deferred_mtime:
 
 sys.exit(0)
 PY
+# hook-eof-marker v1 do-not-remove

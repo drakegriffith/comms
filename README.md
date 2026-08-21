@@ -4,6 +4,41 @@ A standalone, model-agnostic communication stack for coordinating multiple LLM
 CLI agents on one machine. Any runtime that can run a shell command can
 participate; nothing here depends on any particular agent harness.
 
+## The headline use: commenting into a live run
+
+Most multi-agent setups only let agents talk at the edges: one finishes, commits,
+and the next reads the diff. This stack's point is the middle: **agent B comments
+into agent A's run while A is still working, and A reads it and replies before it
+finishes.** The primitive is the unicast channel `@<seat>` -- a row posted with
+`--to <seat>` lands only in that seat's slice, delivered by push injection on
+hook-capable runtimes or by A's own `bin/comms read` on polling ones.
+
+Worked example, distilled from a real two-seat run (2026-08-21, run
+`demo-drake1`; see issue #1). Seat alpha was running test suites and posting
+findings; seat beta was listening and challenging each one mid-run:
+
+```
+alpha  finding  research  test_swarm_heartbeat.sh: PASS, 64 tests ran (exit 0)
+beta   @alpha   is that 64 a count the runner DERIVED from enumerating test
+                functions, or a pinned expectation inside the script?
+alpha  @beta    DERIVED, not pinned -- pass/fail counters increment inside the
+                ck/contains helpers at execution time; no hardcoded 64 anywhere.
+beta   @alpha   exposed hole then: with no -e and no plan, an early return from
+                a scenario yields pass=40 fail=0 and still exits green.
+alpha  @beta    agreed -- executed==static-callsite-count is a derivable oracle,
+                no pin, catches early-return shrinkage. Conceded.
+```
+
+Six challenge/response exchanges ran through the mailbox in that demo, and two
+ended in honest concessions by the seat doing the work -- while it was still
+working. That is the product: review pressure applied mid-run, not post-hoc.
+
+Vocabulary note: rows currently carry `kind` in a closed set
+(`finding|claim|blocker`), so the demo's comments went out as `kind=finding` and
+replies as `kind=claim`. Extending the vocabulary with `comment|reply|status` is
+in flight on a parallel branch (issue #1); the set stays closed on purpose --
+an unlisted kind is a loud error, never a silent default.
+
 ## The model
 
 - File-backed mailbox, one writer per file. Each seat appends to its own
@@ -35,6 +70,8 @@ sugar on top.
 | Claude Code | push     | PostToolUse hook (`adapters/claude-code/`, wired into settings.json by its install.sh) |
 | Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`) |
 | Kimi        | resume-driver | no hook surface; `adapters/kimi/poll-driver.sh` polls and delivers rows as resume turns |
+| pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
+| Discord     | mirror   | `adapters/discord/` mirrors mailbox rows to a channel (in flight, issue #2) |
 | anything else | poll   | `bin/comms read <runid> <seat>` in the agent's own loop |
 
 ## Quickstart
@@ -77,6 +114,7 @@ lib/swarm_claims.py          run-scoped write-set claims arbiter
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
 adapters/kimi/               resume-driver for a runtime with no hook surface
+adapters/pi/                 poll-loop recipe for pi and any hook-less runtime
 tests/                       pytest suites + heartbeat suite + CLI smoke test
 ```
 
