@@ -1,0 +1,85 @@
+#!/bin/bash
+# comms -- thin dispatcher over the comms stack (lib/).
+#
+# ROUTER, NOT A SECOND IMPLEMENTATION: this script only picks which module a
+# subcommand belongs to, then execs that module's own CLI with the remaining
+# arguments passed through verbatim. exec preserves the module's exit code by
+# construction; no argument is re-parsed, no business logic lives here. The
+# modules' docstrings are the authority on arguments and exit codes.
+#
+# lib/ is resolved relative to THIS script's location (the checkout it lives
+# in), never a hardcoded home, so a clone anywhere on any machine routes to
+# its own copy.
+
+set -u
+
+# Chase symlinks before locating the checkout: a PATH install is usually a
+# symlink into ~/bin, and dirname of the SYMLINK points at the wrong tree
+# (caught by the verifier seat, run comms-build-0821: rc=2 masquerading as
+# the usage code, or silent execution of a foreign lib copy).
+SELF="$0"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in
+    /*) SELF="$target" ;;
+    *)  SELF="$(dirname "$SELF")/$target" ;;
+  esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd -P)"   # <repo>/bin
+REPO_ROOT="$(cd "$SELF_DIR/.." && pwd)"           # <repo>
+LIB="$REPO_ROOT/lib"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: comms <subcommand> [args ...]
+
+mailbox (lib/swarm_mailbox.py; exit 0 ok, 1 bad args, 2 usage):
+  init      <runid>
+  subscribe <runid> <seat> <topic> [<topic> ...]
+  post      <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]
+  read      <runid> <seat> [--topic <name>]
+  subs      <runid> <seat>          (this seat's subscribed slice; = read --subs)
+
+arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):
+  arm       <runid> [--topic <set>]
+  disarm    <runid>
+  enroll    <runid> [--agent-id <id>] [--topics <set>] [--seat <name>]
+  status    [<runid>]
+
+claims (lib/swarm_claims.py; exit 0 ok, 1 conflict/refused/nothing-reaped,
+        2 usage, 3 not-armed):
+  claim     <runid> <owner> <path> [<path> ...]
+  release   <runid> <owner> <path> [<path> ...]
+  who       <runid> [<path>]
+  reap      <runid> <owner>
+EOF
+  exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+sub="$1"
+shift
+
+case "$sub" in
+  init|subscribe|post|read)
+    exec python3 "$LIB/swarm_mailbox.py" "$sub" "$@"
+    ;;
+  subs)
+    # The one aliased spelling: the mailbox module expresses this as a flag on
+    # read, so the router appends that flag. Still the module's logic.
+    exec python3 "$LIB/swarm_mailbox.py" read "$@" --subs
+    ;;
+  arm|disarm|enroll|status)
+    exec python3 "$LIB/swarm_arm.py" "$sub" "$@"
+    ;;
+  claim|release|who|reap)
+    exec python3 "$LIB/swarm_claims.py" "$sub" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    printf 'comms: unknown subcommand %q\n' "$sub" >&2
+    usage
+    ;;
+esac
