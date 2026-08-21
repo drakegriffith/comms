@@ -1,64 +1,111 @@
 #!/bin/bash
-# adapters/claude-code/ambient/install.sh -- idempotent installer for the
-# AMBIENT LANE on the Claude Code runtime.
+# adapters/claude-code/ambient/install.sh -- wire the AMBIENT LANE hooks into
+# settings.json, routed through the dispatch shim. Shape follows the harness's
+# shim-rewire.sh: exact-string entry map, --check dry-run, timestamped backup,
+# staged parse before the real file is touched, atomic os.replace.
 #
-# What it does:
-#   (a) verifies python3 and the lib/ modules exist RELATIVE TO THIS CHECKOUT
-#       (never a hardcoded home);
-#   (b) wires TWO hooks into the target settings.json (default
-#       ~/.claude/settings.json -- the one path in this repo that may name
-#       ~/.claude, because settings.json is owned by the Claude Code runtime
-#       itself; override with COMMS_SETTINGS=<path> for testing) via ONE
-#       python json edit -- an already-present entry is detected and left
-#       alone, unrelated settings are never clobbered, an unparseable file is
-#       REFUSED (refusing beats clobbering):
-#         * SessionStart -> session-start.sh   (no matcher: every session)
-#         * PostToolUse  -> sendmessage-bridge.sh (matcher "SendMessage"; the
-#           script ALSO self-filters on tool_name, so a schema that ignores
-#           the matcher still behaves);
-#   (c) prints (does NOT install) the launchd plist that keeps the Discord
-#       mirror following the standing run `machine-ops`, mirroring the
-#       adapters/discord/install.sh style -- running the mirror is the
-#       operator's move, sequenced by hand.
+# HUMAN-RUN, ON PURPOSE: the permission classifier refuses agent edits to the
+# settings.json hooks block, and that refusal is the AUTHORITY class working
+# as designed, not an obstacle to route around. This script is the command the
+# OPERATOR (Drake) runs by hand:
 #
-# Post-install verification (suites) is deliberately NOT run here, unlike the
-# sibling adapters/claude-code/install.sh: this installer is expected to run
-# while other sessions are live, and the operator sequences verification --
-# `python3 -m pytest tests -q` from the checkout is the command.
+#     bash <checkout>/adapters/claude-code/ambient/install.sh          # apply
+#     bash <checkout>/adapters/claude-code/ambient/install.sh --check  # dry-run
 #
-# Exit codes: 0 installed | 1 failed (including refusal on unparseable JSON).
+# What it wires (idempotent -- an already-present entry is detected by exact
+# command string and left alone; unrelated settings are never clobbered; an
+# unparseable settings file is REFUSED, because refusing beats clobbering):
+#   * SessionStart -> session-start.sh      (no matcher: every session)
+#   * PostToolUse  -> sendmessage-bridge.sh (matcher "SendMessage"; the script
+#     ALSO self-filters on tool_name, so a schema ignoring the matcher still
+#     behaves)
+# BOTH commands route THROUGH the dispatch shim in OBSERVER mode --
+#   bash $HOME/.claude/state/bin/hook-shim.sh observer <abs-path-to-hook>
+# -- because neither hook may ever block a session or a tool call: a torn
+# observer is skipped (exit 0) with a witness row, never failed closed. The
+# shim validates each hook file's final-line completeness marker
+# (# hook-eof-marker v1 do-not-remove) against mid-write tears; both hook
+# scripts here carry it as their final line.
+#
+# Also PRINTS (does NOT install) the launchd plist that keeps the Discord
+# mirror following the standing run `machine-ops`, mirroring the
+# adapters/discord/install.sh style. Post-install verification (suites) is
+# deliberately NOT run here, unlike the sibling adapters/claude-code/
+# install.sh: this runs while other sessions are live; verify when convenient
+# with `python3 -m pytest tests -q` from the checkout.
+#
+# Default target ~/.claude/settings.json -- the one path in this repo that may
+# name ~/.claude, because settings.json is owned by the Claude Code runtime
+# itself; override with COMMS_SETTINGS=<path> for testing.
+#
+# Exit codes: 0 wired (or --check) | 1 failed (incl. refusal on unparseable
+# JSON) | 2 prerequisites missing (shim not installed, incomplete checkout).
 
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"        # <repo>/adapters/claude-code/ambient
 REPO_ROOT="$(cd "$SELF_DIR/../../.." && pwd)"    # <repo>
 SETTINGS="${COMMS_SETTINGS:-$HOME/.claude/settings.json}"
+SHIM="$HOME/.claude/state/bin/hook-shim.sh"
+CHECK=0; [ "${1:-}" = "--check" ] && CHECK=1
 
-fail() { echo "install: FAILED: $*" >&2; exit 1; }
+fail()   { echo "install: FAILED: $*" >&2; exit 1; }
+prereq() { echo "install: PREREQUISITE MISSING: $*" >&2; exit 2; }
 
-# ---- (a) prerequisites, relative to this checkout -------------------------
-command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
+# ---- prerequisites, relative to this checkout -----------------------------
+command -v python3 >/dev/null 2>&1 || prereq "python3 not found on PATH"
 for f in \
     lib/swarm_mailbox.py \
     lib/swarm_arm.py \
     adapters/claude-code/stdin-bounded.sh \
     adapters/claude-code/ambient/session-start.sh \
     adapters/claude-code/ambient/sendmessage-bridge.sh; do
-  [ -e "$REPO_ROOT/$f" ] || fail "missing $REPO_ROOT/$f -- incomplete checkout?"
+  [ -e "$REPO_ROOT/$f" ] || prereq "missing $REPO_ROOT/$f -- incomplete checkout?"
+done
+[ -x "$SHIM" ] || prereq "dispatch shim not installed at $SHIM -- run the harness's hook-shim-install.sh first"
+
+# The shim skips a hook whose final line is not the completeness marker; a
+# checkout that lost the markers would wire two permanently-skipped hooks.
+MARKER='# hook-eof-marker v1 do-not-remove'
+for f in session-start.sh sendmessage-bridge.sh; do
+  [ "$(tail -n 1 "$SELF_DIR/$f")" = "$MARKER" ] \
+    || prereq "$SELF_DIR/$f does not end with the completeness marker; the shim would skip it"
 done
 
-# ---- (b) wire both hooks, idempotently, in one edit -----------------------
-# Hooks are wired by ABSOLUTE PATH to THIS checkout's scripts, so the wiring
-# can never point at a file that does not exist on this machine.
-export COMMS_SESSION_START_CMD="bash $SELF_DIR/session-start.sh"
-export COMMS_BRIDGE_CMD="bash $SELF_DIR/sendmessage-bridge.sh"
+# ---- the edit: exact-string map, staged parse, backup, atomic replace -----
+# Hook paths are ABSOLUTE to THIS checkout; the shim path is literal $HOME,
+# expanded by the shell at hook run time (same convention as shim-rewire.sh).
 export COMMS_SETTINGS_TARGET="$SETTINGS"
-python3 - <<'PY' || fail "settings.json edit failed"
+export COMMS_AMBIENT_DIR="$SELF_DIR"
+CHECK="$CHECK" python3 - <<'PYEOF'
 import json
 import os
+import shutil
 import sys
+import time
 
 path = os.environ["COMMS_SETTINGS_TARGET"]
+amb = os.environ["COMMS_AMBIENT_DIR"]
+check = os.environ.get("CHECK") == "1"
+SHIM = 'bash $HOME/.claude/state/bin/hook-shim.sh'
+
+# Exact-string map of the entries to add: event -> (entry, exact command).
+# Presence is judged on the EXACT command string; a substring cousin (same
+# script, different checkout path) is reported, never touched.
+ENTRIES = {
+    "SessionStart": {
+        "hooks": [{"type": "command",
+                   "command": f"{SHIM} observer {amb}/session-start.sh"}],
+    },
+    "PostToolUse": {
+        "matcher": "SendMessage",
+        "hooks": [{"type": "command",
+                   "command": f"{SHIM} observer {amb}/sendmessage-bridge.sh"}],
+    },
+}
+NAMES = {"SessionStart": "ambient/session-start.sh",
+         "PostToolUse": "ambient/sendmessage-bridge.sh"}
+
 try:
     with open(path) as fh:
         settings = json.load(fh)
@@ -71,59 +118,71 @@ except json.JSONDecodeError as exc:
     sys.exit(1)
 
 hooks = settings.setdefault("hooks", {})
-changed = False
 
 
-def present(event, needle):
-    return any(
-        needle in (h.get("command") or "")
+def commands(event):
+    return [
+        h.get("command") or ""
         for entry in hooks.get(event, [])
         if isinstance(entry, dict)
         for h in (entry.get("hooks") or [])
         if isinstance(h, dict)
-    )
+    ]
 
 
-if present("SessionStart", "ambient/session-start.sh"):
-    print("SessionStart wiring: already present in %s, left untouched" % path)
-else:
-    hooks.setdefault("SessionStart", []).append(
-        {"hooks": [{"type": "command",
-                    "command": os.environ["COMMS_SESSION_START_CMD"]}]}
-    )
-    changed = True
-    print("SessionStart wiring: added ambient session-start entry to %s" % path)
+changed = False
+for event, entry in ENTRIES.items():
+    want = entry["hooks"][0]["command"]
+    have = commands(event)
+    if want in have:
+        print("%s wiring: already present (exact match), left untouched" % event)
+        continue
+    cousins = [c for c in have if NAMES[event] in c]
+    for c in cousins:
+        print("%s NOTE: a different %s entry exists and is left untouched: %s"
+              % (event, NAMES[event], c))
+    verb = "would add" if check else "adding"
+    print("%s wiring: %s: %s" % (event, verb, want))
+    if not check:
+        hooks.setdefault(event, []).append(entry)
+        changed = True
 
-if present("PostToolUse", "ambient/sendmessage-bridge.sh"):
-    print("PostToolUse wiring: already present in %s, left untouched" % path)
-else:
-    hooks.setdefault("PostToolUse", []).append(
-        {"matcher": "SendMessage",
-         "hooks": [{"type": "command",
-                    "command": os.environ["COMMS_BRIDGE_CMD"]}]}
-    )
-    changed = True
-    print("PostToolUse wiring: added ambient sendmessage-bridge entry to %s" % path)
+if check:
+    print("--check: nothing written")
+    sys.exit(0)
+if not changed:
+    print("nothing to do")
+    sys.exit(0)
 
-if changed:
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = path + ".comms-tmp"
-    with open(tmp, "w") as fh:
-        json.dump(settings, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
-PY
+d = os.path.dirname(path)
+if d:
+    os.makedirs(d, exist_ok=True)
+if os.path.exists(path):
+    bak = path + ".pre-ambient." + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, bak)
+    print("backup at %s" % bak)
+tmp = path + ".tmp-ambient"
+with open(tmp, "w") as fh:
+    json.dump(settings, fh, indent=2)
+    fh.write("\n")
+with open(tmp) as fh:
+    json.load(fh)               # parse the staged file before it goes live
+os.replace(tmp, path)           # atomic; a crash never leaves a half-write
+print("written atomically to %s" % path)
+PYEOF
+rc=$?
+[ $rc -ne 0 ] && exit $rc
+[ "$CHECK" = "1" ] && exit 0
 
-# ---- (c) print (do not install) the mirror plist --------------------------
+# ---- print (do not install) the mirror plist ------------------------------
 MIRROR="$REPO_ROOT/adapters/discord/mirror.py"
 cat <<EOF
 
-ambient lane: hooks wired. The Discord side runs separately -- keep the
-mirror following the standing run under launchd (NOT installed by this
-script): save as ~/Library/LaunchAgents/com.comms.discord-mirror.machine-ops.plist,
-then 'launchctl load' it:
+ambient lane: hooks wired through the dispatch shim (observer mode). The
+Discord side runs separately -- keep the mirror following the standing run
+under launchd (NOT installed by this script): save as
+~/Library/LaunchAgents/com.comms.discord-mirror.machine-ops.plist, then
+'launchctl load' it:
 
   <?xml version="1.0" encoding="UTF-8"?>
   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"

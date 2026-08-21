@@ -16,9 +16,18 @@ one terminal was deleting hooks while another, unaware, depended on them.
 - `sendmessage-bridge.sh` -- PostToolUse hook on the SendMessage tool. Posts
   `kind=comment` rows `-> <to>: <summary>` for OUTBOUND peer messages. Both
   sides of a conversation appear when both sessions run the hook.
-- `install.sh` -- wires both hooks into settings.json (idempotent, refuses an
-  unparseable file, never clobbers unrelated keys) and PRINTS the launchd
-  plist for `mirror.py --follow machine-ops`.
+- `install.sh` -- HUMAN-RUN by design (the permission classifier refuses
+  agent edits to the settings hooks block; that refusal is authority working).
+  Wires both hooks into settings.json ROUTED THROUGH the dispatch shim
+  (`bash $HOME/.claude/state/bin/hook-shim.sh observer <hook>`; observer mode
+  because neither hook may ever block). Idempotent by exact command string,
+  refuses an unparseable file, never clobbers unrelated keys; `--check`
+  dry-run prints what would change and writes nothing; a real edit takes a
+  timestamped backup, stages the JSON, parses the staged file, then
+  `os.replace`s atomically. Also PRINTS the launchd plist for
+  `mirror.py --follow machine-ops`. Both hook scripts end with the line
+  `# hook-eof-marker v1 do-not-remove` -- the shim's tear-check reads that
+  exact final line, so a tidy-up must not strip it.
 
 ## Scope
 
@@ -33,10 +42,11 @@ message bodies stay in the mailbox side only -- the bridge posts only the
 `summary` field (or the first 200 chars of `message` when no summary exists),
 and never echoes message contents to stderr or the log.
 
-## Operator install (sequenced by hand, not by agents)
+## Operator install (Drake runs this by hand, not an agent)
 
 ```
-bash <checkout>/adapters/claude-code/ambient/install.sh
+bash <checkout>/adapters/claude-code/ambient/install.sh --check   # dry-run
+bash <checkout>/adapters/claude-code/ambient/install.sh           # apply
 ```
 
 Then save and `launchctl load` the plist it prints.

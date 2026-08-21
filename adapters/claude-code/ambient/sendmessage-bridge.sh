@@ -35,6 +35,13 @@
 # ISOLATION KNOBS (tests set these; production uses the defaults):
 #   COMMS_STATE_DIR  roster state + ambient.log (default ~/.comms/state)
 #   COMMS_ROOT       mailbox root (default /tmp)
+#
+# COMPLETENESS MARKER: the FINAL line of this file is
+#   # hook-eof-marker v1 do-not-remove
+# It is LOAD-BEARING, not a comment to tidy away: the dispatch shim
+# (~/.claude/state/bin/hook-shim.sh) validates a hook file against mid-write
+# tears by checking that exact final line before dispatch. Removing it makes
+# the shim treat this file as torn and skip it.
 
 set -uo pipefail
 
@@ -139,3 +146,4 @@ sys.exit(0)
 PY
 
 exit 0
+# hook-eof-marker v1 do-not-remove

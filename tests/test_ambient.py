@@ -216,15 +216,31 @@ def write_fixture(tmp_path, content):
     return path
 
 
-def run_install(env, settings_path):
+def install_stub_shim(env):
+    """The installer requires the dispatch shim at $HOME/.claude/state/bin/
+    hook-shim.sh (prerequisite check). HOME is the sandbox, so plant an
+    executable stub there -- the installer only checks -x, never runs it."""
+    shim = os.path.join(env["HOME"], ".claude", "state", "bin", "hook-shim.sh")
+    os.makedirs(os.path.dirname(shim), exist_ok=True)
+    with open(shim, "w") as fh:
+        fh.write("#!/bin/bash\nexit 0\n")
+    os.chmod(shim, 0o755)
+
+
+def run_install(env, settings_path, *args):
     e = dict(env)
     e["COMMS_SETTINGS"] = str(settings_path)
     return subprocess.run(
-        ["bash", INSTALL], capture_output=True, text=True, env=e, timeout=60
+        ["bash", INSTALL, *args],
+        capture_output=True, text=True, env=e, timeout=60,
     )
 
 
-def test_installer_wires_both_hooks_preserving_everything_else(env, tmp_path):
+SHIM_PREFIX = "bash $HOME/.claude/state/bin/hook-shim.sh observer "
+
+
+def test_installer_wires_both_hooks_through_shim(env, tmp_path):
+    install_stub_shim(env)
     path = write_fixture(tmp_path, FIXTURE_SETTINGS)
     r = run_install(env, path)
     assert r.returncode == 0, r.stderr
@@ -237,15 +253,19 @@ def test_installer_wires_both_hooks_preserving_everything_else(env, tmp_path):
                      if "sendmessage-bridge.sh" in e["hooks"][0]["command"]]
     assert len(bridge_entries) == 1
     assert bridge_entries[0]["matcher"] == "SendMessage"
+    assert bridge_entries[0]["hooks"][0]["command"] == SHIM_PREFIX + BRIDGE
     ss = got["hooks"]["SessionStart"]
     assert len(ss) == 1
-    assert "ambient/session-start.sh" in ss[0]["hooks"][0]["command"]
+    assert ss[0]["hooks"][0]["command"] == SHIM_PREFIX + SESSION_START
     # the plist is printed, never installed
     assert "com.comms.discord-mirror.machine-ops" in r.stdout
     assert "COMMS_MACHINE_LABEL" in r.stdout
+    # a timestamped backup sits beside the edited file
+    assert any(".pre-ambient." in n for n in os.listdir(tmp_path))
 
 
 def test_installer_idempotent_second_run_byte_identical(env, tmp_path):
+    install_stub_shim(env)
     path = write_fixture(tmp_path, FIXTURE_SETTINGS)
     assert run_install(env, path).returncode == 0
     first = path.read_bytes()
@@ -255,7 +275,20 @@ def test_installer_idempotent_second_run_byte_identical(env, tmp_path):
     assert "already present" in r2.stdout
 
 
+def test_installer_check_mode_touches_nothing(env, tmp_path):
+    install_stub_shim(env)
+    path = write_fixture(tmp_path, FIXTURE_SETTINGS)
+    before = path.read_bytes()
+    r = run_install(env, path, "--check")
+    assert r.returncode == 0, r.stderr
+    assert path.read_bytes() == before          # dry-run wrote nothing
+    assert "would add" in r.stdout              # and said what it would do
+    assert "--check: nothing written" in r.stdout
+    assert list(tmp_path.glob("settings.json.pre-ambient.*")) == []
+
+
 def test_installer_refuses_corrupt_json(env, tmp_path):
+    install_stub_shim(env)
     corrupt = "{this is not json,,,"
     path = write_fixture(tmp_path, corrupt)
     r = run_install(env, path)
@@ -264,10 +297,31 @@ def test_installer_refuses_corrupt_json(env, tmp_path):
     assert path.read_text() == corrupt  # untouched, not clobbered
 
 
+def test_installer_requires_shim(env, tmp_path):
+    # No stub shim planted: prerequisite failure is exit 2, settings untouched.
+    path = write_fixture(tmp_path, FIXTURE_SETTINGS)
+    before = path.read_bytes()
+    r = run_install(env, path)
+    assert r.returncode == 2
+    assert path.read_bytes() == before
+
+
 def test_installer_creates_settings_when_absent(env, tmp_path):
+    install_stub_shim(env)
     path = tmp_path / "settings.json"  # does not exist yet
     r = run_install(env, path)
     assert r.returncode == 0, r.stderr
     got = json.loads(path.read_text())
     assert "SessionStart" in got["hooks"]
     assert "PostToolUse" in got["hooks"]
+
+
+# ---- completeness markers -------------------------------------------------
+
+def test_hook_scripts_end_with_eof_marker():
+    """The dispatch shim validates against mid-write tears on this exact final
+    line; a tidy-up that strips it makes the shim skip the hook."""
+    for script in (SESSION_START, BRIDGE):
+        with open(script) as fh:
+            lines = fh.read().splitlines()
+        assert lines[-1] == "# hook-eof-marker v1 do-not-remove", script
