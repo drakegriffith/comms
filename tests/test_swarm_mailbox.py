@@ -48,6 +48,26 @@ class TestMailbox(unittest.TestCase):
         with self.assertRaises(ValueError):
             mb.post("run3", "seatA", "gossip", "not a valid kind")
 
+    def test_every_valid_kind_posts(self):
+        """The full closed vocabulary, enumerated here on purpose (checker
+        duplicates the list rather than importing intent from prose)."""
+        mb.init("run3k")
+        expected = ("finding", "claim", "blocker", "comment", "reply", "status")
+        self.assertEqual(mb.VALID_KINDS, expected)
+        for kind in expected:
+            row = mb.post("run3k", "seatA", kind, "text for %s" % kind)
+            self.assertEqual(row["kind"], kind)
+        view = mb.read_siblings("run3k", "seatB")
+        self.assertEqual(sorted(r["kind"] for r in view), sorted(expected))
+
+    def test_unknown_kind_banana_still_loud(self):
+        """Extending the tuple must not have opened the vocabulary."""
+        mb.init("run3b")
+        with self.assertRaises(ValueError) as ctx:
+            mb.post("run3b", "seatA", "banana", "free text kind")
+        self.assertIn("invalid kind", str(ctx.exception))
+        self.assertIn("banana", str(ctx.exception))
+
     def test_rows_sorted_by_at(self):
         mb.init("run4")
         # Post several from one seat; a reader from another seat sees them ordered.

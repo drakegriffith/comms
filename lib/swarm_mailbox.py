@@ -71,7 +71,7 @@ one extra "to" key; a fan-out row is unchanged.
 CLI:
   swarm_mailbox.py init <runid>
   swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]      # register a seat's topic set
-  swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]  # kind: finding|claim|blocker
+  swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]  # kind: finding|claim|blocker|comment|reply|status
   swarm_mailbox.py read <runid> <seat> [--topic <name>]               # rows from every OTHER seat (one topic or all)
   swarm_mailbox.py read <runid> <seat> --subs                          # only this seat's subscribed slice + its unicasts
 """
@@ -81,7 +81,7 @@ import json
 import os
 import sys
 
-VALID_KINDS = ("finding", "claim", "blocker")
+VALID_KINDS = ("finding", "claim", "blocker", "comment", "reply", "status")
 
 # A unicast row (a message to one seat) rides a reserved topic "@<seat>". A real
 # topic must never start with this, or a fan-out topic could impersonate a direct
@@ -183,8 +183,10 @@ def subscriptions(runid, seat):
 def post(runid, seat, kind, text, topic=None, to=None):
     """Append one JSON-line row to the caller's OWN <seat>.jsonl.
 
-    kind must be one of finding|claim|blocker (a closed vocabulary -- an unknown
-    kind is a hard error, never a silent accept). Routing is one of two shapes,
+    kind must be one of finding|claim|blocker|comment|reply|status (a closed
+    vocabulary -- an unknown kind is a hard error, never a silent accept).
+    comment/reply carry mid-run conversational exchange between live seats;
+    status carries progress notes. Routing is one of two shapes,
     never both at once:
       * FAN-OUT: topic="X" (or nothing -> "default"). Reaches every seat
         subscribed to X. This is the common path.
