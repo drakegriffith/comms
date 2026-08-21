@@ -43,6 +43,50 @@ here -- durable commands go through the GitHub board.
    Run one mirror per machine per run. `install.sh` also prints a launchd
    plist template if you want it supervised.
 
+## Lanes: a second channel for agent-to-agent chatter
+
+By default (`--lane` omitted, or `--lane all`) the mirror behaves exactly as
+above -- every row, one channel. Pass `--lane convo` to mirror ONLY
+agent-to-agent conversation (a direct message, or a `comment`/`reply` row) to
+a SECOND webhook/channel, so a human can watch the conversation lane without
+plain findings/status noise, or vice versa:
+
+    python3 adapters/discord/mirror.py --once <runid> --lane convo
+    python3 adapters/discord/mirror.py --follow <runid> --lane convo
+
+A row is conversation iff `topic` starts with `@` (a direct message) OR
+`kind` is `comment` or `reply`. A row the convo lane skips still advances
+that lane's cursor -- it is never re-scanned on the next pass, it is just
+never posted. The two lanes never share a cursor, a skipped-rows log, or a
+secret:
+
+| Lane | Secret var | State dir |
+| --- | --- | --- |
+| `all` (default) | `DISCORD_COMMS_WEBHOOK_URL` | `discord-mirror/` |
+| `convo` | `DISCORD_COMMS_CONVO_WEBHOOK_URL` | `discord-mirror-convo/` |
+
+Set up the convo lane's secret the same way as the default lane's (Setup
+step 2 above), just with the `_CONVO_` var name and, in Discord, a second
+webhook pointed at a second channel.
+
+### Mirroring every run at once
+
+    python3 adapters/discord/mirror.py --follow-all [--interval N] [--lane convo]
+
+Each pass globs the mailbox root for every `comms-*` run directory and mirrors
+each one, so a new run that gets armed while the process is running is picked
+up without a restart.
+
+### launchd safety
+
+`--follow` and `--follow-all` are meant to run under a launchd `KeepAlive`
+job, which restarts anything that exits nonzero. A job that exits every time
+it polls a not-yet-configured secret would crash-loop. So in those two modes
+only, a missing secret does NOT exit: one stderr line, then a 60s retry.
+`--once` is unaffected -- it still exits 2 and names the exact drop-in line,
+because a one-shot invocation (a human, or a script checking the result)
+needs the loud failure.
+
 ## Env knobs
 
 | Var | Default | Meaning |
@@ -50,8 +94,8 @@ here -- durable commands go through the GitHub board.
 | `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the `[machine/seat]` prefix |
 | `COMMS_ROOT` | `/tmp` | mailbox root (same knob as the mailbox itself) |
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-row records |
-| `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line lives |
-| `COMMS_MIRROR_INTERVAL` | `5` | `--follow` poll seconds |
+| `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
+| `COMMS_MIRROR_INTERVAL` | `5` | `--follow`/`--follow-all` poll seconds |
 
 ## Seat identity (optional)
 

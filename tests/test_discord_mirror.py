@@ -296,3 +296,313 @@ def test_main_once_returns_run_once_result(webhook):
     swarm_mailbox.post(RUNID, "alpha", "finding", "via main")
     assert mirror.main(["mirror.py", "--once", RUNID]) == 0
     assert "via main" in webhook.requests[0]["content"]
+
+
+# ---- default lane: byte-identical when --lane is not given ----------------
+
+
+def test_default_lane_secret_var_unchanged():
+    assert mirror.SECRET_VAR == "DISCORD_COMMS_WEBHOOK_URL"
+    assert mirror.resolve_webhook_url is not None  # still the one entrypoint
+
+
+def test_default_lane_format_and_secret_var_unchanged(webhook):
+    # No --lane anywhere: run_once() with no lane arg, and the CLI with no
+    # --lane flag, must both still speak DISCORD_COMMS_WEBHOOK_URL and emit
+    # the pre-lane line format, exactly as before this feature existed.
+    swarm_mailbox.post(RUNID, "alpha", "finding", "first")
+    assert mirror.run_once(RUNID) == 0
+    content = webhook.requests[0]["content"]
+    assert "[studio/alpha] finding: first" in content
+
+
+def test_default_lane_missing_secret_names_all_lane_var(capsys):
+    with pytest.raises(SystemExit) as exc:
+        mirror.run_once(RUNID)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "DISCORD_COMMS_WEBHOOK_URL=" in err
+    assert "DISCORD_COMMS_CONVO_WEBHOOK_URL" not in err
+
+
+def test_main_without_lane_flag_behaves_as_default_lane(webhook):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "via main default lane")
+    assert mirror.main(["mirror.py", "--once", RUNID]) == 0
+    assert "via main default lane" in webhook.requests[0]["content"]
+    # cursor landed under the default-lane state dir, not a convo one
+    assert os.path.isfile(mirror._cursor_path(RUNID))
+    assert os.path.isfile(mirror._cursor_path(RUNID, "all"))
+
+
+# ---- convo lane: secret var --------------------------------------------
+
+
+def test_convo_lane_missing_secret_names_convo_var(capsys):
+    with pytest.raises(SystemExit) as exc:
+        mirror.run_once(RUNID, lane="convo")
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "DISCORD_COMMS_CONVO_WEBHOOK_URL=" in err
+    assert "http" not in err
+
+
+def test_convo_lane_reads_its_own_env_var(monkeypatch):
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://example.invalid/convo")
+    assert mirror.resolve_webhook_url("convo") == "http://example.invalid/convo"
+
+
+def test_convo_lane_secret_read_from_secrets_file(tmp_path, monkeypatch):
+    (tmp_path / "comms.env").write_text(
+        "DISCORD_COMMS_CONVO_WEBHOOK_URL=http://example.invalid/from-file\n"
+    )
+    assert mirror.resolve_webhook_url("convo") == "http://example.invalid/from-file"
+
+
+# ---- convo lane: separate state dir / cursors ------------------------------
+
+
+def test_convo_lane_cursor_path_differs_from_default_lane():
+    default_path = mirror._cursor_path(RUNID)
+    convo_path = mirror._cursor_path(RUNID, "convo")
+    assert default_path != convo_path
+    assert "discord-mirror-convo" in convo_path
+    assert "discord-mirror-convo" not in default_path
+
+
+def test_convo_lane_cursor_independent_of_default_lane_cursor(monkeypatch):
+    convo_url = "http://127.0.0.1:1/convo"
+    all_url = "http://127.0.0.1:1/all"
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", convo_url)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", all_url)
+
+    def fake_post(url, content):
+        return True
+
+    monkeypatch.setattr(mirror, "post_content", fake_post)
+    swarm_mailbox.post(RUNID, "alpha", "comment", "hello there")
+    assert mirror.run_once(RUNID, lane="all") == 0
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    all_cursor = mirror._load_cursor(RUNID, "all")
+    convo_cursor = mirror._load_cursor(RUNID, "convo")
+    assert all_cursor == {"alpha": 1}
+    assert convo_cursor == {"alpha": 1}
+    # Two separate files on disk, not one shared cursor.
+    assert mirror._cursor_path(RUNID, "all") != mirror._cursor_path(RUNID, "convo")
+
+
+# ---- convo lane: row filter -------------------------------------------
+
+
+def test_convo_lane_mirrors_unicast_topic_rows(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "direct msg", to="bravo")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert posted and "direct msg" in posted[0]
+
+
+def test_convo_lane_mirrors_comment_and_reply_kinds(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "comment", "chatting")
+    swarm_mailbox.post(RUNID, "beta", "reply", "replying")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    joined = "\n".join(posted)
+    assert "chatting" in joined
+    assert "replying" in joined
+
+
+def test_convo_lane_filters_out_plain_finding_status(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "not conversation")
+    swarm_mailbox.post(RUNID, "alpha", "status", "still not conversation")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert posted == []  # nothing to post: no message sent at all
+
+
+def test_convo_lane_filtered_rows_still_advance_cursor(monkeypatch):
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "not conversation")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    cursor = mirror._load_cursor(RUNID, "convo")
+    assert cursor.get("alpha") == 1  # cursor moved even though nothing posted
+    # A second pass with no new rows still posts nothing and cursor unchanged.
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert mirror._load_cursor(RUNID, "convo").get("alpha") == 1
+
+
+def test_convo_lane_mixed_batch_only_posts_convo_rows(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "skip me")
+    swarm_mailbox.post(RUNID, "alpha", "comment", "keep me")
+    swarm_mailbox.post(RUNID, "alpha", "status", "skip me too")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    joined = "\n".join(posted)
+    assert "keep me" in joined
+    assert "skip me" not in joined
+    assert "skip me too" not in joined
+    # cursor advanced past ALL three rows for alpha, not just the posted one
+    assert mirror._load_cursor(RUNID, "convo") == {"alpha": 3}
+
+
+def test_all_lane_is_unfiltered_mirrors_everything(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "plain finding")
+    swarm_mailbox.post(RUNID, "alpha", "comment", "a comment too")
+    assert mirror.run_once(RUNID, lane="all") == 0
+    joined = "\n".join(posted)
+    assert "plain finding" in joined
+    assert "a comment too" in joined
+
+
+# ---- CLI: --lane flag -------------------------------------------------
+
+
+def test_cli_lane_convo_uses_convo_secret(monkeypatch, capsys):
+    monkeypatch.delenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        mirror.main(["mirror.py", "--once", RUNID, "--lane", "convo"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "DISCORD_COMMS_CONVO_WEBHOOK_URL=" in err
+
+
+def test_cli_lane_bogus_rejected():
+    assert mirror.main(["mirror.py", "--once", RUNID, "--lane", "nonsense"]) == 2
+
+
+def test_cli_lane_convo_posts_to_convo_webhook(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append((url, content)) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "comment", "cli convo lane")
+    assert mirror.main(["mirror.py", "--once", RUNID, "--lane", "convo"]) == 0
+    assert posted and posted[0][0] == "http://127.0.0.1:1/convo"
+    assert "cli convo lane" in posted[0][1]
+
+
+# ---- launchd safety: missing secret must not crash --follow / --follow-all
+
+
+def test_follow_missing_secret_does_not_raise_and_retries_60s(monkeypatch, capsys):
+    monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow(RUNID, 5)
+    assert rc == 0  # never raised SystemExit out of follow()
+    assert sleeps == [60]
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1  # exactly one stderr line, not the multi-line drop-in
+    assert "60" in err
+
+
+def test_follow_all_missing_secret_does_not_raise_and_retries_60s(monkeypatch, capsys):
+    monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    swarm_mailbox.init(RUNID)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5)
+    assert rc == 0
+    assert sleeps == [60]
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+
+
+def test_follow_resumes_normal_interval_once_secret_present(webhook):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "will mirror")
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    import mirror as _m
+    orig_sleep = _m.time.sleep
+    _m.time.sleep = fake_sleep
+    try:
+        rc = mirror.follow(RUNID, 5)
+    finally:
+        _m.time.sleep = orig_sleep
+    assert rc == 0
+    assert sleeps == [5]  # normal interval, not the 60s fallback
+    assert "will mirror" in webhook.requests[0]["content"]
+
+
+def test_once_still_exits_2_on_missing_secret_no_retry():
+    # --once must NOT swallow a missing secret: launchd safety is a
+    # --follow/--follow-all concern only.
+    with pytest.raises(SystemExit) as exc:
+        mirror.main(["mirror.py", "--once", RUNID])
+    assert exc.value.code == 2
+
+
+# ---- --follow-all: discover every run and mirror each ---------------------
+
+
+def test_follow_all_discovers_and_mirrors_every_run(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
+    swarm_mailbox.post("run-a", "alpha", "finding", "in run a")
+    swarm_mailbox.post("run-b", "beta", "finding", "in run b")
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5)
+    assert rc == 0
+    joined = "\n".join(posted)
+    assert "in run a" in joined
+    assert "in run b" in joined
+
+
+def test_follow_all_honors_lane_argument(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post("run-c", "alpha", "comment", "chit chat")
+    swarm_mailbox.post("run-c", "alpha", "finding", "not chat")
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5, lane="convo")
+    assert rc == 0
+    joined = "\n".join(posted)
+    assert "chit chat" in joined
+    assert "not chat" not in joined
+
+
+def test_main_follow_all_dispatches(monkeypatch):
+    posted = []
+    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
+    swarm_mailbox.post("run-d", "alpha", "finding", "via follow-all cli")
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.main(["mirror.py", "--follow-all"])
+    assert rc == 0
+    assert "via follow-all cli" in "\n".join(posted)
