@@ -46,19 +46,27 @@ here -- durable commands go through the GitHub board.
 ## Lanes: a second channel for agent-to-agent chatter
 
 By default (`--lane` omitted, or `--lane all`) the mirror behaves exactly as
-above -- every row, one channel. Pass `--lane convo` to mirror ONLY
-agent-to-agent conversation (a direct message, or a `comment`/`reply` row) to
-a SECOND webhook/channel, so a human can watch the conversation lane without
-plain findings/status noise, or vice versa:
+above -- every row, one channel. Pass `--lane convo` to mirror agent-to-agent
+conversation to a SECOND webhook/channel instead. The predicate a row must
+match, exactly:
+
+    topic.startswith("@")          # a unicast -- a message to ONE seat,
+                                    # of ANY kind (finding/status/blocker/
+                                    # claim included: a direct message is
+                                    # conversation regardless of what kind
+                                    # carries it)
+    or kind in ("comment", "reply")  # a broadcast conversational row
+
+so the convo lane is not "findings vs. chatter" -- a `--to` unicast lands in
+convo even if it's kind `finding`. `lib/swarm_mailbox.CONVO_KINDS` is the
+kind-half of this predicate, defined next to `VALID_KINDS`:
 
     python3 adapters/discord/mirror.py --once <runid> --lane convo
     python3 adapters/discord/mirror.py --follow <runid> --lane convo
 
-A row is conversation iff `topic` starts with `@` (a direct message) OR
-`kind` is `comment` or `reply`. A row the convo lane skips still advances
-that lane's cursor -- it is never re-scanned on the next pass, it is just
-never posted. The two lanes never share a cursor, a skipped-rows log, or a
-secret:
+A row the convo lane skips still advances that lane's cursor -- it is never
+re-scanned on the next pass, it is just never posted. The two lanes never
+share a cursor, a skipped-rows log, or a secret:
 
 | Lane | Secret var | State dir |
 | --- | --- | --- |
@@ -85,7 +93,22 @@ it polls a not-yet-configured secret would crash-loop. So in those two modes
 only, a missing secret does NOT exit: one stderr line, then a 60s retry.
 `--once` is unaffected -- it still exits 2 and names the exact drop-in line,
 because a one-shot invocation (a human, or a script checking the result)
-needs the loud failure.
+needs the loud failure. A per-run exception (a bad row, an unwritable state
+dir) is likewise caught, named on one stderr line with the runid and
+exception class, and does not stop the loop or the rest of the pass.
+
+### Concurrency: one poller per (run, lane)
+
+**Never run two mirror processes against the same runid AND the same lane at
+once** -- neither `--follow <runid>` twice, nor `--follow <runid>` alongside
+a `--follow-all` whose default `--lane all` also covers that runid. Two
+pollers on one (run, lane) both read the same cursor, both post, and BOTH
+advance it -- the result is double-posted rows in the channel, not a race
+that merely errors. (The cursor's tmp file is PID-suffixed so the two
+processes' writes cannot collide on the SAME tmp path, but that only removes
+one failure mode; it does not make concurrent pollers on one (run, lane)
+safe.) One lane's `all` job and another's `convo` job on the SAME runid are
+fine -- they are different (run, lane) pairs with separate state dirs.
 
 ## Env knobs
 

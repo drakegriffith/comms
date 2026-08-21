@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -606,3 +607,107 @@ def test_main_follow_all_dispatches(monkeypatch):
     rc = mirror.main(["mirror.py", "--follow-all"])
     assert rc == 0
     assert "via follow-all cli" in "\n".join(posted)
+
+
+# ---- S1: a per-run exception must not kill the follow loop ----------------
+
+
+def test_follow_survives_run_once_exception(webhook, capsys, monkeypatch):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "will error on save")
+
+    def raise_permission(*a, **k):
+        raise PermissionError("state dir not writable")
+
+    monkeypatch.setattr(mirror, "_save_cursor", raise_permission)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow(RUNID, 5)  # must not raise PermissionError out
+    assert rc == 1  # loud (a run failed) but the loop survived, never raised
+    assert sleeps == [5]  # normal interval -- this is not the missing-secret case
+    err = capsys.readouterr().err
+    assert RUNID in err
+    assert "PermissionError" in err
+
+
+def test_follow_all_survives_one_run_failing(webhook, capsys, monkeypatch):
+    swarm_mailbox.post("run-ok", "alpha", "finding", "fine")
+    swarm_mailbox.post("run-bad", "alpha", "finding", "boom")
+    orig_save = mirror._save_cursor
+
+    def flaky_save(runid, cursor, lane=mirror.DEFAULT_LANE):
+        if runid == "run-bad":
+            raise PermissionError("state dir not writable")
+        return orig_save(runid, cursor, lane)
+
+    monkeypatch.setattr(mirror, "_save_cursor", flaky_save)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5)  # must not raise out of the loop
+    assert rc == 1  # loud (one run failed) but the loop survived, never raised
+    assert sleeps == [5]
+    err = capsys.readouterr().err
+    assert "run-bad" in err
+    assert "PermissionError" in err
+    # the good run still got delivered despite the bad one failing
+    joined = "\n".join(r["content"] for r in webhook.requests)
+    assert "fine" in joined
+    assert "boom" in joined  # run-bad's row still POSTed; only its cursor save failed
+
+
+# ---- S6/S7: no idle cursor rewrites, no orphan cursors for empty runs -----
+
+
+def test_run_once_no_new_rows_skips_cursor_rewrite(webhook, monkeypatch):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "one")
+    assert mirror.run_once(RUNID) == 0
+    calls = []
+    orig_save = mirror._save_cursor
+    monkeypatch.setattr(
+        mirror, "_save_cursor",
+        lambda *a, **k: (calls.append(1), orig_save(*a, **k))[1],
+    )
+    assert mirror.run_once(RUNID) == 0  # nothing new this pass
+    assert calls == []  # _save_cursor never called: no idle rewrite
+
+
+def test_run_once_second_pass_no_new_rows_leaves_cursor_mtime_untouched(webhook):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "one")
+    assert mirror.run_once(RUNID) == 0
+    cursor_path = mirror._cursor_path(RUNID)
+    old_mtime = os.path.getmtime(cursor_path) - 100  # detectable if rewritten
+    os.utime(cursor_path, (old_mtime, old_mtime))
+    assert mirror.run_once(RUNID) == 0
+    assert os.path.getmtime(cursor_path) == old_mtime
+
+
+def test_run_once_empty_run_creates_no_orphan_cursor_file(webhook):
+    # A runid nothing has ever posted to: no mailbox dir, no rows, ever.
+    assert mirror.run_once("never-posted-run") == 0
+    assert not os.path.exists(mirror._cursor_path("never-posted-run"))
+
+
+# ---- S3 (cheap half): pid-suffixed cursor tmp name -------------------------
+
+
+def test_cursor_tmp_path_includes_pid():
+    tmp = mirror._cursor_tmp_path(RUNID, "all")
+    assert tmp == mirror._cursor_path(RUNID, "all") + ".tmp." + str(os.getpid())
+
+
+def test_save_cursor_uses_pid_suffixed_tmp_name(webhook):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "one")
+    assert mirror.run_once(RUNID) == 0
+    # the pid-suffixed tmp file was cleaned up by os.replace, only the real
+    # cursor file remains
+    assert os.path.isfile(mirror._cursor_path(RUNID))
+    assert not os.path.isfile(mirror._cursor_tmp_path(RUNID))
