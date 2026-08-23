@@ -304,5 +304,54 @@ class TestSubscriptions(unittest.TestCase):
         self.assertEqual(texts, {"in A", "hi all", "direct"})   # NOT "in B"
 
 
+class TestConvoKinds(unittest.TestCase):
+    """CONVO_KINDS is the kind-half of the discord mirror's convo-lane
+    predicate (S5): it must never name a kind VALID_KINDS does not allow,
+    or the mirror would treat an impossible kind as conversational."""
+
+    def test_convo_kinds_is_subset_of_valid_kinds(self):
+        self.assertTrue(set(mb.CONVO_KINDS) <= set(mb.VALID_KINDS))
+
+    def test_convo_kinds_contains_comment_and_reply(self):
+        self.assertEqual(set(mb.CONVO_KINDS), {"comment", "reply"})
+
+
+class TestRunIds(unittest.TestCase):
+    """run_ids() is the discovery helper --follow-all needs to find every
+    run under the mailbox root without a caller having to know the runids
+    up front."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="comms-test-root-")
+        os.environ["COMMS_ROOT"] = self.tmp
+
+    def test_empty_root_yields_empty_list(self):
+        self.assertEqual(mb.run_ids(), [])
+
+    def test_discovers_every_comms_dir_sorted(self):
+        mb.init("zeta")
+        mb.init("alpha")
+        mb.init("mid")
+        self.assertEqual(mb.run_ids(), ["alpha", "mid", "zeta"])
+
+    def test_ignores_non_comms_entries(self):
+        mb.init("run1")
+        # A stray file and a differently-prefixed dir must not surface.
+        with open(os.path.join(self.tmp, "not-a-run.txt"), "w") as fh:
+            fh.write("x")
+        os.makedirs(os.path.join(self.tmp, "other-thing"), exist_ok=True)
+        self.assertEqual(mb.run_ids(), ["run1"])
+
+    def test_reads_root_per_call_not_at_import(self):
+        # Same footgun test_root() protects against: COMMS_ROOT set AFTER
+        # module import must still be honored, because _root() reads env
+        # every call rather than caching at import time.
+        second_root = tempfile.mkdtemp(prefix="comms-test-root2-")
+        os.environ["COMMS_ROOT"] = second_root
+        mb.init("only-in-second-root")
+        self.assertEqual(mb.run_ids(), ["only-in-second-root"])
+        os.environ["COMMS_ROOT"] = self.tmp  # restore for other tests
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

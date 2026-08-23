@@ -45,6 +45,17 @@ Run it manually (per run, per machine):
   python3 $MIRROR --once <runid>              # mirror new rows, exit
   python3 $MIRROR --follow <runid>            # poll loop (5s; --interval N)
 
+Or mirror EVERY run under the mailbox root in one process (picks up newly
+armed runs without a restart):
+  python3 $MIRROR --follow-all                        # lane "all" (default)
+  python3 $MIRROR --follow-all --lane convo           # conversation-only, 2nd webhook
+
+--lane convo on ANY of the above sends to DISCORD_COMMS_CONVO_WEBHOOK_URL
+(same drop-in steps as above, different var) instead of
+DISCORD_COMMS_WEBHOOK_URL. Never run two of these against the same
+(runid or "every run") AND the same lane at once -- see README.md,
+Concurrency.
+
 Keep it alive under launchd (optional): save as
 ~/Library/LaunchAgents/com.comms.discord-mirror.<runid>.plist, then
 'launchctl load' it:
@@ -61,6 +72,18 @@ Keep it alive under launchd (optional): save as
     </array>
     <key>KeepAlive</key><true/>
   </dict></plist>
+
+A --follow-all --lane convo variant of the same plist (mirrors every run's
+conversation to the second channel; swap the Label so it does not collide
+with a plain --follow-all job):
+
+  <key>Label</key><string>com.comms.discord-mirror.follow-all-convo</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>$MIRROR</string>
+    <string>--follow-all</string><string>--lane</string><string>convo</string>
+  </array>
+  <key>KeepAlive</key><true/>
 
 Env knobs: COMMS_MACHINE_LABEL (prefix; default hostname -s),
 COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped state),

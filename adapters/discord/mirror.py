@@ -45,11 +45,36 @@ SECRET: DISCORD_COMMS_WEBHOOK_URL from the environment, else parsed from
 $COMMS_SECRETS_FILE (default ~/.secrets/comms.env). The URL is never printed,
 logged, or echoed. Missing -> exit 2 naming the exact drop-in line.
 
+LANES: --lane names which Discord channel a pass targets. The default lane
+("all", used when --lane is omitted) is the original single-channel behavior,
+byte-identical: format, secret var (DISCORD_COMMS_WEBHOOK_URL), state dir, and
+row set are all unchanged. The "convo" lane mirrors agent-to-agent
+conversation only -- a row is conversation iff its topic starts with "@"
+(a unicast, see swarm_mailbox SELF_TOPIC_PREFIX) OR its kind is "comment" or
+"reply" -- to a SEPARATE webhook (DISCORD_COMMS_CONVO_WEBHOOK_URL) and a
+SEPARATE state dir (discord-mirror-convo/), so the two lanes never share a
+cursor or a skipped-rows log. A row that does not match the convo lane's
+filter is still counted against the cursor (the cursor is a per-seat row
+count over ALL rows, filter or no) -- otherwise a run with a mix of chatter
+and plain findings would re-scan its non-convo rows on every pass forever.
+Lanes are otherwise identical: same batching, same retry, same skip-and-log
+failure path, just parameterized by lane name.
+
+LAUNCHD SAFETY: --follow and --follow-all run under a launchd KeepAlive job,
+which restarts a job that exits nonzero -- so a job that exits on every poll
+of a not-yet-configured secret crash-loops forever instead of waiting quietly
+for the human to drop the key in. --once is a one-shot invocation (a human or
+a script checking the result), so it keeps the loud exit 2. --follow and
+--follow-all instead catch the missing-secret condition, write ONE stderr
+line (not the multi-line drop-in -- that would spam a log file once per
+poll), and retry in 60s instead of the normal --interval, without raising.
+
 CLI:
-  mirror.py --once <runid>                  # mirror new rows, exit
-  mirror.py --follow <runid> [--interval N] # poll loop (default 5s)
+  mirror.py --once <runid> [--lane <name>]
+  mirror.py --follow <runid> [--interval N] [--lane <name>]   # poll loop (default 5s)
+  mirror.py --follow-all [--interval N] [--lane <name>]       # poll EVERY run under the mailbox root
 Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
-      2 usage or missing webhook secret.
+      2 usage or missing webhook secret (--once only).
 """
 
 import json
@@ -75,6 +100,27 @@ TEXT_CAP = 300  # chars of row text per line
 CONTENT_CAP = 1900
 MAX_RETRIES = 3  # additional attempts after the first
 SECRET_VAR = "DISCORD_COMMS_WEBHOOK_URL"
+DEFAULT_LANE = "all"
+
+# Lane name -> secret var. The default lane keeps the pre-lane var so an
+# un-flagged invocation is byte-identical to before this feature existed.
+LANE_SECRET_VARS = {
+    DEFAULT_LANE: SECRET_VAR,
+    "convo": "DISCORD_COMMS_CONVO_WEBHOOK_URL",
+}
+
+# Lane name -> state subdir. Separate dirs so cursors and skipped-rows logs
+# never mix between lanes (mixing would let one lane's cursor accidentally
+# skip rows the other lane never delivered).
+LANE_STATE_DIRS = {
+    DEFAULT_LANE: "discord-mirror",
+    "convo": "discord-mirror-convo",
+}
+
+# LAUNCHD SAFETY: how long --follow / --follow-all wait before retrying a
+# poll after a missing-secret condition, instead of crash-looping under a
+# KeepAlive launchd job. See module docstring, LAUNCHD SAFETY.
+MISSING_SECRET_RETRY_SECONDS = 60
 
 
 def _state_dir():
@@ -83,26 +129,45 @@ def _state_dir():
     return os.environ.get("COMMS_STATE_DIR") or os.path.expanduser("~/.comms/state")
 
 
-def _mirror_dir():
-    return os.path.join(_state_dir(), "discord-mirror")
+def _mirror_dir(lane=DEFAULT_LANE):
+    return os.path.join(_state_dir(), LANE_STATE_DIRS[lane])
 
 
 def _safe(runid):
     return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(runid))
 
 
-def _cursor_path(runid):
-    return os.path.join(_mirror_dir(), _safe(runid) + ".cursor.json")
+def _cursor_path(runid, lane=DEFAULT_LANE):
+    return os.path.join(_mirror_dir(lane), _safe(runid) + ".cursor.json")
 
 
-def _skipped_path(runid):
-    return os.path.join(_mirror_dir(), _safe(runid) + ".skipped.jsonl")
+def _skipped_path(runid, lane=DEFAULT_LANE):
+    return os.path.join(_mirror_dir(lane), _safe(runid) + ".skipped.jsonl")
 
 
-def resolve_webhook_url():
-    """Env var first, else parse the secrets file. Exits 2 with the exact
-    drop-in line when absent. Never prints the value."""
-    url = os.environ.get(SECRET_VAR)
+def _is_convo_row(row):
+    """A row is agent-to-agent conversation iff it is a unicast (topic
+    starts with swarm_mailbox's "@" prefix) or its kind is one of
+    swarm_mailbox.CONVO_KINDS. Kind alone catches broadcast conversational
+    traffic (e.g. the ambient sendmessage bridge posts kind=comment on a
+    non-"@" topic); topic alone catches a direct message posted with ANY
+    kind -- including finding/status/blocker/claim, by design: a message
+    addressed to one seat is conversation regardless of what kind carries
+    it. See adapters/discord/README.md, Lanes."""
+    topic = str(row.get("topic", ""))
+    return topic.startswith("@") or row.get("kind") in swarm_mailbox.CONVO_KINDS
+
+
+def _find_webhook_url(lane=DEFAULT_LANE):
+    """Resolve this lane's webhook URL with NO side effects (no stderr, no
+    exit): returns the URL or None. Env var first, else parsed from the
+    secrets file. Factored out of resolve_webhook_url so a caller that must
+    not exit or print on every poll -- the follow loops' launchd-safety
+    check, see module docstring LAUNCHD SAFETY -- can test for presence
+    quietly instead of triggering the multi-line drop-in message once per
+    poll."""
+    var = LANE_SECRET_VARS[lane]
+    url = os.environ.get(var)
     if url:
         return url
     path = os.environ.get("COMMS_SECRETS_FILE") or os.path.expanduser(
@@ -112,18 +177,28 @@ def resolve_webhook_url():
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
-                if line.startswith(SECRET_VAR + "="):
+                if line.startswith(var + "="):
                     val = line.split("=", 1)[1].strip().strip("'\"")
                     if val:
                         return val
     except OSError:
         pass
+    return None
+
+
+def resolve_webhook_url(lane=DEFAULT_LANE):
+    """Env var first, else parse the secrets file. Exits 2 with the exact
+    drop-in line for THIS lane's var when absent. Never prints the value."""
+    url = _find_webhook_url(lane)
+    if url:
+        return url
+    var = LANE_SECRET_VARS[lane]
     sys.stderr.write(
         "discord mirror: no webhook configured.\n"
         "  1. open -e ~/.secrets/comms.env\n"
-        "  2. add line: DISCORD_COMMS_WEBHOOK_URL=<paste webhook URL from "
+        "  2. add line: %s=<paste webhook URL from "
         "Discord channel settings>\n"
-        "  3. chmod 600 ~/.secrets/comms.env\n"
+        "  3. chmod 600 ~/.secrets/comms.env\n" % var
     )
     sys.exit(2)
 
@@ -164,31 +239,49 @@ def format_row(row, machine, identity=None):
     return "[%s/%s] %s: %s" % (machine, seat, kind, text)
 
 
-def _load_cursor(runid):
+def _load_cursor(runid, lane=DEFAULT_LANE):
     try:
-        with open(_cursor_path(runid)) as fh:
+        with open(_cursor_path(runid, lane)) as fh:
             cur = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return {}
     return cur if isinstance(cur, dict) else {}
 
 
-def _save_cursor(runid, cursor):
-    os.makedirs(_mirror_dir(), exist_ok=True)
-    path = _cursor_path(runid)
-    tmp = path + ".tmp"
+def _cursor_tmp_path(runid, lane=DEFAULT_LANE):
+    # PID-suffixed (S3, cheap half): two pollers racing on the SAME
+    # (run, lane) still each get their own tmp file, so one process's
+    # partial write is never clobbered or vanished-out-from-under the
+    # other's os.replace (which raised FileNotFoundError before this).
+    # This does not make concurrent pollers on one (run, lane) SAFE to run
+    # -- see adapters/discord/README.md, Concurrency -- it only stops the
+    # tmp-file collision; the two would still double-post to the channel.
+    return _cursor_path(runid, lane) + ".tmp." + str(os.getpid())
+
+
+def _save_cursor(runid, cursor, lane=DEFAULT_LANE):
+    os.makedirs(_mirror_dir(lane), exist_ok=True)
+    path = _cursor_path(runid, lane)
+    tmp = _cursor_tmp_path(runid, lane)
     with open(tmp, "w") as fh:
         json.dump(cursor, fh)
     os.replace(tmp, path)
 
 
-def collect_new(runid):
+def collect_new(runid, lane=DEFAULT_LANE):
     """Return (fresh_rows, new_cursor). Per-seat row counts are the cursor:
     seat files are append-only single-writer, so row N of a seat is stable
     forever and 'new' is exactly indices >= cursor[seat]. read_siblings sorts
-    by `at` with a stable sort, so per-seat file order is preserved."""
+    by `at` with a stable sort, so per-seat file order is preserved.
+
+    LANE FILTER: the cursor always advances over EVERY row (seen[] counts
+    every row regardless of lane), but only rows matching this lane's filter
+    are returned in `fresh` for posting. The default lane's filter is a
+    no-op (every new row is fresh, exactly the pre-lane behavior); the convo
+    lane additionally requires _is_convo_row. A row a lane filters out still
+    counts against that lane's cursor -- see module docstring, LANES."""
     rows = swarm_mailbox.read_siblings(runid, OBSERVER_SEAT)
-    cursor = _load_cursor(runid)
+    cursor = _load_cursor(runid, lane)
     seen = {}
     fresh = []
     for row in rows:
@@ -196,6 +289,8 @@ def collect_new(runid):
         idx = seen.get(seat, 0)
         seen[seat] = idx + 1
         if idx >= int(cursor.get(seat, 0)):
+            if lane == "convo" and not _is_convo_row(row):
+                continue
             fresh.append(row)
     new_cursor = dict(cursor)
     for seat, count in seen.items():
@@ -269,11 +364,11 @@ def post_content(url, content):
             return False
 
 
-def _log_skipped(runid, rows, reason):
+def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
     """The never-drop-silently channel: skipped rows go to stderr AND a
     durable state-dir file, then the cursor may advance past them."""
-    os.makedirs(_mirror_dir(), exist_ok=True)
-    path = _skipped_path(runid)
+    os.makedirs(_mirror_dir(lane), exist_ok=True)
+    path = _skipped_path(runid, lane)
     with open(path, "a") as fh:
         for row in rows:
             fh.write(json.dumps({"reason": reason, "row": row}) + "\n")
@@ -283,35 +378,108 @@ def _log_skipped(runid, rows, reason):
     )
 
 
-def run_once(runid):
-    """Mirror everything new, exactly once. Exit-code semantics of main()."""
-    url = resolve_webhook_url()  # before anything else: missing secret = 2 always
+def run_once(runid, lane=DEFAULT_LANE):
+    """Mirror everything new in one lane, exactly once. Exit-code semantics
+    of main(). Raises SystemExit(2) via resolve_webhook_url if this lane's
+    secret is missing -- callers that must not exit (--follow, --follow-all)
+    catch that themselves; see module docstring, LAUNCHD SAFETY."""
+    url = resolve_webhook_url(lane)  # before anything else: missing secret = 2 always
     machine = machine_label()
-    fresh, new_cursor = collect_new(runid)
-    if not fresh:
-        return 0
-    # Enrollment identity, read once per pass and joined by seat in
-    # format_row. A run with no arm state (or a pre-identity roster) yields
-    # {} and every line renders in the identity-free format.
-    identities = swarm_arm.seat_identities(runid)
+    old_cursor = _load_cursor(runid, lane)
+    fresh, new_cursor = collect_new(runid, lane)
     skipped = False
-    for content, chunk in chunk_rows(fresh, machine, identities=identities):
-        if not post_content(url, content):
-            _log_skipped(runid, chunk, "webhook delivery failed")
-            skipped = True
+    if fresh:
+        # Enrollment identity, read once per pass and joined by seat in
+        # format_row. A run with no arm state (or a pre-identity roster)
+        # yields {} and every line renders in the identity-free format.
+        identities = swarm_arm.seat_identities(runid)
+        for content, chunk in chunk_rows(fresh, machine, identities=identities):
+            if not post_content(url, content):
+                _log_skipped(runid, chunk, "webhook delivery failed", lane)
+                skipped = True
     # Advance past everything, delivered or skipped: the skipped file is the
     # durable record, and never advancing would wedge the mirror forever
-    # behind one undeliverable batch.
-    _save_cursor(runid, new_cursor)
+    # behind one undeliverable batch. But skip the write entirely when the
+    # cursor did not actually change (S6/S7): a lane filter can still
+    # advance it with nothing posted, so this is not just "if not fresh" --
+    # it is "did new_cursor differ from what's on disk". Guarding this
+    # avoids an idle rewrite on every poll of a quiet run, AND avoids
+    # creating an orphan cursor file for a run with no rows at all.
+    if new_cursor != old_cursor:
+        _save_cursor(runid, new_cursor, lane)
     return 1 if skipped else 0
 
 
-def follow(runid, interval):
+def _warn_missing_secret(lane):
+    sys.stderr.write(
+        "discord mirror: webhook secret missing for lane %r; retrying in %ds\n"
+        % (lane, MISSING_SECRET_RETRY_SECONDS)
+    )
+
+
+def _run_once_logged(runid, lane):
+    """run_once, but ANY exception (a bad row, an unwritable state dir, a
+    transient OSError -- not just the missing-secret case _find_webhook_url
+    already guards against) is caught, named with the runid and exception
+    class on one stderr line, and swallowed (S1). Without this, one broken
+    run kills the whole --follow/--follow-all poll loop, and a launchd
+    KeepAlive job restarts it -- the exact crash-loop LAUNCHD SAFETY exists
+    to prevent, just triggered by a different cause than a missing secret.
+    SystemExit is NOT caught here (it is not an Exception subclass): a
+    missing-secret exit from resolve_webhook_url is handled by the caller's
+    _find_webhook_url pre-check, not by this wrapper."""
+    try:
+        return run_once(runid, lane)
+    except Exception as exc:
+        sys.stderr.write(
+            "discord mirror: run_once failed for run %r (%s); continuing\n"
+            % (runid, exc.__class__.__name__)
+        )
+        return 1
+
+
+def follow(runid, interval, lane=DEFAULT_LANE):
+    """Poll one run forever. LAUNCHD SAFETY: checks for the secret BEFORE
+    calling run_once, so a missing secret never reaches resolve_webhook_url
+    (whose multi-line drop-in message is meant for a one-shot --once, not
+    once per poll) -- instead ONE stderr line, then a 60s backoff, so a
+    launchd KeepAlive job waits quietly instead of crash-looping. Any OTHER
+    exception from run_once (S1) is caught by _run_once_logged so it never
+    kills this loop either. See module docstring, LAUNCHD SAFETY."""
     rc = 0
     while True:
-        rc = max(rc, run_once(runid))
+        if _find_webhook_url(lane) is None:
+            _warn_missing_secret(lane)
+            sleep_for = MISSING_SECRET_RETRY_SECONDS
+        else:
+            rc = max(rc, _run_once_logged(runid, lane))
+            sleep_for = interval
         try:
-            time.sleep(interval)
+            time.sleep(sleep_for)
+        except KeyboardInterrupt:
+            return rc
+
+
+def follow_all(interval, lane=DEFAULT_LANE):
+    """Poll EVERY run under the mailbox root, once per pass, forever.
+    Discovery is swarm_mailbox.run_ids() so a newly-armed run is picked up
+    without restarting the process. LAUNCHD SAFETY: the secret is a
+    lane-wide condition (not per-run), so it is checked once per pass,
+    before touching any run -- warns once and backs off 60s exactly like
+    follow() when absent, instead of re-discovering the same failure once
+    per run. A per-run exception (S1) is caught by _run_once_logged so one
+    broken run does not stop the pass from reaching the rest."""
+    rc = 0
+    while True:
+        if _find_webhook_url(lane) is None:
+            _warn_missing_secret(lane)
+            sleep_for = MISSING_SECRET_RETRY_SECONDS
+        else:
+            for runid in swarm_mailbox.run_ids():
+                rc = max(rc, _run_once_logged(runid, lane))
+            sleep_for = interval
+        try:
+            time.sleep(sleep_for)
         except KeyboardInterrupt:
             return rc
 
@@ -319,6 +487,7 @@ def follow(runid, interval):
 def main(argv):
     args = list(argv[1:])
     interval = float(os.environ.get("COMMS_MIRROR_INTERVAL", "5"))
+    lane = DEFAULT_LANE
     if "--interval" in args:
         i = args.index("--interval")
         try:
@@ -327,16 +496,34 @@ def main(argv):
             sys.stderr.write("--interval needs a number\n")
             return 2
         del args[i : i + 2]
+    if "--lane" in args:
+        i = args.index("--lane")
+        if i + 1 >= len(args):
+            sys.stderr.write("--lane needs a value\n")
+            return 2
+        lane = args[i + 1]
+        del args[i : i + 2]
+        if lane not in LANE_SECRET_VARS:
+            sys.stderr.write(
+                "--lane must be one of: %s\n" % ", ".join(sorted(LANE_SECRET_VARS))
+            )
+            return 2
+    if len(args) == 1 and args[0] == "--follow-all":
+        try:
+            return follow_all(interval, lane)
+        except KeyboardInterrupt:
+            return 0
     if len(args) == 2 and args[0] == "--once":
-        return run_once(args[1])
+        return run_once(args[1], lane)
     if len(args) == 2 and args[0] == "--follow":
         try:
-            return follow(args[1], interval)
+            return follow(args[1], interval, lane)
         except KeyboardInterrupt:
             return 0
     sys.stderr.write(
-        "usage: mirror.py --once <runid>\n"
-        "       mirror.py --follow <runid> [--interval <seconds>]\n"
+        "usage: mirror.py --once <runid> [--lane <name>]\n"
+        "       mirror.py --follow <runid> [--interval <seconds>] [--lane <name>]\n"
+        "       mirror.py --follow-all [--interval <seconds>] [--lane <name>]\n"
     )
     return 2
 

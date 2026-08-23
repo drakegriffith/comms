@@ -43,6 +43,73 @@ here -- durable commands go through the GitHub board.
    Run one mirror per machine per run. `install.sh` also prints a launchd
    plist template if you want it supervised.
 
+## Lanes: a second channel for agent-to-agent chatter
+
+By default (`--lane` omitted, or `--lane all`) the mirror behaves exactly as
+above -- every row, one channel. Pass `--lane convo` to mirror agent-to-agent
+conversation to a SECOND webhook/channel instead. The predicate a row must
+match, exactly:
+
+    topic.startswith("@")          # a unicast -- a message to ONE seat,
+                                    # of ANY kind (finding/status/blocker/
+                                    # claim included: a direct message is
+                                    # conversation regardless of what kind
+                                    # carries it)
+    or kind in ("comment", "reply")  # a broadcast conversational row
+
+so the convo lane is not "findings vs. chatter" -- a `--to` unicast lands in
+convo even if it's kind `finding`. `lib/swarm_mailbox.CONVO_KINDS` is the
+kind-half of this predicate, defined next to `VALID_KINDS`:
+
+    python3 adapters/discord/mirror.py --once <runid> --lane convo
+    python3 adapters/discord/mirror.py --follow <runid> --lane convo
+
+A row the convo lane skips still advances that lane's cursor -- it is never
+re-scanned on the next pass, it is just never posted. The two lanes never
+share a cursor, a skipped-rows log, or a secret:
+
+| Lane | Secret var | State dir |
+| --- | --- | --- |
+| `all` (default) | `DISCORD_COMMS_WEBHOOK_URL` | `discord-mirror/` |
+| `convo` | `DISCORD_COMMS_CONVO_WEBHOOK_URL` | `discord-mirror-convo/` |
+
+Set up the convo lane's secret the same way as the default lane's (Setup
+step 2 above), just with the `_CONVO_` var name and, in Discord, a second
+webhook pointed at a second channel.
+
+### Mirroring every run at once
+
+    python3 adapters/discord/mirror.py --follow-all [--interval N] [--lane convo]
+
+Each pass globs the mailbox root for every `comms-*` run directory and mirrors
+each one, so a new run that gets armed while the process is running is picked
+up without a restart.
+
+### launchd safety
+
+`--follow` and `--follow-all` are meant to run under a launchd `KeepAlive`
+job, which restarts anything that exits nonzero. A job that exits every time
+it polls a not-yet-configured secret would crash-loop. So in those two modes
+only, a missing secret does NOT exit: one stderr line, then a 60s retry.
+`--once` is unaffected -- it still exits 2 and names the exact drop-in line,
+because a one-shot invocation (a human, or a script checking the result)
+needs the loud failure. A per-run exception (a bad row, an unwritable state
+dir) is likewise caught, named on one stderr line with the runid and
+exception class, and does not stop the loop or the rest of the pass.
+
+### Concurrency: one poller per (run, lane)
+
+**Never run two mirror processes against the same runid AND the same lane at
+once** -- neither `--follow <runid>` twice, nor `--follow <runid>` alongside
+a `--follow-all` whose default `--lane all` also covers that runid. Two
+pollers on one (run, lane) both read the same cursor, both post, and BOTH
+advance it -- the result is double-posted rows in the channel, not a race
+that merely errors. (The cursor's tmp file is PID-suffixed so the two
+processes' writes cannot collide on the SAME tmp path, but that only removes
+one failure mode; it does not make concurrent pollers on one (run, lane)
+safe.) One lane's `all` job and another's `convo` job on the SAME runid are
+fine -- they are different (run, lane) pairs with separate state dirs.
+
 ## Env knobs
 
 | Var | Default | Meaning |
@@ -50,8 +117,8 @@ here -- durable commands go through the GitHub board.
 | `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the `[machine/seat]` prefix |
 | `COMMS_ROOT` | `/tmp` | mailbox root (same knob as the mailbox itself) |
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-row records |
-| `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line lives |
-| `COMMS_MIRROR_INTERVAL` | `5` | `--follow` poll seconds |
+| `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
+| `COMMS_MIRROR_INTERVAL` | `5` | `--follow`/`--follow-all` poll seconds |
 
 ## Seat identity (optional)
 
