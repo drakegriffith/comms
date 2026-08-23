@@ -90,6 +90,23 @@ def participants(env):
     return sorted(os.listdir(d)) if os.path.isdir(d) else []
 
 
+def test_mailbox_rows_ignores_non_jsonl_files(env):
+    """mailbox_rows is the test suite's own reader of the machine-ops board;
+    it must skip any stray non-.jsonl file (e.g. a half-written .tmp) rather
+    than trying to parse it as mailbox rows -- nothing in the fixtures above
+    ever puts a non-.jsonl file in the dir, so this was previously
+    unexercised."""
+    d = os.path.join(env["COMMS_ROOT"], "comms-machine-ops")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "alpha.jsonl"), "w") as fh:
+        fh.write(json.dumps({"seat": "alpha", "kind": "status", "text": "real row"}) + "\n")
+    with open(os.path.join(d, "alpha.jsonl.tmp"), "w") as fh:
+        fh.write("not valid mailbox json, must never be parsed\n")
+    rows = mailbox_rows(env)
+    assert len(rows) == 1
+    assert rows[0]["text"] == "real row"
+
+
 # ---- session-start --------------------------------------------------------
 
 def test_session_start_enrolls_and_posts_one_row(env, tmp_path):

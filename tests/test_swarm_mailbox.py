@@ -328,6 +328,15 @@ class TestRunIds(unittest.TestCase):
     def test_empty_root_yields_empty_list(self):
         self.assertEqual(mb.run_ids(), [])
 
+    def test_nonexistent_root_yields_empty_list_not_none(self):
+        # os.listdir on a root that does not exist at all raises OSError --
+        # the except branch must still return a (possibly empty) LIST, the
+        # type every caller iterates over, never None.
+        os.environ["COMMS_ROOT"] = os.path.join(self.tmp, "does-not-exist")
+        result = mb.run_ids()
+        self.assertEqual(result, [])
+        self.assertIsInstance(result, list)
+
     def test_discovers_every_comms_dir_sorted(self):
         mb.init("zeta")
         mb.init("alpha")

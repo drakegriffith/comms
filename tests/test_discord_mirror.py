@@ -231,6 +231,21 @@ def test_429_retries_then_delivers(webhook):
     assert len(webhook.requests) == 2  # first 429ed, retry delivered
 
 
+def test_429_response_honors_scripted_retry_after_header_value(webhook, monkeypatch):
+    """The fake webhook's do_POST answers every 429 with header
+    Retry-After: 0 (see _Hook.do_POST). Prove post_content actually reads
+    and uses that header's value instead of its 1s no-header fallback --
+    the only thing that makes every other 429 test fast rather than
+    flaky-slow. Fixes the test double gap where do_POST could stop sending
+    the header entirely and no test would notice."""
+    webhook.script[:] = [429, 204]
+    sleeps = []
+    monkeypatch.setattr(mirror.time, "sleep", lambda s: sleeps.append(s))
+    url = os.environ["DISCORD_COMMS_WEBHOOK_URL"]
+    assert mirror.post_content(url, "x") is True
+    assert sleeps == [0.0]  # not [1.0] -- the header's value was honored
+
+
 def test_429_exhaustion_logs_skipped_never_silent(webhook, capsys):
     webhook.script[:] = [429] * (mirror.MAX_RETRIES + 1)
     swarm_mailbox.post(RUNID, "alpha", "finding", "undeliverable")
@@ -662,6 +677,11 @@ def test_follow_all_survives_one_run_failing(webhook, capsys, monkeypatch):
     joined = "\n".join(r["content"] for r in webhook.requests)
     assert "fine" in joined
     assert "boom" in joined  # run-bad's row still POSTed; only its cursor save failed
+    # the good run's cursor was actually persisted through to the real
+    # _save_cursor (flaky_save must delegate, not swallow the good case)
+    assert mirror._load_cursor("run-ok") == {"alpha": 1}
+    # the bad run's cursor never landed: its save raised
+    assert mirror._load_cursor("run-bad") == {}
 
 
 # ---- S6/S7: no idle cursor rewrites, no orphan cursors for empty runs -----
@@ -711,3 +731,117 @@ def test_save_cursor_uses_pid_suffixed_tmp_name(webhook):
     # cursor file remains
     assert os.path.isfile(mirror._cursor_path(RUNID))
     assert not os.path.isfile(mirror._cursor_tmp_path(RUNID))
+
+
+# ---- chunk_rows: the cap is a hard promise, not a rough guideline ---------
+# (mutation gate: 2 of 9 survived -- both mis-tracked size by exactly 2
+# chars around the join-separator accounting, invisible to the existing
+# batching test's generous margins)
+
+
+def test_chunk_rows_never_exceeds_cap_even_at_a_tight_boundary():
+    """Module docstring: 'Batch rows into as few Discord messages as fit
+    under the content cap.' Three equal-length rows, cap set to exactly one
+    char short of what all three (plus their two '\\n' separators) need: the
+    real size accounting must catch this and split before row 3. A size
+    tracker off by even 2 chars (the size of the +1/-1 swap the surviving
+    mutants make) either overflows the cap or splits one message too many."""
+    rows = [{"seat": "s", "kind": "k", "text": "a" * 100} for _ in range(3)]
+    line_len = len(mirror.format_row(rows[0], "m"))
+    assert line_len == 109
+    joined_len = line_len * 3 + 2  # two "\n" separators between three lines
+    tight_cap = joined_len - 1  # one char too small to hold all three
+    chunks = mirror.chunk_rows(rows, "m", cap=tight_cap)
+    for content, chunk_rows_in in chunks:
+        assert len(content) <= tight_cap
+    # no row lost to the split
+    assert sum(len(rows_in) for _, rows_in in chunks) == 3
+    # and with a cap sized to fit exactly, nothing splits unnecessarily
+    exact_chunks = mirror.chunk_rows(rows, "m", cap=joined_len)
+    assert len(exact_chunks) == 1
+
+
+# ---- post_content: the OSError/URLError retry path (never previously
+# exercised -- only the 429/HTTPError path had tests) ------------------------
+# (mutation gate: 6 of 12 survived, all in or around this branch)
+
+
+class _FakeResp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b""
+
+
+def test_post_content_retries_transient_oserror_then_delivers(monkeypatch):
+    calls = []
+
+    def flaky_urlopen(req, timeout=15):
+        calls.append(1)
+        if len(calls) < 3:
+            raise OSError("connection reset")
+        return _FakeResp()
+
+    monkeypatch.setattr(mirror.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mirror.urllib.request, "urlopen", flaky_urlopen)
+    assert mirror.post_content("http://x.invalid/hook", "hello") is True
+    assert len(calls) == 3  # two failures retried, third attempt delivered
+
+
+def test_post_content_gives_up_after_max_retries_oserror(monkeypatch, capsys):
+    calls = []
+
+    def always_fail(req, timeout=15):
+        calls.append(1)
+        raise OSError("still down")
+
+    monkeypatch.setattr(mirror.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mirror.urllib.request, "urlopen", always_fail)
+    assert mirror.post_content("http://x.invalid/hook", "hello") is False
+    # first attempt + MAX_RETRIES retries, then stop -- never fewer, never more
+    assert len(calls) == mirror.MAX_RETRIES + 1
+    err = capsys.readouterr().err
+    assert ("after %d attempt(s)" % (mirror.MAX_RETRIES + 1)) in err
+
+
+def test_post_content_non_429_http_error_gives_up_immediately_with_correct_count(monkeypatch, capsys):
+    def raise_500(req, timeout=15):
+        raise mirror.urllib.error.HTTPError(req.full_url, 500, "Internal Server Error", {}, None)
+
+    monkeypatch.setattr(mirror.urllib.request, "urlopen", raise_500)
+    assert mirror.post_content("http://x.invalid/hook", "hello") is False
+    err = capsys.readouterr().err
+    assert "HTTP 500" in err
+    # a single attempt was made -- the message must report exactly that
+    assert "after 1 attempt(s)" in err
+
+
+# ---- main(): --interval and a truncated --lane must be parsed correctly --
+# (mutation gate: 7 of 12 survived -- --interval had NO direct test at all,
+# and --lane's missing-value guard was only ever exercised with a full,
+# valid flag set)
+
+
+def test_main_interval_flag_is_parsed_and_stripped_before_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        mirror, "follow",
+        lambda runid, interval, lane=mirror.DEFAULT_LANE: calls.append((runid, interval, lane)) or 0,
+    )
+    rc = mirror.main(["mirror.py", "--follow", RUNID, "--interval", "7"])
+    assert rc == 0
+    assert calls == [(RUNID, 7.0, mirror.DEFAULT_LANE)]
+
+
+def test_main_interval_flag_bad_value_returns_2(capsys):
+    assert mirror.main(["mirror.py", "--follow", RUNID, "--interval", "notanumber"]) == 2
+    assert "--interval needs a number" in capsys.readouterr().err
+
+
+def test_main_lane_flag_missing_value_returns_2(capsys):
+    assert mirror.main(["mirror.py", "--once", RUNID, "--lane"]) == 2
+    assert "--lane needs a value" in capsys.readouterr().err
