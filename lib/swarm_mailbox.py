@@ -331,6 +331,116 @@ def read_for(runid, seat):
     return rows
 
 
+def append_mirrored(runid, mirror_seat, rows):
+    """Append rows that some OTHER machine authored, verbatim, into a mirror
+    file, and return how many were written.
+
+    THE ONLY SANCTIONED WAY TO WRITE A ROW THIS PROCESS DID NOT AUTHOR.
+    post() stamps a fresh `at` and writes the CALLER's own file; that is
+    exactly wrong for a row pulled off another machine, whose `at` and `seat`
+    are the facts being preserved. Rather than let an adapter reach around this
+    module and format its own JSONL (a second writer of the mailbox's file
+    format, free to drift), that need lives here, next to the layout it
+    depends on. See adapters/remote/.
+
+    behavior: appends each row as one JSON line to <mirror_seat>.jsonl inside
+      the run's directory, creating the directory if needed. Rows are written
+      in the order given, unmodified -- no timestamp added or rewritten, no
+      field dropped. Validation happens for EVERY row before ANY row is
+      written, so a bad row in a batch leaves the file untouched rather than
+      half-appended.
+    in: runid; mirror_seat, the file to append to; rows, an iterable of dicts.
+    out: int, the number of rows appended (0 for an empty batch).
+    side effects: creates the run directory; appends to one file.
+    errors: ValueError for an invalid mirror_seat, a non-dict row, a row with
+      no "seat", or a row whose "seat" EQUALS mirror_seat.
+    preconditions: THE CALLER MUST BE THE ONLY WRITER OF <mirror_seat>.jsonl on
+      this machine. One writer per file is the invariant that makes this
+      mailbox race-free (see COLLISION-FREE BY CONSTRUCTION above); a mirror
+      file is that invariant's remote arm, and two syncs pointed at one mirror
+      file break it exactly as two seats sharing a file would. The
+      seat-vs-mirror_seat check enforces the other half structurally: a mirror
+      file must never carry a row in its own name, because that is what a REAL
+      seat's file means and a mirror must not impersonate a seat.
+    limitations: `kind` is deliberately NOT validated. The row came from
+      another machine, whose checkout may run a newer (or older) VALID_KINDS
+      than this one, and a mirror that enforced the local vocabulary would
+      silently drop rows a peer legitimately wrote. VALID_KINDS is the
+      WRITE-side gate for rows authored HERE (see post()), and stays that.
+    """
+    if not _valid_seat(mirror_seat):
+        raise ValueError("invalid mirror seat name %r" % mirror_seat)
+    rows = list(rows)
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(
+                "mirrored row must be a dict, got %s" % type(row).__name__
+            )
+        if not row.get("seat"):
+            raise ValueError("mirrored row has no seat: %r" % (row,))
+        if row["seat"] == mirror_seat:
+            raise ValueError(
+                "row seat %r equals the mirror file %r -- a mirror file must "
+                "never carry rows in its own name" % (row["seat"], mirror_seat)
+            )
+    if not rows:
+        return 0
+    init(runid)
+    path = _seat_path(runid, mirror_seat)
+    with open(path, "a") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+    return len(rows)
+
+
+def fresh_rows_by_seat(rows, cursor, keep=None):
+    """Split already-read rows into (fresh_rows, new_cursor) using per-seat row
+    COUNTS as the cursor.
+
+    WHY COUNTS AND NOT TIMESTAMPS: seat files are append-only with exactly one
+    writer, so row N of a seat is stable forever -- "new" is exactly the indices
+    at or past that seat's count. A timestamp cursor has to answer "what about a
+    second row with the same `at`"; a count never has to.
+
+    Callers hand in rows sorted by `at` (read_siblings sorts, stably), which
+    preserves each seat's own file order inside the merged stream, so counting
+    per seat over the merged stream reconstructs each file's position exactly.
+
+    Lives here rather than in adapters/discord/mirror.py (where it was written)
+    because a SECOND adapter now needs the identical arithmetic over a different
+    source -- adapters/remote/sync.py, over another machine's rows, arriving as
+    a subprocess's stdout instead of a local read. Two copies of a cursor rule
+    are two things to keep in step; this is one.
+
+    behavior: walks rows in order tracking a per-seat index; a row at index >=
+      cursor[seat] is fresh. THE CURSOR ADVANCES OVER EVERY ROW, including rows
+      `keep` rejects -- a filtered row is seen, just not returned, and a cursor
+      that skipped it would re-scan it on every pass forever.
+    in: rows, a list of row dicts; cursor, a {seat: count} dict (a missing seat
+      reads as 0); keep, an optional predicate selecting which FRESH rows to
+      return.
+    out: (fresh_rows, new_cursor). new_cursor is a new dict -- the caller's is
+      never mutated -- and never moves a seat's count backwards.
+    side effects: none, this is pure. Persisting new_cursor is the caller's job.
+    errors: none for ordinary input; a cursor value that is not int-able
+      propagates its own ValueError.
+    """
+    seen = {}
+    fresh = []
+    for row in rows:
+        seat = row.get("seat", "?")
+        idx = seen.get(seat, 0)
+        seen[seat] = idx + 1
+        if idx >= int(cursor.get(seat, 0)):
+            if keep is not None and not keep(row):
+                continue
+            fresh.append(row)
+    new_cursor = dict(cursor)
+    for seat, count in seen.items():
+        new_cursor[seat] = max(count, int(cursor.get(seat, 0)))
+    return fresh, new_cursor
+
+
 def _extract_flags(args):
     """Pull optional `--topic <name>`, `--to <seat>`, and boolean `--subs` out of
     a positional arg list.

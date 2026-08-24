@@ -96,7 +96,6 @@ Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
 import json
 import os
 import re
-import socket
 import sys
 import time
 import urllib.error
@@ -105,6 +104,7 @@ import urllib.request
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+import comms_machine  # noqa: E402  (machine_label, re-exported below)
 import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
 
@@ -220,8 +220,13 @@ def resolve_webhook_url(lane=DEFAULT_LANE):
     sys.exit(2)
 
 
-def machine_label():
-    return os.environ.get("COMMS_MACHINE_LABEL") or socket.gethostname().split(".")[0]
+# machine_label lives in lib/comms_machine.py and is RE-EXPORTED here, not
+# reimplemented: it moved out when adapters/remote/ began writing the label
+# into seat names that cross the network (a sync adapter must not import a
+# display adapter to learn its own machine's name). The name stays bound in
+# this module's namespace because ingest_mirror.py, landings.py, and the test
+# suite all reach it as mirror.machine_label().
+machine_label = comms_machine.machine_label
 
 
 # ---- author (Discord webhook `username`) ----------------------------------
@@ -386,23 +391,17 @@ def collect_new(runid, lane=DEFAULT_LANE):
     are returned in `fresh` for posting. The default lane's filter is a
     no-op (every new row is fresh, exactly the pre-lane behavior); the convo
     lane additionally requires _is_convo_row. A row a lane filters out still
-    counts against that lane's cursor -- see module docstring, LANES."""
+    counts against that lane's cursor -- see module docstring, LANES.
+
+    The counting itself is swarm_mailbox.fresh_rows_by_seat (moved there when
+    adapters/remote/sync.py needed the same arithmetic over another machine's
+    rows -- one cursor rule, two adapters). This function keeps what is
+    Discord-specific: which run to read, which lane's cursor, and which rows
+    that lane wants."""
     rows = swarm_mailbox.read_siblings(runid, OBSERVER_SEAT)
     cursor = _load_cursor(runid, lane)
-    seen = {}
-    fresh = []
-    for row in rows:
-        seat = row.get("seat", "?")
-        idx = seen.get(seat, 0)
-        seen[seat] = idx + 1
-        if idx >= int(cursor.get(seat, 0)):
-            if lane == "convo" and not _is_convo_row(row):
-                continue
-            fresh.append(row)
-    new_cursor = dict(cursor)
-    for seat, count in seen.items():
-        new_cursor[seat] = max(count, int(cursor.get(seat, 0)))
-    return fresh, new_cursor
+    keep = _is_convo_row if lane == "convo" else None
+    return swarm_mailbox.fresh_rows_by_seat(rows, cursor, keep=keep)
 
 
 def chunk_rows(rows, machine, cap=CONTENT_CAP, identities=None):
