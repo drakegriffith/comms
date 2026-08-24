@@ -72,72 +72,179 @@ def webhook(monkeypatch):
     srv.server_close()
 
 
-def _append_raw(seat, kind, text):
+def _append_raw(seat, kind, text, topic=None, at=None):
     """Write a row straight to the seat's jsonl -- the on-disk contract --
     so tests can carry kinds VALID_KINDS does not (yet) allow, exactly what
     the parallel kind-vocabulary branch will produce."""
     d = os.path.join(os.environ["COMMS_ROOT"], "comms-%s" % RUNID)
     os.makedirs(d, exist_ok=True)
-    row = {"seat": seat, "at": "2026-08-21T00:00:00+00:00", "kind": kind, "text": text}
+    row = {
+        "seat": seat,
+        "at": at or "2026-08-21T00:00:00+00:00",
+        "kind": kind,
+        "text": text,
+    }
+    if topic is not None:
+        row["topic"] = topic
     with open(os.path.join(d, "%s.jsonl" % seat), "a") as fh:
         fh.write(json.dumps(row) + "\n")
 
 
-# ---- formatting ----------------------------------------------------------
+def _fake_post(monkeypatch, posted):
+    """Install a post_content stand-in that records (url, content, username)
+    without touching the network. `posted` accumulates 3-tuples."""
+
+    def fake(url, content, username=None):
+        posted.append((url, content, username))
+        return True
+
+    monkeypatch.setattr(mirror, "post_content", fake)
 
 
-def test_format_row_prefix_and_kind():
-    row = {"seat": "alpha", "kind": "finding", "text": "cursor landed"}
-    assert mirror.format_row(row, "studio") == "[studio/alpha] finding: cursor landed"
+# ---- build_content: kind -> emoji, event-shape precedence -----------------
 
 
-def test_format_row_truncates_to_300():
-    row = {"seat": "a", "kind": "finding", "text": "x" * 400}
-    line = mirror.format_row(row, "m")
-    assert line.endswith("x" * 300)
-    assert "x" * 301 not in line
+def test_build_content_kind_emoji_prefixes():
+    cases = {
+        "finding": "\U0001f4ec✅",
+        "comment": "\U0001f4ec\U0001f4ac",
+        "reply": "↩️",
+        "claim": "\U0001f4cc",
+        "blocker": "\U0001f6a7",
+        "status": "ℹ️",
+    }
+    for kind, emoji in cases.items():
+        row = {"seat": "a", "kind": kind, "text": "t", "topic": "default"}
+        assert mirror.build_content(row) == "%s t" % emoji
 
 
-def test_machine_label_env_overrides_hostname():
-    assert mirror.machine_label() == "studio"
+def test_build_content_unknown_kind_falls_back_to_info_emoji():
+    row = {"seat": "a", "kind": "mystery", "text": "t", "topic": "default"}
+    assert mirror.build_content(row) == "ℹ️ t"
 
 
-def test_machine_label_falls_back_to_short_hostname(monkeypatch):
-    monkeypatch.delenv("COMMS_MACHINE_LABEL", raising=False)
-    label = mirror.machine_label()
-    assert label and "." not in label
+def test_build_content_truncates_to_300_chars_of_text():
+    row = {"seat": "a", "kind": "finding", "text": "x" * 400, "topic": "default"}
+    content = mirror.build_content(row)
+    assert content.endswith("x" * 300)
+    assert "x" * 301 not in content
 
 
-# ---- enrollment identity (display-only; joined by seat at format time) ----
+def test_build_content_session_started_renders_agent_born_verb():
+    row = {
+        "seat": "alpha",
+        "kind": "status",
+        "text": "session started in /Users/drake/code/comms",
+        "topic": "default",
+    }
+    assert mirror.build_content(row) == "\U0001f423 I am awake in /Users/drake/code/comms"
 
 
-def test_format_row_with_full_identity():
-    row = {"seat": "kimi1", "kind": "finding", "text": "hook rot in leg 2"}
+def test_build_content_status_without_session_started_shape_uses_status_emoji():
+    row = {"seat": "alpha", "kind": "status", "text": "still working", "topic": "default"}
+    assert mirror.build_content(row) == "ℹ️ still working"
+
+
+def test_build_content_unicast_renders_to_target_seat():
+    row = {"seat": "alpha", "kind": "finding", "text": "direct msg", "topic": "@bravo"}
+    assert mirror.build_content(row) == "\U0001f4e8 to bravo: direct msg"
+
+
+def test_build_content_unicast_overrides_kind_emoji():
+    # A unicast finding/blocker/claim renders the "to <seat>" shape, not its
+    # kind's emoji -- a direct message is conversation regardless of kind
+    # (same rule the convo-lane filter already applies, see swarm_mailbox).
+    row = {"seat": "alpha", "kind": "blocker", "text": "stuck", "topic": "@bravo"}
+    assert mirror.build_content(row) == "\U0001f4e8 to bravo: stuck"
+
+
+def test_build_content_bridge_row_bare_agent_id_never_bare_object():
+    # This is the exact complaint the feature exists to fix: "-> aecd8555b8a274737: comment"
+    row = {
+        "seat": "dispatch",
+        "kind": "comment",
+        "text": "-> aecd8555b8a274737: comment",
+        "topic": "default",
+    }
+    content = mirror.build_content(row)
+    assert "aecd8555b8a274737" not in content  # raw id never the bare object
+    assert content == "\U0001f4ec\U0001f4ac sent to a subagent (aecd8555): comment"
+
+
+def test_build_content_bridge_row_to_a_real_seat_renders_readably():
+    row = {
+        "seat": "dispatch",
+        "kind": "comment",
+        "text": "-> worker: needs review",
+        "topic": "default",
+    }
+    assert mirror.build_content(row) == "\U0001f4ec\U0001f4ac sent to worker: needs review"
+
+
+def test_build_content_bridge_row_precedence_under_unicast():
+    # A bridge-shaped text on an actual unicast topic renders as the unicast
+    # (bridge rows in production never carry an "@" topic, see mirror.py's
+    # module docstring, but the precedence must still be well-defined).
+    row = {
+        "seat": "dispatch",
+        "kind": "comment",
+        "text": "-> aecd8555b8a274737: comment",
+        "topic": "@bravo",
+    }
+    assert mirror.build_content(row) == "\U0001f4e8 to bravo: -> aecd8555b8a274737: comment"
+
+
+# ---- build_author: identity roster, sanitization ---------------------------
+
+
+def test_build_author_with_full_identity():
     identity = {"model": "Kimi K3", "project": "agent-os", "area": "hooks/"}
-    assert (
-        mirror.format_row(row, "macbook", identity)
-        == "[macbook] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: hook rot in leg 2"
-    )
+    assert mirror.build_author("kimi1", identity, "macbook") == "kimi1 · Kimi K3 on agent-os (macbook)"
 
 
-def test_format_row_with_partial_identity_drops_absent_parts():
-    row = {"seat": "kimi1", "kind": "finding", "text": "t"}
-    assert (
-        mirror.format_row(row, "macbook", {"model": "Opus 5"})
-        == "[macbook] Opus 5 | seat kimi1 | finding: t"
-    )
-    assert (
-        mirror.format_row(row, "macbook", {"project": "agent-os"})
-        == "[macbook] on agent-os | seat kimi1 | finding: t"
-    )
+def test_build_author_partial_identity_drops_absent_parts():
+    assert mirror.build_author("kimi1", {"model": "Opus 5"}, "macbook") == "kimi1 · Opus 5 (macbook)"
+    assert mirror.build_author("kimi1", {"project": "agent-os"}, "macbook") == "kimi1 · on agent-os (macbook)"
 
 
-def test_format_row_without_identity_is_byte_identical_to_old_format():
-    row = {"seat": "alpha", "kind": "finding", "text": "cursor landed"}
-    old = "[studio/alpha] finding: cursor landed"
-    assert mirror.format_row(row, "studio") == old
-    assert mirror.format_row(row, "studio", None) == old
-    assert mirror.format_row(row, "studio", {}) == old
+def test_build_author_without_identity_degrades_to_seat_and_machine():
+    assert mirror.build_author("alpha", None, "studio") == "alpha (studio)"
+    assert mirror.build_author("alpha", {}, "studio") == "alpha (studio)"
+
+
+def test_build_author_strips_everyone_and_here_mentions():
+    assert "@everyone" not in mirror.build_author("@everyone", None, "studio")
+    assert "@here" not in mirror.build_author("@here", None, "studio")
+    assert mirror.build_author("@everyone", None, "studio") == "everyone (studio)"
+
+
+def test_build_author_mention_strip_is_case_insensitive():
+    assert "@Everyone" not in mirror.build_author("@Everyone", None, "studio")
+
+
+def test_build_author_strips_zero_width_characters():
+    smuggled = "alpha​‌‍﻿"
+    author = mirror.build_author(smuggled, None, "studio")
+    for ch in "​‌‍﻿":
+        assert ch not in author
+
+
+def test_format_row_returns_author_content_tuple():
+    row = {"seat": "alpha", "kind": "finding", "text": "cursor landed", "topic": "default"}
+    author, content = mirror.format_row(row, "studio")
+    assert author == "alpha (studio)"
+    assert content == "\U0001f4ec✅ cursor landed"
+
+
+def test_format_row_joins_identity_by_seat():
+    row = {"seat": "kimi1", "kind": "finding", "text": "hook rot in leg 2", "topic": "default"}
+    identity = {"model": "Kimi K3", "project": "agent-os", "area": "hooks/"}
+    author, content = mirror.format_row(row, "macbook", identity)
+    assert author == "kimi1 · Kimi K3 on agent-os (macbook)"
+    assert content == "\U0001f4ec✅ hook rot in leg 2"
+
+
+# ---- enrollment identity roster (unchanged surface) ------------------------
 
 
 def test_enroll_identity_roundtrips_through_roster():
@@ -155,8 +262,110 @@ def test_enroll_without_identity_yields_empty_roster_map():
     swarm_arm.arm(RUNID)
     assert swarm_arm.enroll(RUNID, "agent-a", seat="alpha", topics="t1")
     assert swarm_arm.seat_identities(RUNID) == {}
-    # And with no arm state at all (the common pre-identity case): still {}.
     assert swarm_arm.seat_identities("never-armed") == {}
+
+
+def test_machine_label_env_overrides_hostname():
+    assert mirror.machine_label() == "studio"
+
+
+def test_machine_label_falls_back_to_short_hostname(monkeypatch):
+    monkeypatch.delenv("COMMS_MACHINE_LABEL", raising=False)
+    label = mirror.machine_label()
+    assert label and "." not in label
+
+
+# ---- chunk_rows: per-seat authorship, batching, cap ------------------------
+
+
+def test_chunk_rows_never_mixes_two_seats_into_one_message():
+    rows = [
+        {"seat": "alpha", "kind": "finding", "text": "first", "topic": "default"},
+        {"seat": "beta", "kind": "blocker", "text": "second", "topic": "default"},
+    ]
+    chunks = mirror.chunk_rows(rows, "studio")
+    assert len(chunks) == 2  # one POST per seat, even though both fit under the cap
+    authors = [author for author, _, _ in chunks]
+    assert authors == ["alpha (studio)", "beta (studio)"]
+    assert chunks[0][2] == [rows[0]]
+    assert chunks[1][2] == [rows[1]]
+
+
+def test_chunk_rows_groups_consecutive_same_seat_rows_into_one_message():
+    rows = [
+        {"seat": "alpha", "kind": "finding", "text": "first", "topic": "default"},
+        {"seat": "alpha", "kind": "comment", "text": "second", "topic": "default"},
+    ]
+    chunks = mirror.chunk_rows(rows, "studio")
+    assert len(chunks) == 1
+    author, content, chunk_rows_in = chunks[0]
+    assert author == "alpha (studio)"
+    assert "first" in content and "second" in content
+    assert chunk_rows_in == rows
+
+
+def test_chunk_rows_seat_change_starts_a_new_chunk_even_under_the_cap():
+    rows = [
+        {"seat": "alpha", "kind": "finding", "text": "a", "topic": "default"},
+        {"seat": "beta", "kind": "finding", "text": "b", "topic": "default"},
+        {"seat": "alpha", "kind": "finding", "text": "c", "topic": "default"},
+    ]
+    chunks = mirror.chunk_rows(rows, "studio", cap=1900)
+    # three seat-runs (alpha, beta, alpha), never re-merged even though the
+    # same seat reappears later -- ordering must be preserved.
+    assert len(chunks) == 3
+    assert [a for a, _, _ in chunks] == ["alpha (studio)", "beta (studio)", "alpha (studio)"]
+
+
+def test_chunk_rows_never_exceeds_cap_even_at_a_tight_boundary():
+    """Same-seat rows still respect the content cap: a size tracker off by
+    even 2 chars either overflows the cap or splits one message too many."""
+    rows = [{"seat": "s", "kind": "finding", "text": "a" * 100, "topic": "default"} for _ in range(3)]
+    line_len = len(mirror.build_content(rows[0]))
+    assert line_len == 103
+    joined_len = line_len * 3 + 2  # two "\n" separators between three lines
+    tight_cap = joined_len - 1  # one char too small to hold all three
+    chunks = mirror.chunk_rows(rows, "m", cap=tight_cap)
+    for _author, content, _rows_in in chunks:
+        assert len(content) <= tight_cap
+    assert sum(len(rows_in) for _, _, rows_in in chunks) == 3  # no row lost
+    exact_chunks = mirror.chunk_rows(rows, "m", cap=joined_len)
+    assert len(exact_chunks) == 1
+
+
+# ---- post_content: username field -----------------------------------------
+
+
+def test_post_content_includes_username_when_given(webhook):
+    assert mirror.post_content(os.environ["DISCORD_COMMS_WEBHOOK_URL"], "hi", username="alpha (studio)") is True
+    assert webhook.requests[0] == {"content": "hi", "username": "alpha (studio)"}
+
+
+def test_post_content_omits_username_key_when_not_given(webhook):
+    assert mirror.post_content(os.environ["DISCORD_COMMS_WEBHOOK_URL"], "hi") is True
+    assert "username" not in webhook.requests[0]
+    assert webhook.requests[0] == {"content": "hi"}
+
+
+# ---- mirroring, batching, cursor -----------------------------------------
+
+
+def test_once_posts_two_seats_as_two_separate_authored_messages(webhook):
+    swarm_mailbox.post(RUNID, "alpha", "finding", "first")
+    swarm_mailbox.post(RUNID, "beta", "blocker", "second")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 2  # one POST per seat, not batched across seats
+    by_username = {r["username"]: r["content"] for r in webhook.requests}
+    assert by_username["alpha (studio)"] == "\U0001f4ec✅ first"
+    assert by_username["beta (studio)"] == "\U0001f6a7 second"
+
+
+def test_kind_agnostic_mirrors_unknown_kinds(webhook):
+    _append_raw("alpha", "comment", "a new kind from the parallel branch")
+    assert mirror.run_once(RUNID) == 0
+    req = webhook.requests[0]
+    assert req["username"] == "alpha (studio)"
+    assert req["content"] == "\U0001f4ec\U0001f4ac a new kind from the parallel branch"
 
 
 def test_once_joins_identity_from_enrollment(webhook):
@@ -168,32 +377,9 @@ def test_once_joins_identity_from_enrollment(webhook):
     swarm_mailbox.post(RUNID, "kimi1", "finding", "identity rendered")
     swarm_mailbox.post(RUNID, "alpha", "finding", "no identity here")
     assert mirror.run_once(RUNID) == 0
-    content = webhook.requests[0]["content"]
-    # Enrolled seat: rich line. Un-enrolled sibling in the SAME batch: old line.
-    assert (
-        "[studio] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: identity rendered"
-        in content
-    )
-    assert "[studio/alpha] finding: no identity here" in content
-
-
-# ---- mirroring, batching, cursor -----------------------------------------
-
-
-def test_once_posts_rows_batched_into_one_message(webhook):
-    swarm_mailbox.post(RUNID, "alpha", "finding", "first")
-    swarm_mailbox.post(RUNID, "beta", "blocker", "second")
-    assert mirror.run_once(RUNID) == 0
-    assert len(webhook.requests) == 1  # batched, not one POST per row
-    content = webhook.requests[0]["content"]
-    assert "[studio/alpha] finding: first" in content
-    assert "[studio/beta] blocker: second" in content
-
-
-def test_kind_agnostic_mirrors_unknown_kinds(webhook):
-    _append_raw("alpha", "comment", "a new kind from the parallel branch")
-    assert mirror.run_once(RUNID) == 0
-    assert "[studio/alpha] comment: a new kind" in webhook.requests[0]["content"]
+    by_username = {r["username"]: r["content"] for r in webhook.requests}
+    assert by_username["kimi1 · Kimi K3 on agent-os (studio)"] == "\U0001f4ec✅ identity rendered"
+    assert by_username["alpha (studio)"] == "\U0001f4ec✅ no identity here"
 
 
 def test_cursor_never_reposts_across_restarts(webhook):
@@ -209,6 +395,22 @@ def test_cursor_never_reposts_across_restarts(webhook):
     assert "one" not in webhook.requests[1]["content"]
 
 
+def test_existing_cursor_file_is_honored_across_the_rendering_upgrade(webhook):
+    """The cursor FORMAT (per-seat row counts) is unchanged by this feature
+    -- prove an old-shape cursor file, dropped in before this test ever
+    calls run_once, is read correctly and nothing it already counted is
+    re-posted on deploy."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "already delivered before upgrade")
+    os.makedirs(os.path.dirname(mirror._cursor_path(RUNID)), exist_ok=True)
+    with open(mirror._cursor_path(RUNID), "w") as fh:
+        json.dump({"alpha": 1}, fh)  # pre-existing cursor: row 0 already seen
+    swarm_mailbox.post(RUNID, "alpha", "finding", "posted after upgrade")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+    assert "posted after upgrade" in webhook.requests[0]["content"]
+    assert "already delivered before upgrade" not in webhook.requests[0]["content"]
+
+
 def test_long_batch_chunks_under_discord_cap(webhook):
     for i in range(8):
         swarm_mailbox.post(RUNID, "alpha", "finding", ("row%d " % i) * 60)
@@ -216,6 +418,7 @@ def test_long_batch_chunks_under_discord_cap(webhook):
     assert len(webhook.requests) > 1  # would blow the 2000-char cap in one
     for req in webhook.requests:
         assert len(req["content"]) <= 2000
+        assert req["username"] == "alpha (studio)"  # same seat -> same author throughout
     joined = "\n".join(r["content"] for r in webhook.requests)
     for i in range(8):
         assert "row%d" % i in joined  # nothing lost to chunking
@@ -314,7 +517,7 @@ def test_main_once_returns_run_once_result(webhook):
     assert "via main" in webhook.requests[0]["content"]
 
 
-# ---- default lane: byte-identical when --lane is not given ----------------
+# ---- default lane: same rendering upgrade as convo -------------------------
 
 
 def test_default_lane_secret_var_unchanged():
@@ -322,14 +525,15 @@ def test_default_lane_secret_var_unchanged():
     assert mirror.resolve_webhook_url is not None  # still the one entrypoint
 
 
-def test_default_lane_format_and_secret_var_unchanged(webhook):
+def test_default_lane_renders_with_the_same_emoji_content_as_convo(webhook):
     # No --lane anywhere: run_once() with no lane arg, and the CLI with no
-    # --lane flag, must both still speak DISCORD_COMMS_WEBHOOK_URL and emit
-    # the pre-lane line format, exactly as before this feature existed.
+    # --lane flag, must both still speak DISCORD_COMMS_WEBHOOK_URL. Content
+    # rendering (emoji, per-seat authorship) applies to BOTH lanes now.
     swarm_mailbox.post(RUNID, "alpha", "finding", "first")
     assert mirror.run_once(RUNID) == 0
-    content = webhook.requests[0]["content"]
-    assert "[studio/alpha] finding: first" in content
+    req = webhook.requests[0]
+    assert req["username"] == "alpha (studio)"
+    assert req["content"] == "\U0001f4ec✅ first"
 
 
 def test_default_lane_missing_secret_names_all_lane_var(capsys):
@@ -390,11 +594,7 @@ def test_convo_lane_cursor_independent_of_default_lane_cursor(monkeypatch):
     all_url = "http://127.0.0.1:1/all"
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", convo_url)
     monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", all_url)
-
-    def fake_post(url, content):
-        return True
-
-    monkeypatch.setattr(mirror, "post_content", fake_post)
+    monkeypatch.setattr(mirror, "post_content", lambda url, content, username=None: True)
     swarm_mailbox.post(RUNID, "alpha", "comment", "hello there")
     assert mirror.run_once(RUNID, lane="all") == 0
     assert mirror.run_once(RUNID, lane="convo") == 0
@@ -411,28 +611,28 @@ def test_convo_lane_cursor_independent_of_default_lane_cursor(monkeypatch):
 
 def test_convo_lane_mirrors_unicast_topic_rows(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post(RUNID, "alpha", "finding", "direct msg", to="bravo")
     assert mirror.run_once(RUNID, lane="convo") == 0
-    assert posted and "direct msg" in posted[0]
+    assert posted and "direct msg" in posted[0][1]
 
 
 def test_convo_lane_mirrors_comment_and_reply_kinds(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post(RUNID, "alpha", "comment", "chatting")
     swarm_mailbox.post(RUNID, "beta", "reply", "replying")
     assert mirror.run_once(RUNID, lane="convo") == 0
-    joined = "\n".join(posted)
+    joined = "\n".join(c for _, c, _ in posted)
     assert "chatting" in joined
     assert "replying" in joined
 
 
 def test_convo_lane_filters_out_plain_finding_status(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post(RUNID, "alpha", "finding", "not conversation")
     swarm_mailbox.post(RUNID, "alpha", "status", "still not conversation")
@@ -453,13 +653,13 @@ def test_convo_lane_filtered_rows_still_advance_cursor(monkeypatch):
 
 def test_convo_lane_mixed_batch_only_posts_convo_rows(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post(RUNID, "alpha", "finding", "skip me")
     swarm_mailbox.post(RUNID, "alpha", "comment", "keep me")
     swarm_mailbox.post(RUNID, "alpha", "status", "skip me too")
     assert mirror.run_once(RUNID, lane="convo") == 0
-    joined = "\n".join(posted)
+    joined = "\n".join(c for _, c, _ in posted)
     assert "keep me" in joined
     assert "skip me" not in joined
     assert "skip me too" not in joined
@@ -469,12 +669,12 @@ def test_convo_lane_mixed_batch_only_posts_convo_rows(monkeypatch):
 
 def test_all_lane_is_unfiltered_mirrors_everything(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
     swarm_mailbox.post(RUNID, "alpha", "finding", "plain finding")
     swarm_mailbox.post(RUNID, "alpha", "comment", "a comment too")
     assert mirror.run_once(RUNID, lane="all") == 0
-    joined = "\n".join(posted)
+    joined = "\n".join(c for _, c, _ in posted)
     assert "plain finding" in joined
     assert "a comment too" in joined
 
@@ -497,7 +697,12 @@ def test_cli_lane_bogus_rejected():
 
 def test_cli_lane_convo_posts_to_convo_webhook(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append((url, content)) or True)
+
+    def fake(url, content, username=None):
+        posted.append((url, content, username))
+        return True
+
+    monkeypatch.setattr(mirror, "post_content", fake)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post(RUNID, "alpha", "comment", "cli convo lane")
     assert mirror.main(["mirror.py", "--once", RUNID, "--lane", "convo"]) == 0
@@ -575,7 +780,7 @@ def test_once_still_exits_2_on_missing_secret_no_retry():
 
 def test_follow_all_discovers_and_mirrors_every_run(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
     swarm_mailbox.post("run-a", "alpha", "finding", "in run a")
     swarm_mailbox.post("run-b", "beta", "finding", "in run b")
@@ -586,14 +791,14 @@ def test_follow_all_discovers_and_mirrors_every_run(monkeypatch):
     monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
     rc = mirror.follow_all(5)
     assert rc == 0
-    joined = "\n".join(posted)
+    joined = "\n".join(c for _, c, _ in posted)
     assert "in run a" in joined
     assert "in run b" in joined
 
 
 def test_follow_all_honors_lane_argument(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
     swarm_mailbox.post("run-c", "alpha", "comment", "chit chat")
     swarm_mailbox.post("run-c", "alpha", "finding", "not chat")
@@ -604,14 +809,14 @@ def test_follow_all_honors_lane_argument(monkeypatch):
     monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
     rc = mirror.follow_all(5, lane="convo")
     assert rc == 0
-    joined = "\n".join(posted)
+    joined = "\n".join(c for _, c, _ in posted)
     assert "chit chat" in joined
     assert "not chat" not in joined
 
 
 def test_main_follow_all_dispatches(monkeypatch):
     posted = []
-    monkeypatch.setattr(mirror, "post_content", lambda url, content: posted.append(content) or True)
+    _fake_post(monkeypatch, posted)
     monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
     swarm_mailbox.post("run-d", "alpha", "finding", "via follow-all cli")
 
@@ -621,7 +826,73 @@ def test_main_follow_all_dispatches(monkeypatch):
     monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
     rc = mirror.main(["mirror.py", "--follow-all"])
     assert rc == 0
-    assert "via follow-all cli" in "\n".join(posted)
+    assert "via follow-all cli" in "\n".join(c for _, c, _ in posted)
+
+
+# ---- follow_all --lane convo: also tails the ingest log --------------------
+
+
+def test_follow_all_convo_lane_also_tails_ingest_each_pass(monkeypatch):
+    calls = []
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+
+    def fake_tail_once(url):
+        calls.append(url)
+        return 0
+
+    import ingest_mirror
+    monkeypatch.setattr(ingest_mirror, "tail_once", fake_tail_once)
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5, lane="convo")
+    assert rc == 0
+    assert calls == ["http://127.0.0.1:1/convo"]
+
+
+def test_follow_all_default_lane_never_tails_ingest(monkeypatch):
+    calls = []
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
+
+    def fake_tail_once(url):
+        calls.append(url)
+        return 0
+
+    import ingest_mirror
+    monkeypatch.setattr(ingest_mirror, "tail_once", fake_tail_once)
+
+    def fake_sleep(seconds):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5, lane="all")
+    assert rc == 0
+    assert calls == []  # the "all" lane never touches the heartbeat log
+
+
+def test_follow_all_convo_lane_survives_ingest_tail_exception(monkeypatch, capsys):
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+
+    import ingest_mirror
+
+    def boom(url):
+        raise PermissionError("state dir not writable")
+
+    monkeypatch.setattr(ingest_mirror, "tail_once", boom)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(mirror.time, "sleep", fake_sleep)
+    rc = mirror.follow_all(5, lane="convo")  # must not raise PermissionError out
+    assert rc == 1
+    assert sleeps == [5]
+    err = capsys.readouterr().err
+    assert "PermissionError" in err
 
 
 # ---- S1: a per-run exception must not kill the follow loop ----------------
@@ -731,34 +1002,6 @@ def test_save_cursor_uses_pid_suffixed_tmp_name(webhook):
     # cursor file remains
     assert os.path.isfile(mirror._cursor_path(RUNID))
     assert not os.path.isfile(mirror._cursor_tmp_path(RUNID))
-
-
-# ---- chunk_rows: the cap is a hard promise, not a rough guideline ---------
-# (mutation gate: 2 of 9 survived -- both mis-tracked size by exactly 2
-# chars around the join-separator accounting, invisible to the existing
-# batching test's generous margins)
-
-
-def test_chunk_rows_never_exceeds_cap_even_at_a_tight_boundary():
-    """Module docstring: 'Batch rows into as few Discord messages as fit
-    under the content cap.' Three equal-length rows, cap set to exactly one
-    char short of what all three (plus their two '\\n' separators) need: the
-    real size accounting must catch this and split before row 3. A size
-    tracker off by even 2 chars (the size of the +1/-1 swap the surviving
-    mutants make) either overflows the cap or splits one message too many."""
-    rows = [{"seat": "s", "kind": "k", "text": "a" * 100} for _ in range(3)]
-    line_len = len(mirror.format_row(rows[0], "m"))
-    assert line_len == 109
-    joined_len = line_len * 3 + 2  # two "\n" separators between three lines
-    tight_cap = joined_len - 1  # one char too small to hold all three
-    chunks = mirror.chunk_rows(rows, "m", cap=tight_cap)
-    for content, chunk_rows_in in chunks:
-        assert len(content) <= tight_cap
-    # no row lost to the split
-    assert sum(len(rows_in) for _, rows_in in chunks) == 3
-    # and with a cap sized to fit exactly, nothing splits unnecessarily
-    exact_chunks = mirror.chunk_rows(rows, "m", cap=joined_len)
-    assert len(exact_chunks) == 1
 
 
 # ---- post_content: the OSError/URLError retry path (never previously

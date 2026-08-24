@@ -56,6 +56,15 @@ DISCORD_COMMS_WEBHOOK_URL. Never run two of these against the same
 (runid or "every run") AND the same lane at once -- see README.md,
 Concurrency.
 
+"--follow-all --lane convo" ALSO tails the heartbeat-telemetry ingestion
+log each pass (adapters/discord/ingest_mirror.py), posting a "heard from
+mailbox" event when the heartbeat hook delivers new rows to an agent -- one
+process, no second launchd job. It has its own standalone CLI too, if you
+want it separate:
+  python3 $SELF_DIR/ingest_mirror.py --once
+  python3 $SELF_DIR/ingest_mirror.py --follow            # poll loop
+See README.md, Ingestion events.
+
 Keep it alive under launchd (optional): save as
 ~/Library/LaunchAgents/com.comms.discord-mirror.<runid>.plist, then
 'launchctl load' it:

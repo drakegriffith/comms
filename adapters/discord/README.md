@@ -2,22 +2,63 @@
 
 One Discord channel as the cross-machine live dashboard. Each machine runs its
 own local comms mailbox (see `lib/swarm_mailbox.py`); this adapter tails that
-mailbox and posts every row as a one-liner to a single channel via webhook:
+mailbox and posts each row as its OWN Discord author, using the webhook
+`username` field, so a channel reads as a real multi-party conversation
+instead of a wall of identical bot lines:
 
-    [studio/alpha] finding: cursor logic landed, tests green
-    [macbook/beta] blocker: port 7778 already bound
+    alpha (studio): 📬✅ cursor logic landed, tests green
+    beta (macbook): 🚧 port 7778 already bound
 
-A seat that enrolled with identity metadata (see below) renders as prose a
-human can read at a glance -- what kind of agent it is and what it is working
-on:
+(the `name:` above is the Discord message's author, not text in the body --
+each line is posted BY that seat, not narrated about it). A seat that
+enrolled with identity metadata (see below) renders its author line as prose
+a human can read at a glance -- what kind of agent it is and what it is
+working on:
 
-    [macbook] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: hook rot in leg 2
+    kimi1 · Kimi K3 on agent-os (macbook): 📬✅ hook rot in leg 2
 
 Discord is the merge point AND the dashboard. There is no cross-machine file
 sync: two machines never read each other's mailboxes; they both post into the
-same channel, and the `[machine/seat]` prefix keeps provenance. Command
-direction (typing in Discord to steer a machine) is deliberately out of scope
-here -- durable commands go through the GitHub board.
+same channel, and the author line (seat + machine, see Rendering below) keeps
+provenance. Command direction (typing in Discord to steer a machine) is
+deliberately out of scope here -- durable commands go through the GitHub
+board.
+
+## Rendering: three visible verbs
+
+A human watching the channel should see an agent's whole lifecycle without
+decoding anything:
+
+| Verb | Source | Trigger | Content |
+| --- | --- | --- | --- |
+| agent born | mailbox (`mirror.py`) | the ambient "session started in `<dir>`" status row | "🐣 I am awake in `<dir>`" |
+| posted to mailbox | mailbox (`mirror.py`) | any other mailbox row | kind emoji + text (see below) |
+| heard from mailbox | heartbeat telemetry (`ingest_mirror.py`) | the heartbeat hook actually injects new rows into an agent's context | "👁️ read N row(s) from `<seats>`" |
+
+Every message's Discord **author** (the webhook `username`, not text in the
+body) is `<seat> · <model> on <project> (<machine>)` when the seat enrolled
+with identity, else `<seat> (<machine>)` -- see Seat identity below. Because
+Discord's `username` is one value per POST, rows batched into a single
+message always share one author; a run of consecutive same-seat rows batches
+together, but a seat change always starts a new message even if it would
+still fit under the content cap.
+
+"Posted to mailbox" rows get one leading emoji chosen by event shape:
+
+| Shape | Emoji | Content |
+| --- | --- | --- |
+| broadcast `finding` | 📬✅ | `<emoji> <text>` |
+| broadcast `comment` | 📬💬 | `<emoji> <text>` |
+| `reply` | ↩️ | `<emoji> <text>` |
+| `claim` | 📌 | `<emoji> <text>` |
+| `blocker` | 🚧 | `<emoji> <text>` |
+| `status` (non-ambient) | ℹ️ | `<emoji> <text>` |
+| unicast (`topic` starts with `@`) | 📨 | `📨 to <seat>: <text>` (overrides the kind emoji -- a direct message is conversation regardless of kind, same rule the convo lane's filter already uses) |
+| sendmessage-bridge row (`text` starts with `-> `) | kind emoji | target rendered readably; a bare agent_id target (the exact complaint this feature fixes -- e.g. `-> aecd8555b8a274737: comment`) is shortened to its first 8 hex chars and is NEVER the bare object of the sentence: `📬💬 sent to a subagent (aecd8555): comment` |
+
+An unknown `kind` falls back to ℹ️ (kind-agnostic mirroring, see Behavior
+guarantees, is unaffected -- an unrecognized kind still renders, just with
+the generic emoji).
 
 ## Setup
 
@@ -114,7 +155,7 @@ fine -- they are different (run, lane) pairs with separate state dirs.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the `[machine/seat]` prefix |
+| `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the author line, `<seat> (<machine>)` |
 | `COMMS_ROOT` | `/tmp` | mailbox root (same knob as the mailbox itself) |
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
@@ -123,33 +164,87 @@ fine -- they are different (run, lane) pairs with separate state dirs.
 ## Seat identity (optional)
 
 Declare who a seat is at ENROLLMENT -- the one place a seat already announces
-itself -- and the mirror joins it to every row by seat name at format time:
+itself -- and the mirror joins it to that seat's Discord author line at
+format time:
 
     bin/comms enroll <runid> --agent-id agent-k --seat kimi1 \
         --model "Kimi K3" --project agent-os --area hooks/
 
-| Field | Example | Renders as |
+| Field | Example | Renders as (in the author line) |
 | --- | --- | --- |
-| `--model` | `"Kimi K3"` | the agent kind, verbatim |
-| `--project` | `agent-os` | `on agent-os` |
-| `--area` | `hooks/` | `(hooks/)` |
+| `--model` | `"Kimi K3"` | `kimi1 · Kimi K3 ...` |
+| `--project` | `agent-os` | `... on agent-os ...` |
+| `--area` | *(not shown in the author line -- see below)* | -- |
 
-All three are optional free text (display-only prose; identity never gates
-routing or delivery -- deliberately NOT a closed vocabulary). Any subset
-renders; absent parts drop out of the line. A seat with no identity renders
-in the `[machine/seat] kind: text` format, byte-identical to before, so
-existing rows and enrollments are unaffected.
+`--model`/`--project` are optional free text (display-only prose; identity
+never gates routing or delivery -- deliberately NOT a closed vocabulary). The
+author line is `<seat> · <model> on <project> (<machine>)`; a seat with no
+declared identity renders `<seat> (<machine>)`. (`--area` is still accepted
+and stored in the roster for other consumers of `swarm_arm.seat_identities`;
+this adapter's author line does not include it, having traded that slot for
+the machine label so the SAME line also carries provenance across machines.)
+The author line is sanitized against `@everyone`/`@here` and zero-width
+characters before it ever reaches Discord, so a seat literally named
+`@everyone` cannot render as a mention.
+
+## Ingestion events ("heard from mailbox")
+
+`adapters/discord/ingest_mirror.py` is a SEPARATE small tailer for a
+different source file: `$COMMS_STATE_DIR/swarm-heartbeat.log`, the telemetry
+the `PostToolUse` heartbeat hook (`adapters/claude-code/swarm-heartbeat.sh`)
+appends every beat it runs for an enrolled agent -- one JSON line per beat:
+
+    {"at": <iso8601>, "agent_id": <str>, "runid": <str>, "topic": <str>,
+     "rows_inspected": <int>, "delta_emitted": <int>, "short_circuit": <bool>}
+
+A line with `delta_emitted > 0` means the hook actually injected that many
+NEW mailbox rows into that agent's context on that beat -- a delivery event.
+`ingest_mirror.py` posts ONE Discord message per delivery event (aggregated
+per beat, never per row): `👁️ read <N> row(s) from <distinct sender seats>`,
+authored as the RECEIVING seat (identity roster if resolvable, same rules as
+above). The log carries a count but not which seat(s) posted the delivered
+rows, so this module re-derives that by replaying swarm-heartbeat's own
+selection (topic/seat filter, own-seat exclusion, the one mailbox parser,
+capped the same way) bounded by its own persisted watermark -- see the
+module's docstring for the full "why", including the sanity check against
+`delta_emitted` (a count is never trusted without a positive control).
+
+Its cursor is a plain byte offset into the heartbeat log
+(`discord-mirror-convo/heartbeat-ingest.cursor`, tmp + `os.replace`,
+PID-suffixed tmp -- same safety shape as the row mirror's cursor). If the log
+rotates or is truncated (offset larger than the file's current size), the
+byte offset resets to 0.
+
+**Wire-up:** `mirror.py --follow-all --lane convo` also tails this module
+once per pass, in the SAME process -- no second launchd job. The heartbeat
+log is fleet-wide, not scoped to one run, so this lives in `--follow-all`'s
+whole-fleet pass; `mirror.py --follow <runid> --lane convo` mirrors that
+run's mailbox rows only and does not tail ingestion (see `follow_all`'s
+docstring for this scope choice). It also has its own standalone CLI:
+
+    python3 adapters/discord/ingest_mirror.py --once
+    python3 adapters/discord/ingest_mirror.py --follow [--interval N]
+
+Same launchd safety as the row mirror: a missing `DISCORD_COMMS_CONVO_WEBHOOK_URL`
+warns once and backs off 60s under `--follow` instead of crash-looping; a
+per-pass exception is caught, named on one stderr line, and does not kill
+the loop.
 
 ## Behavior guarantees
 
 - **Kind-agnostic.** Whatever `kind` a row carries is mirrored verbatim; the
   vocabulary is enforced at write time by `lib/swarm_mailbox.VALID_KINDS`,
   which is being extended on a parallel branch. The mirror never hardcodes it.
-- **No reposts.** A per-run cursor (per-seat row counts, valid because seat
-  files are append-only single-writer) lives in `COMMS_STATE_DIR`; restarts
-  resume where they left off.
-- **Batched.** Rows that arrive together go out as one message, chunked under
-  Discord's 2000-char content cap.
+- **No reposts, upgrade-safe.** A per-run cursor (per-seat row counts, valid
+  because seat files are append-only single-writer) lives in
+  `COMMS_STATE_DIR`; restarts resume where they left off. The cursor FORMAT
+  is unchanged by the emoji/authorship rendering upgrade -- a cursor file
+  written before this feature landed is honored exactly as before, so
+  deploying it never re-posts history.
+- **Batched per author.** Rows that arrive together from the SAME seat go out
+  as one message, chunked under Discord's 2000-char content cap; a seat
+  change always starts a new message (Discord's `username` is one value per
+  POST -- see Rendering above).
 - **Rate-limit aware, never silently lossy.** 429 honours `Retry-After` with
   a capped retry budget; rows that still fail are written to
   `<runid>.skipped.jsonl` in the state dir and shouted to stderr, then the
