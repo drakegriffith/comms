@@ -14,6 +14,13 @@ file lands under tmp automatically. This file's own autouse fixture only
 adds the knobs conftest does NOT cover: the webhook secret var/file and the
 machine label, plus a default owner/window so tests that don't care about
 discovery specifics have a sane default.
+
+CURSOR SHAPE (post verifier3 fix round): a repo's cursor entry is now
+`{"pulls": {"ts": <iso>, "seen": [<event ids at ts>]}, "issues": {...}}` --
+NOT a flat ISO string -- so PR and issue events landing in the same second
+no longer share (and cannot shadow each other on) one high-water mark. The
+`_cursor()` helper below builds that shape for tests that need to seed a
+specific starting point.
 """
 
 import json
@@ -98,27 +105,43 @@ def webhook_env(monkeypatch):
 PULLS_URL = "repos/acme/widgets/pulls?state=closed&sort=updated&direction=desc&per_page=30"
 ISSUES_URL = "repos/acme/widgets/issues?state=closed&sort=updated&direction=desc&per_page=30"
 
+GIZMOS_PULLS_URL = "repos/acme/gizmos/pulls?state=closed&sort=updated&direction=desc&per_page=30"
+GIZMOS_ISSUES_URL = "repos/acme/gizmos/issues?state=closed&sort=updated&direction=desc&per_page=30"
 
-def _pr(number, title, user, merged_at=None, closed_at=None):
+
+def _pr(number, title, user, merged_at=None, closed_at=None, updated_at=None):
     return {
         "number": number,
         "title": title,
         "user": {"login": user},
         "merged_at": merged_at,
         "closed_at": closed_at,
+        "updated_at": updated_at or merged_at or closed_at,
     }
 
 
-def _issue(number, title, user, closed_at, pull_request=False):
+def _issue(number, title, user, closed_at, pull_request=False, closed_by=None, updated_at=None):
     row = {
         "number": number,
         "title": title,
         "user": {"login": user},
         "closed_at": closed_at,
+        "updated_at": updated_at or closed_at,
+        "closed_by": {"login": closed_by} if closed_by else None,
     }
     if pull_request:
         row["pull_request"] = {"url": "x"}
     return row
+
+
+def _cursor(pulls_ts="2000-01-01T00:00:00Z", pulls_seen=None,
+            issues_ts="2000-01-01T00:00:00Z", issues_seen=None):
+    """Build a repo_cursor dict with an old-enough ts that any realistic
+    test timestamp reads as fresh, unless the test overrides it."""
+    return {
+        "pulls": {"ts": pulls_ts, "seen": pulls_seen or []},
+        "issues": {"ts": issues_ts, "seen": issues_seen or []},
+    }
 
 
 # ---- classification: merged / closed-unmerged / closed-issue ---------------
@@ -133,12 +156,13 @@ def test_merged_pr_renders_with_merged_by_and_emoji(fake_gh, posted):
         ["api", "repos/acme/widgets/pulls/12"],
         {"merged_by": {"login": "bob"}},
     )
-    landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, new_cursor = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == [
         ("2026-08-24T10:00:00Z",
          "\U0001f7e3 bob merged PR #12 on widgets: Add landings watcher")
     ]
+    assert new_cursor["pulls"]["ts"] == "2026-08-24T10:00:00Z"
+    assert new_cursor["pulls"]["seen"] == ["pr:12"]
 
 
 def test_merged_pr_falls_back_to_user_when_merged_by_absent(fake_gh):
@@ -147,7 +171,7 @@ def test_merged_pr_falls_back_to_user_when_merged_by_absent(fake_gh):
     ])
     fake_gh.add(["api", ISSUES_URL], [])
     fake_gh.add(["api", "repos/acme/widgets/pulls/13"], {"merged_by": None})
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == [
         ("2026-08-24T10:05:00Z", "\U0001f7e3 carol merged PR #13 on widgets: Fix typo")
     ]
@@ -158,7 +182,7 @@ def test_closed_unmerged_pr_renders_with_author_no_detail_call(fake_gh):
         _pr(14, "Abandoned idea", "dave", closed_at="2026-08-24T11:00:00Z"),
     ])
     fake_gh.add(["api", ISSUES_URL], [])
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == [
         ("2026-08-24T11:00:00Z",
          "❌ dave closed PR #14 without merging on widgets: Abandoned idea")
@@ -167,29 +191,28 @@ def test_closed_unmerged_pr_renders_with_author_no_detail_call(fake_gh):
     assert ("api", "repos/acme/widgets/pulls/14") not in fake_gh.calls
 
 
-def test_closed_issue_renders_with_closed_by_and_emoji(fake_gh):
+def test_closed_issue_renders_with_closed_by_from_list_row_no_detail_call(fake_gh):
+    # closed_by comes straight off the issues LIST row now (fix: it was
+    # already fully populated there; a detail call for it was wasted cost).
     fake_gh.add(["api", PULLS_URL], [])
     fake_gh.add(["api", ISSUES_URL], [
-        _issue(7, "Crash on startup", "erin", "2026-08-24T09:00:00Z"),
+        _issue(7, "Crash on startup", "erin", "2026-08-24T09:00:00Z", closed_by="frank"),
     ])
-    fake_gh.add(
-        ["api", "repos/acme/widgets/issues/7"],
-        {"closed_by": {"login": "frank"}},
-    )
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == [
         ("2026-08-24T09:00:00Z",
          "✅ frank closed issue #7 on widgets: Crash on startup")
     ]
+    assert ("api", "repos/acme/widgets/issues/7") not in fake_gh.calls
+    assert not any(c[:2] == ("api", "repos/acme/widgets/issues/7") for c in fake_gh.calls)
 
 
 def test_closed_issue_falls_back_to_user_when_closed_by_absent(fake_gh):
     fake_gh.add(["api", PULLS_URL], [])
     fake_gh.add(["api", ISSUES_URL], [
-        _issue(8, "Docs typo", "grace", "2026-08-24T09:10:00Z"),
+        _issue(8, "Docs typo", "grace", "2026-08-24T09:10:00Z"),  # no closed_by
     ])
-    fake_gh.add(["api", "repos/acme/widgets/issues/8"], {"closed_by": None})
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == [
         ("2026-08-24T09:10:00Z", "✅ grace closed issue #8 on widgets: Docs typo")
     ]
@@ -200,7 +223,7 @@ def test_pull_request_key_issue_row_is_skipped(fake_gh):
     fake_gh.add(["api", ISSUES_URL], [
         _issue(9, "Actually a PR", "hank", "2026-08-24T09:20:00Z", pull_request=True),
     ])
-    events, _ = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", _cursor())
     assert events == []
     assert ("api", "repos/acme/widgets/issues/9") not in fake_gh.calls
 
@@ -211,12 +234,85 @@ def test_pr_neither_merged_nor_closed_after_cursor_is_ignored(fake_gh):
             merged_at="2026-08-23T10:00:00Z", closed_at="2026-08-23T10:00:00Z"),
     ])
     fake_gh.add(["api", ISSUES_URL], [])
-    events, latest = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    cursor = _cursor(pulls_ts="2026-08-24T00:00:00Z", issues_ts="2026-08-24T00:00:00Z")
+    events, new_cursor = landings.collect_repo_events("acme/widgets", cursor)
     assert events == []
-    assert latest == "2026-08-24T00:00:00Z"  # cursor unchanged, nothing newer found
+    assert new_cursor["pulls"]["ts"] == "2026-08-24T00:00:00Z"  # unchanged, nothing newer found
 
 
-# ---- cursor: advance + idempotent second pass, first-run today-cap --------
+# ---- pagination: truncation detection + bounded fetch (verifier3 #1) -------
+
+
+def test_fetch_paginated_follows_truncated_pages_until_a_short_page(fake_gh):
+    # 31 rows total: a full page1 (30) whose oldest row is still newer than
+    # the cursor must trigger page2; page2 is short (1 row) so it stops
+    # there -- all 31 rows recovered, no bound-hit warning.
+    page1 = [
+        {"number": n, "updated_at": "2026-08-24T10:%02d:00Z" % n}
+        for n in range(30, 0, -1)
+    ]  # minutes 30..1, newest first
+    page2 = [{"number": 0, "updated_at": "2026-08-24T10:00:00Z"}]  # minute 0, oldest
+    url_page1 = PULLS_URL
+    url_page2 = PULLS_URL + "&page=2"
+    fake_gh.add(["api", url_page1], page1)
+    fake_gh.add(["api", url_page2], page2)
+    rows = landings._fetch_paginated("acme/widgets", "pulls", "2026-08-24T09:00:00Z")
+    assert len(rows) == 31
+    assert {r["number"] for r in rows} == set(range(31))
+    assert ("api", url_page2) in fake_gh.calls
+
+
+def test_fetch_paginated_stops_and_logs_one_line_at_the_page_bound(fake_gh, capsys):
+    # Every page comes back FULL and still fresh -- pagination could run
+    # forever; it must stop at MAX_PAGES and log exactly one stderr line
+    # naming the repo and endpoint (never silent, never unbounded).
+    for page in range(1, landings.MAX_PAGES + 1):
+        rows = [
+            {"number": page * 1000 + i, "updated_at": "2026-08-24T10:00:00Z"}
+            for i in range(landings.PER_PAGE)
+        ]
+        url = PULLS_URL if page == 1 else PULLS_URL + "&page=%d" % page
+        fake_gh.add(["api", url], rows)
+    rows = landings._fetch_paginated("acme/widgets", "pulls", "2026-08-24T00:00:00Z")
+    assert len(rows) == landings.MAX_PAGES * landings.PER_PAGE
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "acme/widgets" in err
+    assert "pulls" in err
+    assert "truncated" in err.lower()
+
+
+def test_fetch_paginated_short_first_page_never_requests_page_two(fake_gh):
+    fake_gh.add(["api", PULLS_URL], [{"number": 1, "updated_at": "2026-08-24T10:00:00Z"}])
+    rows = landings._fetch_paginated("acme/widgets", "pulls", "2000-01-01T00:00:00Z")
+    assert len(rows) == 1
+    assert (PULLS_URL + "&page=2") not in [c[1] for c in fake_gh.calls]
+
+
+def test_collect_repo_events_recovers_all_31_fresh_events_across_pagination(fake_gh):
+    # End-to-end: without the pagination fix, PR #0 (the oldest, evicted off
+    # page1) would be silently and permanently dropped. Closed-unmerged PRs
+    # need no detail call, keeping this test's route table small.
+    page1 = [
+        _pr(n, "T%d" % n, "user%d" % n,
+            closed_at="2026-08-24T10:%02d:00Z" % n,
+            updated_at="2026-08-24T10:%02d:00Z" % n)
+        for n in range(30, 0, -1)
+    ]
+    page2 = [
+        _pr(0, "T0", "user0",
+            closed_at="2026-08-24T10:00:00Z", updated_at="2026-08-24T10:00:00Z")
+    ]
+    fake_gh.add(["api", PULLS_URL], page1)
+    fake_gh.add(["api", PULLS_URL + "&page=2"], page2)
+    fake_gh.add(["api", ISSUES_URL], [])
+    cursor = _cursor(pulls_ts="2026-08-24T09:00:00Z", issues_ts="2026-08-24T09:00:00Z")
+    events, _ = landings.collect_repo_events("acme/widgets", cursor)
+    assert len(events) == 31
+    assert any("T0" in text for _, text in events)  # the row that pagination rescues
+
+
+# ---- cursor: >= filter + seen-id dedupe, per-endpoint (verifier3 #2) -------
 
 
 def test_cursor_advances_to_latest_event_timestamp(fake_gh):
@@ -227,9 +323,76 @@ def test_cursor_advances_to_latest_event_timestamp(fake_gh):
     fake_gh.add(["api", ISSUES_URL], [])
     fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
     fake_gh.add(["api", "repos/acme/widgets/pulls/2"], {"merged_by": {"login": "b"}})
-    events, latest = landings.collect_repo_events("acme/widgets", "2026-08-24T00:00:00Z")
+    events, new_cursor = landings.collect_repo_events("acme/widgets", _cursor())
     assert len(events) == 2
-    assert latest == "2026-08-24T12:00:00Z"
+    assert new_cursor["pulls"]["ts"] == "2026-08-24T12:00:00Z"
+
+
+def test_pr_merged_and_issue_closed_same_second_across_three_passes(fake_gh, posted, monkeypatch):
+    """The exact scenario verifier3 reproduced: a PR merged at T posts;
+    an issue closed at the SAME second T, becoming visible to the API only
+    on the next pass, still posts (no longer shadowed by a shared
+    high-water mark); a third pass -- nothing changed -- posts nothing."""
+    monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    t = "2026-08-24T18:39:21Z"
+
+    # Pass 1: only the merged PR is visible.
+    fake_gh.add(["api", PULLS_URL], [_pr(1, "Merged one", "a", merged_at=t)])
+    fake_gh.add(["api", ISSUES_URL], [])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
+    assert landings.run_once() == 0
+    assert len(posted) == 1
+    assert "Merged one" in posted[0][1]
+
+    # Pass 2: the issue, closed at the exact same second, becomes visible.
+    posted.clear()
+    fake_gh.add(["api", ISSUES_URL], [
+        _issue(9, "Closed one", "b", t, closed_by="b"),
+    ])
+    assert landings.run_once() == 0
+    assert len(posted) == 1
+    assert "Closed one" in posted[0][1]
+
+    # Pass 3: nothing changed -- idempotent, nothing re-posted.
+    posted.clear()
+    assert landings.run_once() == 0
+    assert posted == []
+
+
+def test_two_prs_merged_same_second_then_a_late_third_still_posts(fake_gh):
+    """Within-endpoint version of the same-second fix: two PRs merged in the
+    SAME second both post once and never repost; a third PR that lands at
+    that identical second on a later pass (eventual consistency) still
+    posts, because the seen-id set -- not just the timestamp -- gates it."""
+    t = "2026-08-24T12:00:00Z"
+    fake_gh.add(["api", PULLS_URL], [
+        _pr(1, "One", "a", merged_at=t),
+        _pr(2, "Two", "b", merged_at=t),
+    ])
+    fake_gh.add(["api", ISSUES_URL], [])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
+    fake_gh.add(["api", "repos/acme/widgets/pulls/2"], {"merged_by": {"login": "b"}})
+    events1, cursor1 = landings.collect_repo_events("acme/widgets", _cursor())
+    assert len(events1) == 2
+    assert cursor1["pulls"]["ts"] == t
+    assert sorted(cursor1["pulls"]["seen"]) == ["pr:1", "pr:2"]
+
+    # Second pass, same two PRs still in the list window: both already seen.
+    events2, cursor2 = landings.collect_repo_events("acme/widgets", cursor1)
+    assert events2 == []
+    assert cursor2 == cursor1
+
+    # A third PR merged at the identical second appears (late arrival).
+    fake_gh.add(["api", PULLS_URL], [
+        _pr(1, "One", "a", merged_at=t),
+        _pr(2, "Two", "b", merged_at=t),
+        _pr(3, "Three", "c", merged_at=t),
+    ])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/3"], {"merged_by": {"login": "c"}})
+    events3, cursor3 = landings.collect_repo_events("acme/widgets", cursor2)
+    assert len(events3) == 1
+    assert "Three" in events3[0][1]
+    assert sorted(cursor3["pulls"]["seen"]) == ["pr:1", "pr:2", "pr:3"]
 
 
 def test_run_once_second_pass_reposts_nothing_new(fake_gh, posted, tmp_path):
@@ -260,8 +423,7 @@ def test_first_sight_of_repo_caps_backfill_to_start_of_today(fake_gh):
         _pr(1, "Ancient", "a", merged_at=old_event_ts),
     ])
     fake_gh.add(["api", ISSUES_URL], [])
-    cursor = landings._today_utc_start()
-    events, _ = landings.collect_repo_events("acme/widgets", cursor)
+    events, _ = landings.collect_repo_events("acme/widgets", {})  # no cursor at all: first sight
     assert events == []  # older than today's cap: never surfaced on first sight
 
 
@@ -271,24 +433,35 @@ def test_today_utc_start_shape():
     assert len(start) == len("2026-08-24T00:00:00Z")
 
 
-# ---- per-repo exception isolation ------------------------------------------
+# ---- per-repo exception isolation (verifier3 #3: real isolation claim) ----
 
 
-def test_collect_new_isolates_one_repo_failure_from_the_rest(fake_gh, monkeypatch, capsys):
+def test_collect_new_isolates_one_repo_failure_the_healthy_repo_advances_the_failing_one_does_not(
+    fake_gh, monkeypatch, capsys
+):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets,acme/gizmos")
-    fake_gh.add(["api", "repos/acme/widgets/pulls?state=closed&sort=updated&direction=desc&per_page=30"], [
-        _pr(1, "Good one", "a", merged_at="2026-08-24T10:00:00Z"),
-    ])
-    fake_gh.add(["api", "repos/acme/widgets/issues?state=closed&sort=updated&direction=desc&per_page=30"], [])
+    # Seed a pre-existing cursor for gizmos, as if an earlier pass had
+    # already succeeded there -- so "unchanged" is a real, checkable claim,
+    # not just "the key happens to be absent".
+    landings._save_cursor({
+        "acme/gizmos": _cursor(pulls_ts="2026-08-20T00:00:00Z", issues_ts="2026-08-20T00:00:00Z"),
+    })
+    fake_gh.add(["api", PULLS_URL], [_pr(1, "Good one", "a", merged_at="2026-08-24T10:00:00Z")])
+    fake_gh.add(["api", ISSUES_URL], [])
     fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
-    fake_gh.add_raise(
-        ["api", "repos/acme/gizmos/pulls?state=closed&sort=updated&direction=desc&per_page=30"],
-        RuntimeError("gh api rate limited"),
-    )
+    fake_gh.add_raise(["api", GIZMOS_PULLS_URL], RuntimeError("gh api rate limited"))
+
     events, new_cursor = landings.collect_new()
+
     assert any("Good one" in e for e in events)
-    assert "acme/gizmos" in new_cursor or "acme/gizmos" not in new_cursor  # never crashes either way
-    assert "acme/widgets" in new_cursor
+    # The real isolation claim: the healthy repo's cursor ADVANCED past the
+    # seeded far-past default...
+    assert new_cursor["acme/widgets"]["pulls"]["ts"] == "2026-08-24T10:00:00Z"
+    # ...and the failing repo's cursor is UNCHANGED from what it was before
+    # this pass ran -- not zeroed, not reseeded, exactly what it already was.
+    assert new_cursor["acme/gizmos"]["pulls"]["ts"] == "2026-08-20T00:00:00Z"
+    assert new_cursor["acme/gizmos"]["issues"]["ts"] == "2026-08-20T00:00:00Z"
+
     err = capsys.readouterr().err
     assert "acme/gizmos" in err
     assert "RuntimeError" in err
@@ -296,18 +469,40 @@ def test_collect_new_isolates_one_repo_failure_from_the_rest(fake_gh, monkeypatc
 
 def test_run_once_survives_one_repo_exception_and_delivers_the_rest(fake_gh, posted, monkeypatch):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets,acme/gizmos")
-    fake_gh.add(["api", "repos/acme/widgets/pulls?state=closed&sort=updated&direction=desc&per_page=30"], [
-        _pr(1, "Good one", "a", merged_at="2026-08-24T10:00:00Z"),
-    ])
-    fake_gh.add(["api", "repos/acme/widgets/issues?state=closed&sort=updated&direction=desc&per_page=30"], [])
+    fake_gh.add(["api", PULLS_URL], [_pr(1, "Good one", "a", merged_at="2026-08-24T10:00:00Z")])
+    fake_gh.add(["api", ISSUES_URL], [])
     fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
-    fake_gh.add_raise(
-        ["api", "repos/acme/gizmos/pulls?state=closed&sort=updated&direction=desc&per_page=30"],
-        RuntimeError("boom"),
-    )
+    fake_gh.add_raise(["api", GIZMOS_PULLS_URL], RuntimeError("boom"))
     assert landings.run_once() == 0
     joined = "\n".join(c for _, c, _ in posted)
     assert "Good one" in joined
+
+
+# ---- discover_repos() failure under --once (verifier3 #4) ------------------
+
+
+def test_run_once_discover_repos_failure_exits_1_with_one_stderr_line_no_traceback(
+    fake_gh, capsys, monkeypatch
+):
+    monkeypatch.setenv("COMMS_GH_OWNER", "acme")  # skip the api-user call
+    fake_gh.add_raise(
+        ["repo", "list", "acme", "--limit", "100", "--json", "nameWithOwner,pushedAt"],
+        RuntimeError("gh: rate limit exceeded"),
+    )
+    assert landings.run_once() == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "Traceback" not in err
+    assert "RuntimeError" in err
+
+
+def test_main_once_discover_repos_failure_returns_1_not_2(fake_gh, monkeypatch):
+    monkeypatch.setenv("COMMS_GH_OWNER", "acme")
+    fake_gh.add_raise(
+        ["repo", "list", "acme", "--limit", "100", "--json", "nameWithOwner,pushedAt"],
+        RuntimeError("boom"),
+    )
+    assert landings.main(["landings.py", "--once"]) == 1
 
 
 # ---- discovery: explicit repos / owner / window ----------------------------
@@ -369,7 +564,7 @@ def test_discover_repos_window_hours_env_override(fake_gh, monkeypatch):
     assert landings.discover_repos() == ["acme/inrange"]
 
 
-# ---- delivery: author, chunking --------------------------------------------
+# ---- delivery: author, chunking, skipped-count (verifier3 #6) -------------
 
 
 def test_run_once_uses_landings_author_with_machine_label(fake_gh, posted, monkeypatch):
@@ -389,6 +584,43 @@ def test_run_once_no_events_posts_nothing(fake_gh, posted, monkeypatch):
     fake_gh.add(["api", ISSUES_URL], [])
     assert landings.run_once() == 0
     assert posted == []
+
+
+def test_chunk_events_returns_content_and_events_in_chunk():
+    events = ["a" * 10, "b" * 10]
+    chunks = landings.chunk_events(events, cap=1900)
+    assert len(chunks) == 1
+    content, events_in_chunk = chunks[0]
+    assert content == "\n".join(events)
+    assert events_in_chunk == events
+
+
+def test_log_skipped_counts_individual_events_not_the_joined_chunk(fake_gh, monkeypatch, capsys):
+    # verifier3's finding: _log_skipped used to receive [joined_chunk_string],
+    # so a chunk of 4 events logged "SKIPPED 1 event(s)". It must now log the
+    # real count -- same shape as mirror.py's _log_skipped(runid, rows, ...).
+    monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+
+    def failing_post(url, content, username=None):
+        return False
+
+    monkeypatch.setattr(landings.mirror, "post_content", failing_post)
+    fake_gh.add(["api", PULLS_URL], [
+        _pr(1, "One", "a", merged_at="2026-08-24T10:00:00Z"),
+        _pr(2, "Two", "b", merged_at="2026-08-24T10:01:00Z"),
+    ])
+    fake_gh.add(["api", ISSUES_URL], [
+        _issue(3, "Three", "c", "2026-08-24T10:02:00Z", closed_by="c"),
+        _issue(4, "Four", "d", "2026-08-24T10:03:00Z", closed_by="d"),
+    ])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
+    fake_gh.add(["api", "repos/acme/widgets/pulls/2"], {"merged_by": {"login": "b"}})
+    assert landings.run_once() == 1
+    err = capsys.readouterr().err
+    assert "SKIPPED 4 event(s)" in err
+    with open(landings._skipped_path()) as fh:
+        recorded = [json.loads(line) for line in fh]
+    assert len(recorded) == 4
 
 
 # ---- secret handling: both modes -------------------------------------------
@@ -476,7 +708,7 @@ def test_cursor_file_lives_under_state_dir_github_landings(fake_gh, posted, monk
     assert os.path.isfile(cursor_path)
     with open(cursor_path) as fh:
         data = json.load(fh)
-    assert data["acme/widgets"] == "2026-08-24T10:00:00Z"
+    assert data["acme/widgets"]["pulls"]["ts"] == "2026-08-24T10:00:00Z"
 
 
 def test_cursor_tmp_path_includes_pid():

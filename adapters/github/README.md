@@ -24,12 +24,16 @@ its own cursor.
 | Issue closed | ✅ | closed-issues list, no `pull_request` key |
 
 Line shape: `<emoji> <actor> <verb> #<n> on <repo-short>: <title>`. `<actor>`
-is, in order of preference: the merge/close actor (`merged_by`/`closed_by`,
-fetched with one extra `gh api` call per FRESH event only -- never per row
-in the list, to keep API cost bounded) if GitHub reports one, else the
-PR/issue author. `<repo-short>` is the repo name without the owner
-(`comms`, not `drakegriffith/comms`) -- provenance across repos without the
-noise of repeating the owner on every line.
+is, in order of preference: the merge/close actor if GitHub reports one,
+else the PR/issue author. `closed_by` (who closed an issue) comes straight
+off the issues LIST row -- GitHub's issues list endpoint already includes it
+fully populated, so no extra call is spent on it. `merged_by` (who merged a
+PR) is genuinely absent from the pulls LIST endpoint, so that is the only
+case that pays for one extra `gh api` detail call, and only for events that
+already passed the cursor filter (never per row in the list) -- API cost is
+bounded by fresh merges, not by list size. `<repo-short>` is the repo name
+without the owner (`comms`, not `drakegriffith/comms`) -- provenance across
+repos without the noise of repeating the owner on every line.
 
 Every landings line shares ONE Discord author (the webhook `username`):
 `github landings (<machine label>)` -- unlike `adapters/discord/mirror.py`'s
@@ -73,14 +77,38 @@ voice, so there is no seat to attribute the POST to.
 ## Cursor and the "backlog of today" cap
 
 One JSON file, `$COMMS_STATE_DIR/github-landings/cursor.json`, mapping
-`owner/repo` -> ISO8601 UTC timestamp high-water mark (GitHub's own `...Z`
-format, string-compared, never parsed). Written via tmp + `os.replace` with
+`owner/repo` -> `{"pulls": {"ts", "seen"}, "issues": {"ts", "seen"}}`.
+`pulls` and `issues` are tracked as SEPARATE high-water marks -- a merged PR
+and a closed issue landing in the same second cannot shadow each other,
+because they are different streams. Each `ts` is GitHub's own ISO8601 UTC
+`...Z` format, string-compared, never parsed; the filter is `event_ts >=
+ts`, with an event exactly AT `ts` further gated by `seen` (a list of
+`"pr:<n>"`/`"issue:<n>"` ids already emitted at that instant) -- a strict
+`>` filter would permanently drop any second event landing in the very same
+second as the current high-water mark. Written via tmp + `os.replace` with
 a PID-suffixed tmp name (same shape as `mirror.py`'s cursor).
 
-The FIRST time a repo is seen (no entry yet), its cursor seeds at the start
-of today, UTC -- so the first pass over a newly-watched repo posts today's
-landings and nothing older, instead of replaying its entire closed-PR/issue
-history on day one.
+The FIRST time a repo is seen (no entry yet, either endpoint), that
+endpoint's cursor seeds at the start of TODAY, **UTC** -- not the local
+day. On a machine west of UTC (e.g. US Eastern), `00:00:00Z` lands a few
+hours into what is still locally "yesterday evening", so the very first
+pass' backfill window is a little more generous than "since local
+midnight". This is deliberate (one unambiguous cutoff, no per-machine
+timezone drift between two pollers on the same repo) -- the first pass over
+a newly-watched repo posts today's (UTC) landings and nothing older,
+instead of replaying its entire closed-PR/issue history on day one.
+
+## Pagination
+
+Each list call fetches `per_page=30`. If a page comes back full AND its
+oldest row's `updated_at` (the field GitHub is actually sorting by) is
+still newer than that endpoint's cursor, there may be more fresh rows past
+this page -- stopping there would permanently drop them (evicted by newer
+traffic on the very next `sort=updated` pass). So the fetch pages forward
+(`page=2, 3, ...`), bounded at `MAX_PAGES` (5); if still truncated at the
+bound, one stderr line names the repo and endpoint before giving up for
+that pass -- never a silent, permanent loss, and never an unbounded fetch
+on a very chatty repo.
 
 ## Env knobs
 
@@ -131,18 +159,36 @@ Example plist (save as
 
 ## Behavior guarantees
 
-- **Bounded API cost.** Two list calls per active repo per pass (closed PRs,
-  closed issues), plus exactly one detail call per FRESH event -- never per
-  row in a list, and never for closed-unmerged PRs at all (the list row
-  already carries the author GitHub reports for that case).
-- **No reposts, idempotent.** The per-repo cursor advances to the latest
-  event timestamp considered each pass; a second pass over unchanged data
-  emits nothing.
-- **Per-repo failure isolation.** One repo's `gh` failure is caught, logged,
-  and skipped -- every other repo's landings still deliver that pass.
+- **Bounded API cost.** One list call per endpoint per active repo per pass
+  in the common case (paginating further only when a page is full AND still
+  fresh, capped at `MAX_PAGES`), plus exactly one detail call per FRESH
+  merged-PR event -- never per row in a list, and never at all for
+  closed-unmerged PRs or closed issues (both carry their attribution
+  straight off the list row).
+- **No silent truncation.** A list page that is both full and still fresh
+  is followed to the next page automatically; if the repo is chatty enough
+  to still be truncated after `MAX_PAGES`, that is logged on stderr rather
+  than silently dropping the oldest rows off the page.
+- **No reposts, idempotent, same-second safe.** Each repo's `pulls` and
+  `issues` cursors advance independently to the latest event considered
+  each pass; a second pass over unchanged data emits nothing, and two
+  events landing in the exact same second (even on the same endpoint) are
+  deduped by id, not silently dropped by a `>` comparison that can never be
+  true of a mark equal to itself.
+- **Per-repo failure isolation.** One repo's `gh` failure (during event
+  collection) is caught, logged, and skipped -- every other repo's landings
+  still deliver that pass, and the failing repo's OWN cursor is left
+  untouched (not zeroed), so the next pass retries it from where it last
+  succeeded.
+- **Discovery failure is loud, not a crash.** A `discover_repos()` failure
+  (bad owner, a rate limit on the `repo list` call itself) is a coarser,
+  pass-wide failure than one repo failing -- `--once` reports it as one
+  stderr line and exit 1, never an uncaught Python traceback.
 - **Rate-limit aware, never silently lossy.** A failed webhook POST is
-  written to `skipped.jsonl` in the state dir and shouted to stderr, then
-  the cursor advances (the skipped file is the durable record).
+  written to `skipped.jsonl` in the state dir (one line per individual
+  EVENT, not per batched Discord message) and shouted to stderr with the
+  real event count, then the cursor advances (the skipped file is the
+  durable record).
 
 ## Deliberately NOT covered here
 
