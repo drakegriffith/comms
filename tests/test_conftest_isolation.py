@@ -8,16 +8,19 @@ Two things earn direct tests here rather than trust-by-inspection:
    autouse default must not clobber a later, more specific override.
 
 The leak sentinel itself gets a positive control: a throwaway test file that
-deliberately writes into real /tmp is run in a child pytest process (so
-conftest.py applies to it exactly as it would to any file under tests/), and
-this test asserts that run FAILS with the sentinel's message. Silence would
-mean the sentinel exists but never actually fires -- a gate that never
-inspects anything is not a passing gate.
+deliberately writes into real /tmp is run via pytest's own `pytester`
+fixture (a nested pytest invocation against a scratch directory, never this
+repo's working tree -- two concurrent suite runs on one checkout must not
+collide, and an untracked victim file must never be sweepable by `git add
+-A`), loaded with a copy of this repo's actual tests/conftest.py so the
+REAL sentinel logic is what's under test, not a reimplementation of it. The
+positive control asserts that run FAILS with the sentinel's message.
+Silence would mean the sentinel exists but never actually fires -- a gate
+that never inspects anything is not a passing gate.
 """
 
 import os
 import shutil
-import subprocess
 import sys
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +28,17 @@ _LIB = os.path.join(os.path.dirname(_TESTS_DIR), "lib")
 sys.path.insert(0, _LIB)
 
 import swarm_mailbox as mb  # noqa: E402
+
+# The leak-victim test below deliberately creates this real /tmp dir to
+# prove the sentinel catches it. Its name starts with "isofix-" so
+# conftest.py's _TEST_SHAPED_PREFIXES classifies it as a hard failure, not
+# just a warning (see tests/conftest.py). Removed before AND after the
+# run: a prior run killed mid-test (SIGKILL/Ctrl-C) can leave it behind,
+# and a stale copy sitting here before we start would make the CHILD
+# pytest's own sentinel see it in its "before" snapshot, count it as
+# pre-existing, and pass -- which would make THIS test fail for the wrong
+# reason ("sentinel did not fire") instead of the right one.
+_LEAK_DIR = "/tmp/comms-isofix-meta-leak-sentinel-check"
 
 
 def test_default_env_points_at_tmp_path_not_real_tmp(tmp_path):
@@ -59,39 +73,39 @@ def test_local_override_still_wins_over_the_autouse_default(tmp_path, monkeypatc
     assert d == os.path.join(str(custom), "comms-isofix-override-write")
 
 
-def test_leak_sentinel_fires_on_a_real_tmp_write():
+def test_leak_sentinel_fires_on_a_real_tmp_write(pytester):
     """Positive control: prove the sentinel actually fails a test that
-    leaks into real /tmp, by running one in a child pytest process against
-    this repo's own tests/conftest.py.
+    leaks into real /tmp, by running one via pytester -- a throwaway
+    directory, never this repo's tests/ tree -- loaded with a copy of our
+    actual conftest.py so the real sentinel logic is what's exercised.
     """
-    victim_name = "test_isofix_meta_leak_victim.py"
-    victim_path = os.path.join(_TESTS_DIR, victim_name)
-    leak_dir = "/tmp/comms-isofix-meta-leak-sentinel-check"
-    victim_src = (
-        "import os\n"
-        "\n"
-        "def test_this_leaks_into_real_tmp_on_purpose():\n"
-        "    os.makedirs(%r, exist_ok=True)\n" % leak_dir
-    )
-    assert not os.path.exists(victim_path), (
-        "stale victim file from a previous run -- remove it manually"
-    )
-    with open(victim_path, "w") as fh:
-        fh.write(victim_src)
+    # Before: a leftover from a killed prior run must not make the CHILD
+    # run's own "before" snapshot already contain it (see module docstring).
+    shutil.rmtree(_LEAK_DIR, ignore_errors=True)
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", victim_name, "-q"],
-            cwd=_TESTS_DIR,
-            capture_output=True,
-            text=True,
-            timeout=60,
+        real_conftest = os.path.join(_TESTS_DIR, "conftest.py")
+        with open(real_conftest) as fh:
+            pytester.makeconftest(fh.read())
+        pytester.makepyfile(
+            test_victim="""
+            import os
+
+            def test_this_leaks_into_real_tmp_on_purpose():
+                os.makedirs(%r, exist_ok=True)
+            """
+            % _LEAK_DIR
         )
-        combined = result.stdout + result.stderr
-        assert result.returncode != 0, (
+        result = pytester.runpytest_subprocess()
+        combined = "\n".join(result.outlines)
+        assert result.ret != 0, (
             "sentinel did not fail the leaking test; output:\n" + combined
         )
         assert "test isolation breach" in combined
-        assert leak_dir in combined
+        assert _LEAK_DIR in combined
     finally:
-        os.remove(victim_path)
-        shutil.rmtree(leak_dir, ignore_errors=True)
+        # After: this test's OWN deliberate leak must not still be sitting
+        # in real /tmp when we return -- our OUTER sentinel (wrapping this
+        # very test, since it's autouse) would otherwise flag it too, and
+        # a leftover here would poison the next run's "before" snapshot the
+        # same way described above.
+        shutil.rmtree(_LEAK_DIR, ignore_errors=True)
