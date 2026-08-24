@@ -29,6 +29,13 @@ def env(tmp_path):
     e["HOME"] = str(tmp_path / "home")  # any ~ fallback lands in the sandbox
     e.pop("CLAUDE_SESSION_ID", None)
     e.pop("CLAUDE_MODEL", None)
+    e.pop("COMMS_AMBIENT_OPTOUT", None)
+    # tmp_path itself resolves under /private/var/folders, one of the
+    # throwaway-cwd guard's own trigger roots -- FORCE keeps every EXISTING
+    # test in this file (which uses tmp_path-based work dirs as the session
+    # cwd) exercising the normal enrollment path. Guard-behavior tests below
+    # pop this back off deliberately.
+    e["COMMS_AMBIENT_FORCE"] = "1"
     return e
 
 
@@ -150,6 +157,79 @@ def test_session_start_never_fails_on_garbage_stdin(env):
     assert r.returncode == 0  # NEVER fail the session
 
 
+def ambient_log(env):
+    path = os.path.join(env["COMMS_STATE_DIR"], "ambient.log")
+    if not os.path.isfile(path):
+        return ""
+    with open(path) as fh:
+        return fh.read()
+
+
+def test_session_start_optout_skips_everything(env, tmp_path):
+    work = tmp_path / "myproj"
+    work.mkdir()
+    env["COMMS_AMBIENT_OPTOUT"] = "1"
+    r = run(SESSION_START, env, start_payload(str(work)))
+    assert r.returncode == 0
+    assert r.stdout == ""
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    # opt-out is honored BEFORE any write -- not even the log directory exists
+    assert not os.path.isdir(env["COMMS_STATE_DIR"])
+
+
+def test_session_start_skips_tmp_cwd(env):
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    throwaway = "/tmp/some-throwaway-session-dir"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    assert throwaway in ambient_log(env)
+
+
+def test_session_start_skips_private_var_folders_cwd(env):
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    throwaway = "/private/var/folders/xx/yy/T/pytest-of-x/pytest-1/test0"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    assert throwaway in ambient_log(env)
+
+
+def test_session_start_skips_mutgate_worktree_cwd(env):
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    throwaway = "/Users/drake/.claude/jobs/abc/tmp/mutgate-wt.9f2c/repo"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    assert throwaway in ambient_log(env)
+
+
+def test_session_start_force_overrides_tmp_guard(env, tmp_path):
+    env["COMMS_AMBIENT_FORCE"] = "1"
+    throwaway = "/tmp/forced-through"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert len(participants(env)) == 1
+    rows = mailbox_rows(env)
+    assert len(rows) == 1
+    assert rows[0]["text"] == "session started in %s" % throwaway
+
+
+def test_session_start_normal_repo_cwd_writes_row_without_force(env):
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    normal = os.path.join(REPO, "not-a-throwaway-checkout")
+    r = run(SESSION_START, env, start_payload(normal))
+    assert r.returncode == 0
+    assert len(participants(env)) == 1
+    rows = mailbox_rows(env)
+    assert len(rows) == 1
+    assert rows[0]["text"] == "session started in %s" % normal
+
+
 # ---- sendmessage-bridge ---------------------------------------------------
 
 def enroll_first(env, tmp_path):
@@ -207,6 +287,16 @@ def test_bridge_skips_other_tools(env, tmp_path):
     r = run(BRIDGE, env, json.dumps(payload))
     assert r.returncode == 0
     assert mailbox_rows(env) == before
+
+
+def test_bridge_optout_skips(env, tmp_path):
+    enroll_first(env, tmp_path)
+    before = mailbox_rows(env)
+    env["COMMS_AMBIENT_OPTOUT"] = "1"
+    r = run(BRIDGE, env, bridge_payload())
+    assert r.returncode == 0
+    assert r.stdout == ""
+    assert mailbox_rows(env) == before  # no new comment row posted
 
 
 # ---- installer ------------------------------------------------------------

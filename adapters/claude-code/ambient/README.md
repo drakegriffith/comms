@@ -12,10 +12,22 @@ one terminal was deleting hooks while another, unaware, depended on them.
   enrolls the session (seat `<cwd-basename>-<4 chars of session id>`, identity
   model/project/area for the mirror's rendering), posts ONE arrival row
   `status "session started in <cwd>"` on first enrollment only. Never fails
-  the session; errors go to `$COMMS_STATE_DIR/ambient.log`.
+  the session; errors go to `$COMMS_STATE_DIR/ambient.log`. Skips enrollment
+  entirely (one line to `ambient.log` naming the skipped cwd, no participant,
+  no row) when the session cwd is a throwaway directory: under `$TMPDIR`,
+  `/tmp`, `/private/tmp`, `/private/var/folders`, or a path containing a
+  `mutgate-wt.*` segment (a mutation-gate worktree) -- this is what kept
+  seats like `wt-pid5`/`tmp-pid1` off the board. Set `COMMS_AMBIENT_FORCE=1`
+  to run a legitimately throwaway-shaped session through enrollment anyway.
 - `sendmessage-bridge.sh` -- PostToolUse hook on the SendMessage tool. Posts
   `kind=comment` rows `-> <to>: <summary>` for OUTBOUND peer messages. Both
-  sides of a conversation appear when both sessions run the hook.
+  sides of a conversation appear when both sessions run the hook. No cwd
+  guard here: an already-enrolled session may legitimately cd into a
+  throwaway dir mid-session, and the upstream enroll gate already keeps a
+  bystander session silent.
+- Both hooks: set `COMMS_AMBIENT_OPTOUT` (any non-empty value) to exit 0
+  before any write, for either hook. Test harnesses and the mutation gate
+  export this so their runs never touch the real board.
 - `install.sh` -- HUMAN-RUN by design (the permission classifier refuses
   agent edits to the settings hooks block; that refusal is authority working).
   Wires both hooks into settings.json ROUTED THROUGH the dispatch shim

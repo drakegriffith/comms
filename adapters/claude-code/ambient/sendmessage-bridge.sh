@@ -23,6 +23,8 @@
 # contents to stderr, stdout, or the log.
 #
 # SKIP CONDITIONS (exit 0, no row, silent):
+#   * COMMS_AMBIENT_OPTOUT is non-empty -- checked FIRST, before even the
+#     state dir is created. Test harnesses and the mutation gate export this.
 #   * payload not parseable, or tool_name is not SendMessage (self-filter for
 #     installs whose hook schema cannot match on tool name)
 #   * no session id in payload or $CLAUDE_SESSION_ID (a PID-fallback
@@ -33,8 +35,13 @@
 # $COMMS_STATE_DIR/ambient.log with no payload content.
 #
 # ISOLATION KNOBS (tests set these; production uses the defaults):
-#   COMMS_STATE_DIR  roster state + ambient.log (default ~/.comms/state)
-#   COMMS_ROOT       mailbox root (default /tmp)
+#   COMMS_STATE_DIR      roster state + ambient.log (default ~/.comms/state)
+#   COMMS_ROOT           mailbox root (default /tmp)
+#   COMMS_AMBIENT_OPTOUT non-empty -> exit 0 before any write. NOTE: no
+#     throwaway-cwd guard here (unlike session-start.sh) -- an already
+#     enrolled session may legitimately cd into a throwaway dir mid-session,
+#     and the enroll gate upstream (is_participant) already keeps a bystander
+#     session silent, so a second cwd check here would be redundant.
 #
 # COMPLETENESS MARKER: the FINAL line of this file is
 #   # hook-eof-marker v1 do-not-remove
@@ -44,6 +51,11 @@
 # the shim treat this file as torn and skip it.
 
 set -uo pipefail
+
+# ---- opt-out: honored BEFORE any write, even before STATE_DIR is touched --
+if [ -n "${COMMS_AMBIENT_OPTOUT:-}" ]; then
+  exit 0
+fi
 
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 
