@@ -48,7 +48,21 @@ OFFLINE IS NORMAL, NOT AN ERROR. The laptop closes at the end of the day, so
 post() ALWAYS appends to a local outbox first and only then tries to flush the
 whole outbox in order. A row is durable on local disk before any network call,
 a fresh row can never jump ahead of one queued this morning, and a failed
-flush stops at the first failure with the remainder intact.
+flush stops at the first failure with the remainder intact. An outbox line that
+will not parse is QUARANTINED to outbox.bad and counted, never silently
+skipped: an undeliverable queued row is exactly the silent loss this module
+promises not to have.
+
+DELIVERY IS AT-LEAST-ONCE, AND THE DUPLICATE IS MADE VISIBLE. There is no
+transaction spanning "the hub appended the row" and "we wrote that down", so
+an ambiguous transport failure (the connection dies after the hub committed)
+or a crash mid-flush can resend a row. Two mitigations, both needed: the
+outbox is rewritten after EVERY successful send, which bounds a crash to one
+duplicated row instead of a whole batch; and every queued row carries a stable
+delivery id, stamped into its text, so a surviving duplicate is detectable at
+read time (`dupes` subcommand, and the dupes= counter on every pull) instead
+of being an invisible second copy. Retrying on an ambiguous failure is
+deliberate -- a duplicate is cheap and a lost message is not.
 
 EXIT CODES (the two success shapes are different codes on purpose):
   0  delivered / pulled. `pull` reporting inspected=0 still means it REACHED
@@ -57,9 +71,11 @@ EXIT CODES (the two success shapes are different codes on purpose):
      disk awaiting the next flush. Durable "later", not a crash.
   2  usage error, or COULD NOT INSPECT (pull could not reach the hub, remote
      CLI missing/erroring). Never a pass.
-`pull` prints inspected/mirrored/echo counts every pass, because "the sync
-never reached the hub" and "the hub had nothing" are otherwise identical
-silence.
+`pull` prints inspected/mirrored/echo/skipped/dupes counts every pass, because
+"the sync never reached the hub" and "the hub had nothing" are otherwise
+identical silence. `echo` (our own rows coming back) and `skipped` (another
+machine's mirror file) are separate counters: they are different facts, and one
+label over both made a third machine's rows read as ours.
 
 LAUNCHD SAFETY: same shape as adapters/discord/mirror.py -- --follow catches
 per-pass errors, writes one stderr line and keeps polling, rather than exiting
@@ -71,12 +87,14 @@ CLI:
   sync.py flush [--host <h>]
   sync.py pull <runid> [--host <h>]
   sync.py sync <runid> [--host <h>]              # flush + pull
+  sync.py dupes <runid> [--host <h>]             # read-time duplicate report
   sync.py --follow <runid> [--interval N] [--host <h>]
 """
 
 import datetime
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -85,14 +103,26 @@ import time
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
-sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "discord"))
-import mirror  # noqa: E402  (machine_label -- ONE label per machine, not two)
+import comms_machine  # noqa: E402  (ONE label per machine, not two)
 import swarm_mailbox  # noqa: E402  (one mailbox writer/parser; never a second)
+
+# This machine's label, RE-EXPORTED from lib/comms_machine.py. It used to be
+# imported from adapters/discord/mirror.py, which meant cross-machine
+# correctness depended on a display adapter for a chat service: if Discord were
+# removed or moved, the echo filter would break even though nothing here talks
+# to Discord. The label is not decoration in this module -- it is written into
+# seat names that cross the network and is what is_echo() tests against.
+machine_label = comms_machine.machine_label
 
 # The machine tag separator inside a seat name. "~" and not "@": "@" already
 # means "unicast topic" in swarm_mailbox (SELF_TOPIC_PREFIX), and a seat name
 # that reads like an address is a trap for a human skimming a board.
 QUALIFIER = "~"
+
+# Delivery is AT-LEAST-ONCE, so every queued row carries a stable id and a
+# duplicate is CHEAP AND VISIBLE rather than prevented. See MSGID below.
+MSGID_MARKER = " [#%s]"
+MSGID_RE = re.compile(r"\s*\[#([0-9a-f]{8})\]\s*$")
 
 # Rows pulled from the hub are appended to "<MIRROR_PREFIX>~<hub label>.jsonl".
 # Reserved: do NOT name a real seat "remote" or "remote~anything" -- pull skips
@@ -121,7 +151,8 @@ class RemoteUnreachable(Exception):
 # ---- configuration -------------------------------------------------------
 # Each knob below exists because the value is a fact about ANOTHER machine or
 # about ~/.ssh/config, which this process cannot compute. machine_label is the
-# exception and is therefore NOT a new knob: it is mirror.py's, reused.
+# exception and is therefore NOT a new knob: it is lib/comms_machine.py's,
+# shared with every other consumer.
 
 
 def remote_host():
@@ -136,12 +167,6 @@ def remote_label(host=None):
     """Provenance label written into pulled seat names. Defaults to the ssh
     alias, which is already the human's name for that machine."""
     return os.environ.get("COMMS_REMOTE_LABEL") or (host or remote_host())
-
-
-def machine_label():
-    """This machine's label -- mirror.machine_label(), not a second copy. One
-    machine must not be "studio" to Discord and something else to the mailbox."""
-    return mirror.machine_label()
 
 
 def ssh_timeout():
@@ -186,9 +211,105 @@ def is_mirror_seat(seat):
     return seat == MIRROR_PREFIX or seat.startswith(MIRROR_PREFIX + QUALIFIER)
 
 
-def _should_mirror(row, label):
+def classify(row, label):
+    """Why a hub row is or is not mirrored home: "mirror" | "echo" | "skipped".
+
+    behavior: "echo" means THIS machine exported the row and it came back;
+      "skipped" means some OTHER machine's mirror file, which must not be
+      re-exported; "mirror" means a genuine peer row to bring home.
+    in: a row dict; this machine's label.
+    out: one of three literal strings. The vocabulary is CLOSED and every
+      caller must handle all three -- a fourth reason must not silently join
+      whichever bucket happens to be the default.
+    errors: none.
+
+    Split out of a single boolean because the two rejection reasons were being
+    reported under one counter called "echo", which made a third machine's
+    mirror rows read as this machine's own traffic coming back. Two different
+    facts sharing a label is how a metric stops being a measurement.
+    """
     seat = str(row.get("seat", ""))
-    return not is_echo(seat, label) and not is_mirror_seat(seat)
+    if is_echo(seat, label):
+        return "echo"
+    if is_mirror_seat(seat):
+        return "skipped"
+    return "mirror"
+
+
+# ---- delivery ids: at-least-once, with duplicates made visible ------------
+#
+# MSGID. Delivery over ssh cannot be exactly-once, and pretending otherwise is
+# how rows get silently dropped. Two unavoidable windows:
+#   * AMBIGUOUS TRANSPORT FAILURE -- the hub appends the row and the connection
+#     dies before the success reaches us. We saw a nonzero rc; the row exists
+#     over there.
+#   * CRASH between a successful send and the outbox rewrite.
+# The doctrine is at-least-once with CHEAP DUPLICATES, never silent loss: keep
+# retrying on an ambiguous failure, and make the duplicate harmless and
+# VISIBLE. So every queued row is stamped at enqueue with a stable random id
+# that survives any number of resends, and a duplicate is detectable at READ
+# time by anyone looking at the board -- see duplicate_msgids() and the `dupes`
+# subcommand.
+#
+# The id rides in the row's TEXT because that is the only field the hub's
+# existing `comms post` CLI will carry, and requiring a new field would mean
+# deploying code to the hub -- the one thing this adapter's whole design
+# refuses to do. Cost, stated: rows carry a visible " [#a1b2c3d4]" suffix, and
+# a row whose text ALREADY ends in that exact shape would be misread as
+# stamped. The id is advisory -- a detector, never a gate -- so a false read
+# costs a wrong count in a query, nothing more.
+
+
+def new_msgid():
+    return os.urandom(4).hex()
+
+
+def stamp_msgid(text, msgid):
+    """Attach a delivery id to a row's text. Idempotent for the SAME id, so a
+    resend of an already-stamped record never stacks two markers."""
+    existing = read_msgid(text)
+    if existing == msgid:
+        return text
+    return text + (MSGID_MARKER % msgid)
+
+
+def read_msgid(text):
+    """The delivery id in this text, or None. Reads only the trailing marker."""
+    match = MSGID_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def strip_msgid(text):
+    """The text without its delivery-id marker -- for renderers and for tests
+    that care about what a human wrote, not how it was delivered."""
+    return MSGID_RE.sub("", text or "")
+
+
+def duplicate_msgids(rows):
+    """Map every delivery id that appears MORE THAN ONCE to its occurrence
+    count -- the read-time duplicate detector.
+
+    behavior: scans row texts for the trailing marker. Rows with no id (posted
+      locally on the hub, or by a machine not running this adapter) are ignored
+      rather than counted as one big untagged group.
+    in: an iterable of row dicts.
+    out: {msgid: count}, only for counts >= 2. Empty dict = no duplicates SEEN,
+      which is a real result over the rows inspected, not a guarantee.
+    side effects: none.
+    errors: none.
+    """
+    counts = {}
+    for row in rows:
+        msgid = read_msgid(str(row.get("text", "")))
+        if msgid:
+            counts[msgid] = counts.get(msgid, 0) + 1
+    return {k: v for k, v in counts.items() if v >= 2}
+
+
+def redundant_row_count(rows):
+    """How many rows are surplus copies: 3 rows sharing one id is 2 redundant.
+    The number a human wants when asking "how much did retrying cost me"."""
+    return sum(count - 1 for count in duplicate_msgids(rows).values())
 
 
 # ---- the seam: every ssh call goes through this one function -------------
@@ -295,25 +416,69 @@ def _write_atomic(path, text):
 # ---- outbox --------------------------------------------------------------
 
 
-def load_outbox(host=None):
-    """Every queued record, oldest first. A missing outbox is an empty queue,
-    not an error. A malformed line is SKIPPED rather than fatal -- one corrupt
-    row must not wedge every later row behind it forever."""
+def _quarantine_path(host):
+    """Where unparseable outbox lines go to be SEEN. A dropped row and a
+    delivered row look identical from the outbox; this file is the difference."""
+    return os.path.join(_host_dir(host), "outbox.bad")
+
+
+def read_outbox(host=None):
+    """Parse the outbox into (records, malformed_lines).
+
+    behavior: returns queued records oldest first, PLUS every line that would
+      not parse, verbatim. A missing outbox is an empty queue, not an error.
+    in: host.
+    out: (records, malformed_lines). Both lists; the second is normally empty.
+    side effects: none -- this is the pure parse. Quarantining the malformed
+      lines is flush()'s job, so a read cannot silently mutate state.
+    errors: none.
+
+    Two return values rather than one because a corrupt line is a QUEUED ROW
+    THAT WILL NEVER BE DELIVERED. Skipping it silently -- what this did before
+    -- means local disk corruption loses a message with no trace, in a module
+    whose entire promise is "never silent loss".
+    """
     path = _outbox_path(host or remote_host())
     records = []
+    malformed = []
     try:
         with open(path) as fh:
             for line in fh:
-                line = line.strip()
-                if not line:
+                line = line.rstrip("\n")
+                if not line.strip():
                     continue
                 try:
                     records.append(json.loads(line))
                 except ValueError:
-                    continue
+                    malformed.append(line)
     except OSError:
-        return []
-    return records
+        return [], []
+    return records, malformed
+
+
+def load_outbox(host=None):
+    """Just the deliverable records -- read_outbox()[0]. Kept because callers
+    that only want the queue depth should not have to unpack a parse report."""
+    return read_outbox(host)[0]
+
+
+def quarantine(host, lines):
+    """Append unparseable lines to outbox.bad and return how many were moved.
+
+    behavior: appends verbatim, so whatever a human needs to recover the row is
+      still there. Never deletes; the outbox rewrite is what removes them from
+      the queue.
+    side effects: creates the state dir; appends to one file.
+    """
+    lines = list(lines)
+    if not lines:
+        return 0
+    path = _quarantine_path(host)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as fh:
+        for line in lines:
+            fh.write(line + "\n")
+    return len(lines)
 
 
 def _save_outbox(host, records):
@@ -345,14 +510,21 @@ def build_post_argv(record):
     the row with its own code, so nothing here has to stay in step with the
     hub's checkout beyond four positional arguments that have not changed
     since PR #4.
+
+    The record's delivery id is stamped onto the TEXT here rather than stored
+    pre-stamped, so the queue on disk holds what the author actually wrote and
+    the id is applied identically on the first send and every resend.
     """
+    text = record["text"]
+    if record.get("msgid"):
+        text = stamp_msgid(text, record["msgid"])
     argv = [
         remote_bin(),
         "post",
         record["runid"],
         record["seat"],
         record["kind"],
-        record["text"],
+        text,
     ]
     if record.get("to"):
         argv += ["--to", record["to"]]
@@ -362,25 +534,49 @@ def build_post_argv(record):
 
 
 def flush(host=None):
-    """Deliver queued rows to the hub in order. Returns (delivered, remaining).
+    """Deliver queued rows to the hub in order.
 
-    behavior: STOPS AT THE FIRST FAILURE and keeps every remaining record,
-      order intact. Draining past a failure would reorder the queue; dropping
-      the failed record would lose it silently. The outbox is rewritten once,
-      atomically, only if something was delivered.
+    behavior: quarantines any unparseable line first, then sends each record
+      and REWRITES THE OUTBOX AFTER EVERY SUCCESSFUL SEND. Stops at the first
+      failure with the remainder intact and in order -- draining past a failure
+      would reorder the queue, and dropping the failed record would lose it
+      silently.
     in: host, the ssh alias.
-    out: (delivered_count, remaining_count). remaining > 0 means the hub is
-      unreachable right now, which is the expected evening state, not an error.
-    side effects: up to one ssh call per queued record; one outbox rewrite.
-    errors: none raised. A remote CLI that REJECTS a row (nonzero rc that is
-      not a transport failure) is still a stop, not a drop -- a row the hub
-      refuses is a bug to be seen, and this function does not get to decide
-      that a message the caller wrote may be discarded.
+    out: {"delivered": n, "remaining": n, "malformed": n}. remaining > 0 means
+      the hub is unreachable right now, the expected evening state, not an
+      error. malformed > 0 means rows were moved to outbox.bad and need a human.
+    side effects: up to one ssh call per record; one outbox rewrite PER
+      DELIVERED ROW; appends to outbox.bad if anything was unparseable.
+    errors: none raised for a refused row. A remote CLI that REJECTS a row
+      (nonzero rc that is not a transport failure) is still a stop, not a drop
+      -- a row the hub refuses is a bug to be seen, and this function does not
+      get to decide that a message the caller wrote may be discarded. A disk
+      error from the outbox rewrite PROPAGATES rather than being swallowed:
+      losing the ability to record progress is exactly the condition under
+      which continuing to send manufactures duplicates.
+
+    WHY REWRITE PER ROW AND NOT ONCE AT THE END: the old shape rewrote the
+    outbox after the loop, so a crash anywhere in a batch of N resent ALL N
+    delivered rows on the next pass. Per-row persistence bounds that to ONE
+    row. It cannot reach zero -- there is no transaction spanning "the hub
+    appended it" and "we wrote that down" -- which is why the surviving
+    duplicate is made visible by a delivery id instead of pretended away. See
+    MSGID above.
     """
     host = host or remote_host()
-    records = load_outbox(host)
+    records, malformed = read_outbox(host)
+    if malformed:
+        quarantine(host, malformed)
+        # Rewrite without the bad lines so the queue reflects what is actually
+        # deliverable; the verbatim copy in outbox.bad is the durable record.
+        _save_outbox(host, records)
+        sys.stderr.write(
+            "remote-sync: %d unparseable outbox line(s) moved to %s -- these "
+            "rows were NEVER delivered and need a human\n"
+            % (len(malformed), _quarantine_path(host))
+        )
     if not records:
-        return 0, 0
+        return {"delivered": 0, "remaining": 0, "malformed": len(malformed)}
     delivered = 0
     for record in records:
         rc, _out, err = _ssh(build_post_argv(record), host=host)
@@ -391,9 +587,12 @@ def flush(host=None):
             )
             break
         delivered += 1
-    if delivered:
         _save_outbox(host, records[delivered:])
-    return delivered, len(records) - delivered
+    return {
+        "delivered": delivered,
+        "remaining": len(records) - delivered,
+        "malformed": len(malformed),
+    }
 
 
 def post(runid, seat, kind, text, topic=None, to=None, host=None):
@@ -406,7 +605,7 @@ def post(runid, seat, kind, text, topic=None, to=None, host=None):
     in: runid; seat, this machine's local seat name (unqualified is normal);
       kind, from swarm_mailbox.VALID_KINDS; text; topic OR to, never both;
       host.
-    out: (delivered, remaining) from the flush.
+    out: flush()'s report dict for the pass this post triggered.
     side effects: one outbox append; up to one ssh call per queued row.
     errors: ValueError for an invalid kind, an invalid seat, or topic AND to
       together -- raised HERE, before the row is queued, so a malformed row
@@ -430,6 +629,9 @@ def post(runid, seat, kind, text, topic=None, to=None, host=None):
         "text": text,
         "topic": topic,
         "to": to,
+        # Assigned ONCE, at enqueue, and stable across every resend -- that is
+        # the whole property that makes a duplicate matchable later.
+        "msgid": new_msgid(),
         "queued_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     enqueue(record, host=host)
@@ -500,9 +702,17 @@ def pull(runid, host=None):
       the two re-mirrors rows on the next pass (visible, duplicated), where the
       other order loses them (invisible). Duplicates are the survivable failure.
     in: runid; host.
-    out: {"inspected": n, "mirrored": n, "echo": n} -- inspected is asserted,
-      not implied, because a pull that reached a hub with nothing new and a
-      pull that never reached anything are otherwise identical silence.
+    out: {"inspected", "mirrored", "echo", "skipped", "dupes"}. `inspected` is
+      asserted, not implied, because a pull that reached a hub with nothing new
+      and a pull that never reached anything are otherwise identical silence.
+      `echo` and `skipped` are the TWO distinct reasons a fresh row was not
+      mirrored (see classify) and are counted separately: reporting a third
+      machine's mirror rows under a counter named "echo" made them read as this
+      machine's own traffic coming back.
+      `dupes` counts surplus copies over EVERY row inspected, not just the
+      fresh slice -- a duplicate is a property of the board, and the copies are
+      usually this machine's own rows, which the echo filter drops before the
+      fresh slice would ever see them.
     side effects: one ssh call; appends to the local mirror file; writes a
       cursor.
     errors: RemoteUnreachable, propagated from fetch_remote_rows.
@@ -513,9 +723,13 @@ def pull(runid, host=None):
     rows = fetch_remote_rows(runid, host=host)
     cursor = _load_cursor(host, runid)
     fresh, new_cursor = swarm_mailbox.fresh_rows_by_seat(rows, cursor)
-    keep = [r for r in fresh if _should_mirror(r, mine)]
+    counts = {"mirror": 0, "echo": 0, "skipped": 0}
     qualified = []
-    for row in keep:
+    for row in fresh:
+        verdict = classify(row, mine)
+        counts[verdict] += 1  # KeyError, loudly, if classify ever grows a case
+        if verdict != "mirror":
+            continue
         row = dict(row)
         row["seat"] = qualify(str(row.get("seat", "?")), label)
         qualified.append(row)
@@ -523,8 +737,10 @@ def pull(runid, host=None):
     _save_cursor(host, runid, new_cursor)
     return {
         "inspected": len(rows),
-        "mirrored": len(qualified),
-        "echo": len(fresh) - len(qualified),
+        "mirrored": counts["mirror"],
+        "echo": counts["echo"],
+        "skipped": counts["skipped"],
+        "dupes": redundant_row_count(rows),
     }
 
 
@@ -535,6 +751,7 @@ USAGE = """usage:
   sync.py flush [--host <h>]
   sync.py pull <runid> [--host <h>]
   sync.py sync <runid> [--host <h>]
+  sync.py dupes <runid> [--host <h>]
   sync.py --follow <runid> [--interval N] [--host <h>]
 
 exit: 0 delivered/pulled | 1 queued, hub unreachable | 2 usage or could-not-inspect
@@ -561,17 +778,61 @@ def _extract_flags(args):
     return out, flags
 
 
-def _report_flush(delivered, remaining):
-    sys.stdout.write("delivered=%d queued=%d\n" % (delivered, remaining))
-    return 0 if remaining == 0 else 1
+def _format_flush(report):
+    return "delivered=%d queued=%d malformed=%d" % (
+        report["delivered"], report["remaining"], report["malformed"],
+    )
+
+
+def _format_pull(counts):
+    return "inspected=%d mirrored=%d echo=%d skipped=%d dupes=%d" % (
+        counts["inspected"], counts["mirrored"], counts["echo"],
+        counts["skipped"], counts["dupes"],
+    )
+
+
+def _report_flush(report):
+    sys.stdout.write(_format_flush(report) + "\n")
+    return 0 if report["remaining"] == 0 else 1
 
 
 def _do_pull(runid, host):
-    counts = pull(runid, host=host)
+    sys.stdout.write(_format_pull(pull(runid, host=host)) + "\n")
+    return 0
+
+
+def _do_dupes(runid, host):
+    """Read-time duplicate report over the hub's board for one run.
+
+    A QUERY, not a detector: it is answered on demand and has no invoker of its
+    own, which is the correct shape for a tool a human reaches for after seeing
+    a nonzero dupes= in a pull. Exit 0 whenever the hub could be read (the
+    printed count is the channel), 2 when it could not.
+    """
+    rows = fetch_remote_rows(runid, host=host)
+    dupes = duplicate_msgids(rows)
     sys.stdout.write(
-        "inspected=%d mirrored=%d echo=%d\n"
-        % (counts["inspected"], counts["mirrored"], counts["echo"])
+        "inspected=%d duplicated_ids=%d redundant_rows=%d\n"
+        % (len(rows), len(dupes), sum(c - 1 for c in dupes.values()))
     )
+    by_id = {}
+    for row in rows:
+        msgid = read_msgid(str(row.get("text", "")))
+        if msgid in dupes:
+            by_id.setdefault(msgid, []).append(row)
+    for msgid in sorted(by_id):
+        copies = by_id[msgid]
+        sys.stdout.write(
+            "  %s x%d  %s: %s\n"
+            % (
+                msgid,
+                len(copies),
+                copies[0].get("seat", "?"),
+                strip_msgid(str(copies[0].get("text", ""))),
+            )
+        )
+        for copy in copies:
+            sys.stdout.write("      at %s\n" % copy.get("at", "?"))
     return 0
 
 
@@ -585,17 +846,10 @@ def follow(runid, interval, host):
     """
     while True:
         try:
-            delivered, remaining = flush(host=host)
+            report = flush(host=host)
             counts = pull(runid, host=host)
             sys.stdout.write(
-                "delivered=%d queued=%d inspected=%d mirrored=%d echo=%d\n"
-                % (
-                    delivered,
-                    remaining,
-                    counts["inspected"],
-                    counts["mirrored"],
-                    counts["echo"],
-                )
+                _format_flush(report) + " " + _format_pull(counts) + "\n"
             )
             sys.stdout.flush()
         except RemoteUnreachable as exc:
@@ -631,31 +885,35 @@ def main(argv):
             if len(rest) != 5:
                 sys.stderr.write(USAGE)
                 return 2
-            delivered, remaining = post(
+            return _report_flush(post(
                 rest[1], rest[2], rest[3], rest[4],
                 topic=flags["topic"], to=flags["to"], host=host,
-            )
-            return _report_flush(delivered, remaining)
+            ))
         if cmd == "flush":
             if len(rest) != 1:
                 sys.stderr.write(USAGE)
                 return 2
-            return _report_flush(*flush(host=host))
+            return _report_flush(flush(host=host))
         if cmd == "pull":
             if len(rest) != 2:
                 sys.stderr.write(USAGE)
                 return 2
             return _do_pull(rest[1], host)
+        if cmd == "dupes":
+            if len(rest) != 2:
+                sys.stderr.write(USAGE)
+                return 2
+            return _do_dupes(rest[1], host)
         if cmd == "sync":
             if len(rest) != 2:
                 sys.stderr.write(USAGE)
                 return 2
-            delivered, remaining = flush(host=host)
-            sys.stdout.write("delivered=%d queued=%d\n" % (delivered, remaining))
+            report = flush(host=host)
+            sys.stdout.write(_format_flush(report) + "\n")
             rc = _do_pull(rest[1], host)
             # A queued row means the hub was unreachable during the flush, so
             # report that rather than the pull's success.
-            return rc if remaining == 0 else 1
+            return rc if report["remaining"] == 0 else 1
     except RemoteUnreachable as exc:
         # COULD NOT INSPECT is exit 2, never 0: a pull that never reached the
         # hub must not read like a hub with nothing to say.

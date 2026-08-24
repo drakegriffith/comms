@@ -96,7 +96,6 @@ Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
 import json
 import os
 import re
-import socket
 import sys
 import time
 import urllib.error
@@ -105,6 +104,7 @@ import urllib.request
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+import comms_machine  # noqa: E402  (machine_label, re-exported below)
 import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
 
@@ -220,8 +220,13 @@ def resolve_webhook_url(lane=DEFAULT_LANE):
     sys.exit(2)
 
 
-def machine_label():
-    return os.environ.get("COMMS_MACHINE_LABEL") or socket.gethostname().split(".")[0]
+# machine_label lives in lib/comms_machine.py and is RE-EXPORTED here, not
+# reimplemented: it moved out when adapters/remote/ began writing the label
+# into seat names that cross the network (a sync adapter must not import a
+# display adapter to learn its own machine's name). The name stays bound in
+# this module's namespace because ingest_mirror.py, landings.py, and the test
+# suite all reach it as mirror.machine_label().
+machine_label = comms_machine.machine_label
 
 
 # ---- author (Discord webhook `username`) ----------------------------------

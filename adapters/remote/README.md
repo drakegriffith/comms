@@ -26,6 +26,9 @@ python3 adapters/remote/sync.py pull machine-ops
 # both, in one call; or poll
 python3 adapters/remote/sync.py sync machine-ops
 python3 adapters/remote/sync.py --follow machine-ops --interval 15
+
+# who got delivered twice, and which copies (read-time duplicate report)
+python3 adapters/remote/sync.py dupes machine-ops
 ```
 
 After a `pull`, the hub's rows are ordinary sibling rows in the local
@@ -40,7 +43,7 @@ Discord mirror, all of it.
 | `COMMS_REMOTE_HOST` | `studio` | The ssh alias is a fact about `~/.ssh/config`, not about this repo. |
 | `COMMS_REMOTE_BIN` | `~/code/comms/bin/comms` | The hub's checkout path is a fact about the other machine's disk (its `$HOME` is a different username here). |
 | `COMMS_REMOTE_LABEL` | value of `COMMS_REMOTE_HOST` | The provenance label written into pulled seat names. Defaults to the alias, which is already the human's name for that machine. |
-| `COMMS_MACHINE_LABEL` | `hostname` up to the first dot | Shared with `adapters/discord/mirror.py` -- one label per machine, not two. Worth setting: this laptop's hostname is `Christophers-MacBook-Pro-2`, which becomes part of every seat name it exports. |
+| `COMMS_MACHINE_LABEL` | `hostname` up to the first dot | Read through `lib/comms_machine.py`, which every consumer shares -- one label per machine, not two. Worth setting: this laptop's hostname is `Christophers-MacBook-Pro-2`, which becomes part of every seat name it exports. |
 | `COMMS_REMOTE_SSH_TIMEOUT` | `10` (seconds) | Offline is the expected steady state, not an error; the wait before declaring it is a taste call. |
 
 ## Provenance: machine-qualified seat names
@@ -100,13 +103,50 @@ state, not a failure, so `post` never loses a row to it:
   it never drops or reorders. The next `post`, `flush`, `sync`, or `--follow`
   pass retries.
 * The outbox is `$COMMS_STATE_DIR/remote-sync/<host>/outbox.jsonl`, rewritten
-  via tmp + `os.replace`, so a crash mid-flush leaves either the old queue or
-  the new one, never half of one.
+  via tmp + `os.replace` **after every successful send**, so a crash mid-flush
+  leaves either the old queue or the new one, never half of one.
+* A line that will not parse is **quarantined**, never skipped: it moves
+  verbatim to `outbox.bad`, is reported as `malformed=N`, and leaves the queue
+  so it cannot be re-reported forever. An unparseable queued row is a message
+  that will never be delivered, which is precisely the silent loss this module
+  exists to not have.
 
 `post` therefore has two success shapes and they are different exit codes:
 **0 delivered, 1 queued-but-not-delivered.** Queued is not a pass and is not
 a crash; it is a durable "later", and a caller that wants to know which one
 happened can read the code instead of parsing prose.
+
+## Delivery is at-least-once, and the duplicate is visible
+
+There is no transaction spanning "the hub appended the row" and "we wrote that
+down", so exactly-once is not on the menu. Two windows produce a duplicate:
+
+1. **Ambiguous transport failure** -- the hub commits the row and the
+   connection dies before the success reaches us. We saw a nonzero exit; the
+   row exists over there; we cannot tell.
+2. **A crash between a successful send and the outbox rewrite.**
+
+The choice is at-least-once with **cheap, visible duplicates**, never silent
+loss. So the adapter keeps retrying on an ambiguous failure, and makes the
+surviving duplicate harmless and findable:
+
+* The outbox is rewritten after **every** successful send, so a crash costs at
+  most **one** duplicated row rather than the whole delivered batch.
+* Every queued row is stamped at enqueue with a stable delivery id that
+  survives any number of resends, rendered as a ` [#a1b2c3d4]` suffix on the
+  row's text. Two copies of one message therefore carry the *same* id and are
+  matchable by anyone reading the board.
+
+The id rides in the **text** because that is the only field the hub's existing
+`comms post` will carry, and adding a field would mean deploying code to the
+hub -- the one thing this design refuses to do. Cost, stated: rows carry a
+visible suffix, and a row whose text already ended in that exact shape would be
+misread as stamped. The id is advisory, a detector and never a gate, so a
+misread costs a wrong number in a query and nothing else. `sync.strip_msgid()`
+is available to any renderer that would rather not show it.
+
+Read the duplicates with `sync.py dupes <runid>`, or watch the `dupes=` counter
+that every `pull` prints.
 
 ## Exit codes
 
@@ -116,9 +156,16 @@ happened can read the code instead of parsing prose.
 | 1 | Queued, not delivered (hub unreachable). The row is on local disk. |
 | 2 | Usage error, or **could not inspect** -- `pull` could not reach the hub, or the remote CLI is missing. Never a pass. |
 
-`pull` reports `inspected=<n> mirrored=<n> echo=<n>` on every pass. A pass
-that inspected zero rows says so out loud, because a sync that never reached
-the hub and a hub with nothing new are otherwise byte-identical.
+`flush` reports `delivered=<n> queued=<n> malformed=<n>`; `pull` reports
+`inspected=<n> mirrored=<n> echo=<n> skipped=<n> dupes=<n>` on every pass. A
+pass that inspected zero rows says so out loud, because a sync that never
+reached the hub and a hub with nothing new are otherwise byte-identical.
+
+`echo` and `skipped` are **two different facts and get two counters**: `echo`
+is a row this machine exported coming back, `skipped` is another machine's
+mirror file that must not be re-exported. They were one counter named `echo`
+until a reviewer pointed out that a third machine's rows were being reported as
+this machine's own traffic.
 
 ## Design record (2026-08-24, claude-harness#150)
 
@@ -247,3 +294,11 @@ install.sh    preflight (ssh reachable, remote CLI present) + wiring instruction
 machine authored) and `fresh_rows_by_seat` (the per-seat cursor arithmetic,
 lifted out of `adapters/discord/mirror.py` so the two adapters share one
 implementation instead of two that drift).
+
+`lib/comms_machine.py` holds `machine_label()`. It used to live in
+`adapters/discord/mirror.py`, which meant this adapter imported a *display*
+adapter for a chat service in order to learn its own machine's name -- and the
+label is not decoration here, it is written into seat names that cross the
+network and is what the echo filter tests against. Both consumers now import
+the one implementation; `mirror.machine_label` is a re-export, so
+`ingest_mirror.py` and `landings.py` are untouched.

@@ -55,6 +55,16 @@ fi
 export COMMS_ROOT="$FAKE_REMOTE_ROOT"
 export COMMS_STATE_DIR="$FAKE_REMOTE_STATE"
 eval "$cmd"
+rc=$?
+# AMBIGUOUS TRANSPORT FAILURE: the remote command RAN and committed its write,
+# and only then did the connection die. The client sees ssh's 255 and cannot
+# distinguish this from "the row never arrived" -- which is the entire reason
+# delivery is at-least-once instead of exactly-once.
+if [ -n "${FAKE_SSH_AMBIGUOUS:-}" ] && [[ "$cmd" == *"$FAKE_SSH_AMBIGUOUS"* ]]; then
+  echo "ssh: connection closed by remote host" >&2
+  exit 255
+fi
+exit $rc
 """
 
 
@@ -85,6 +95,7 @@ def fake_ssh(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_SSH_LOG", str(log))
     monkeypatch.setenv("FAKE_SSH_DOWN", "")
     monkeypatch.setenv("FAKE_SSH_REJECT", "")
+    monkeypatch.setenv("FAKE_SSH_AMBIGUOUS", "")
 
     # Adapter config: point at the repo's own CLI as the "remote" comms.
     monkeypatch.setenv("COMMS_REMOTE_HOST", "studio")
@@ -104,6 +115,14 @@ def fake_ssh(tmp_path, monkeypatch):
 
         def reject(self, substring):
             monkeypatch.setenv("FAKE_SSH_REJECT", substring)
+
+        def ambiguous(self, substring):
+            """Rows whose command matches COMMIT on the hub and THEN report a
+            transport failure -- the case that makes exactly-once impossible."""
+            monkeypatch.setenv("FAKE_SSH_AMBIGUOUS", substring)
+
+        def clear_ambiguous(self):
+            monkeypatch.setenv("FAKE_SSH_AMBIGUOUS", "")
 
         def calls(self):
             if not log.exists():
@@ -125,6 +144,13 @@ def remote_rows(handle, runid, seat="observer"):
         stdout=subprocess.PIPE, env=env,
     ).stdout.decode()
     return [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+
+
+def hub_texts(handle, runid):
+    """Hub row texts with the delivery-id marker stripped -- what a human
+    wrote, not how it was delivered. Every row this adapter SENDS carries an
+    id (see sync.MSGID_RE); rows posted natively on the hub do not."""
+    return [sync.strip_msgid(r["text"]) for r in remote_rows(handle, runid)]
 
 
 def remote_post(handle, runid, seat, kind, text, topic=None, to=None):
@@ -272,11 +298,11 @@ def test_is_mirror_seat():
 
 
 def test_post_delivers_to_the_remote_mailbox(fake_ssh):
-    delivered, remaining = sync.post("test-x1", "alpha", "comment", "hello hub")
-    assert (delivered, remaining) == (1, 0)
+    report = sync.post("test-x1", "alpha", "comment", "hello hub")
+    assert (report["delivered"], report["remaining"]) == (1, 0)
     rows = remote_rows(fake_ssh, "test-x1")
     assert len(rows) == 1
-    assert rows[0]["text"] == "hello hub"
+    assert sync.strip_msgid(rows[0]["text"]) == "hello hub"
 
 
 def test_post_qualifies_the_seat_with_this_machine(fake_ssh):
@@ -306,7 +332,7 @@ def test_post_text_with_shell_metacharacters_survives_the_wire(fake_ssh):
     only thing between a row's text and command substitution on the hub."""
     nasty = "it's $(echo pwned) `whoami` && rm -rf; \"quoted\""
     sync.post("test-x6", "alpha", "finding", nasty)
-    assert remote_rows(fake_ssh, "test-x6")[0]["text"] == nasty
+    assert hub_texts(fake_ssh, "test-x6") == [nasty]
 
 
 def test_post_rejects_an_invalid_kind_before_queueing(fake_ssh):
@@ -322,8 +348,8 @@ def test_post_rejects_topic_and_to_together(fake_ssh):
 
 def test_post_queues_when_the_hub_is_offline(fake_ssh):
     fake_ssh.go_down()
-    delivered, remaining = sync.post("test-x9", "alpha", "comment", "later")
-    assert (delivered, remaining) == (0, 1)
+    report = sync.post("test-x9", "alpha", "comment", "later")
+    assert (report["delivered"], report["remaining"]) == (0, 1)
     queued = sync.load_outbox()
     assert len(queued) == 1
     assert queued[0]["text"] == "later"
@@ -336,9 +362,9 @@ def test_queued_rows_flush_when_the_hub_comes_back(fake_ssh):
     sync.post("test-xa", "alpha", "comment", "two")
     assert len(sync.load_outbox()) == 2
     fake_ssh.come_up()
-    delivered, remaining = sync.flush()
-    assert (delivered, remaining) == (2, 0)
-    assert [r["text"] for r in remote_rows(fake_ssh, "test-xa")] == ["one", "two"]
+    report = sync.flush()
+    assert (report["delivered"], report["remaining"]) == (2, 0)
+    assert hub_texts(fake_ssh, "test-xa") == ["one", "two"]
     assert sync.load_outbox() == []
 
 
@@ -348,7 +374,7 @@ def test_a_fresh_post_never_overtakes_a_queued_one(fake_ssh):
     sync.post("test-xb", "alpha", "comment", "first")
     fake_ssh.come_up()
     sync.post("test-xb", "alpha", "comment", "second")
-    assert [r["text"] for r in remote_rows(fake_ssh, "test-xb")] == ["first", "second"]
+    assert hub_texts(fake_ssh, "test-xb") == ["first", "second"]
 
 
 def test_flush_stops_at_the_first_failure_and_keeps_the_remainder(fake_ssh):
@@ -358,9 +384,9 @@ def test_flush_stops_at_the_first_failure_and_keeps_the_remainder(fake_ssh):
     sync.post("test-xc", "alpha", "comment", "ccc")
     fake_ssh.come_up()
     fake_ssh.reject("bbb")
-    delivered, remaining = sync.flush()
-    assert (delivered, remaining) == (1, 2)
-    assert [r["text"] for r in remote_rows(fake_ssh, "test-xc")] == ["aaa"]
+    report = sync.flush()
+    assert (report["delivered"], report["remaining"]) == (1, 2)
+    assert hub_texts(fake_ssh, "test-xc") == ["aaa"]
     assert [r["text"] for r in sync.load_outbox()] == ["bbb", "ccc"]
 
 
@@ -373,7 +399,7 @@ def test_a_rejected_row_is_never_dropped(fake_ssh):
 
 
 def test_flush_on_an_empty_outbox_makes_no_ssh_call(fake_ssh):
-    assert sync.flush() == (0, 0)
+    assert sync.flush() == {"delivered": 0, "remaining": 0, "malformed": 0}
     assert fake_ssh.calls() == []
 
 
@@ -384,6 +410,319 @@ def test_outbox_skips_a_corrupt_line_instead_of_wedging(fake_ssh):
     with open(path, "a") as fh:
         fh.write("{not json\n")
     assert [r["text"] for r in sync.load_outbox()] == ["good"]
+
+
+# ---- at-least-once delivery: duplicates are visible, loss is not ---------
+#
+# Verifier finding 1 (MAJOR). There is no transaction spanning "the hub
+# appended the row" and "we wrote that down", so a duplicate is possible and
+# the design's answer is to make it CHEAP AND VISIBLE, never to pretend it
+# away. These tests pin both halves: the crash window is one row, and the
+# surviving duplicate is detectable at read time.
+
+
+def test_stamp_msgid_is_idempotent_for_the_same_id():
+    once = sync.stamp_msgid("hello", "a1b2c3d4")
+    assert sync.stamp_msgid(once, "a1b2c3d4") == once
+
+
+def test_read_and_strip_msgid_round_trip():
+    stamped = sync.stamp_msgid("hello there", "0011aabb")
+    assert sync.read_msgid(stamped) == "0011aabb"
+    assert sync.strip_msgid(stamped) == "hello there"
+
+
+def test_read_msgid_is_none_for_an_unstamped_text():
+    assert sync.read_msgid("just a message") is None
+
+
+def test_duplicate_msgids_ignores_unstamped_rows():
+    """Rows posted natively on the hub carry no id; lumping them together
+    would report one enormous phantom duplicate group."""
+    rows = [_row("a", "1", text="no id"), _row("b", "2", text="also none")]
+    assert sync.duplicate_msgids(rows) == {}
+
+
+def test_duplicate_msgids_counts_only_repeats():
+    rows = [
+        _row("a", "1", text=sync.stamp_msgid("x", "aaaaaaaa")),
+        _row("a", "2", text=sync.stamp_msgid("x", "aaaaaaaa")),
+        _row("a", "3", text=sync.stamp_msgid("y", "bbbbbbbb")),
+    ]
+    assert sync.duplicate_msgids(rows) == {"aaaaaaaa": 2}
+    assert sync.redundant_row_count(rows) == 1
+
+
+def test_every_posted_row_carries_a_delivery_id(fake_ssh):
+    sync.post("test-d1", "alpha", "comment", "tagged")
+    assert sync.read_msgid(remote_rows(fake_ssh, "test-d1")[0]["text"]) is not None
+
+
+def test_ambiguous_failure_leaves_the_row_queued_though_the_hub_has_it(fake_ssh):
+    """The verifier's case: the hub committed, the transport died, and the
+    client cannot tell. Keeping the row queued is the deliberate choice --
+    dropping it here is exactly the silent loss this module refuses."""
+    fake_ssh.ambiguous("ambiguous row")
+    report = sync.post("test-d2", "alpha", "comment", "ambiguous row")
+    assert (report["delivered"], report["remaining"]) == (0, 1)
+    assert len(remote_rows(fake_ssh, "test-d2")) == 1  # it DID land
+    assert len(sync.load_outbox()) == 1  # and we correctly do not know that
+
+
+def test_retry_after_an_ambiguous_failure_duplicates_but_it_is_detectable(fake_ssh):
+    fake_ssh.ambiguous("ambiguous row")
+    sync.post("test-d3", "alpha", "comment", "ambiguous row")
+    fake_ssh.clear_ambiguous()
+    report = sync.flush()
+    assert (report["delivered"], report["remaining"]) == (1, 0)
+
+    rows = remote_rows(fake_ssh, "test-d3")
+    assert len(rows) == 2, "at-least-once: the retry produced a second copy"
+    ids = {sync.read_msgid(r["text"]) for r in rows}
+    assert len(ids) == 1, "both copies must carry the SAME id, or they are not matchable"
+    assert sync.redundant_row_count(rows) == 1
+    assert hub_texts(fake_ssh, "test-d3") == ["ambiguous row", "ambiguous row"]
+
+
+def test_pull_reports_the_duplicate_it_can_see(fake_ssh):
+    """The duplicate is OUR row, so the echo filter drops it before the fresh
+    slice -- which is why dupes is counted over every inspected row."""
+    fake_ssh.ambiguous("ambiguous row")
+    sync.post("test-d4", "alpha", "comment", "ambiguous row")
+    fake_ssh.clear_ambiguous()
+    sync.flush()
+    counts = sync.pull("test-d4")
+    assert counts["inspected"] == 2
+    assert counts["echo"] == 2
+    assert counts["mirrored"] == 0
+    assert counts["dupes"] == 1
+
+
+def test_the_delivery_id_is_stable_across_resends(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-d5", "alpha", "comment", "queued")
+    first = sync.load_outbox()[0]["msgid"]
+    sync.flush()  # still down, still queued
+    assert sync.load_outbox()[0]["msgid"] == first
+    fake_ssh.come_up()
+    sync.flush()
+    assert sync.read_msgid(remote_rows(fake_ssh, "test-d5")[0]["text"]) == first
+
+
+def test_outbox_is_rewritten_after_every_successful_send(fake_ssh, monkeypatch):
+    """The fix for the crash window. Observed DURING the loop, because the
+    end-of-loop rewrite the old code did is indistinguishable from this one
+    once flush has returned."""
+    fake_ssh.go_down()
+    for text in ("aaa", "bbb", "ccc"):
+        sync.post("test-d6", "alpha", "comment", text)
+    fake_ssh.come_up()
+
+    depths = []
+    real_ssh = sync._ssh
+
+    def watching_ssh(argv, host=None):
+        depths.append(len(sync.load_outbox(host)))
+        return real_ssh(argv, host=host)
+
+    monkeypatch.setattr(sync, "_ssh", watching_ssh)
+    sync.flush()
+    # Before send 1 the queue is 3; before send 2 it must ALREADY be 2, which
+    # only holds if the outbox was persisted between the two.
+    assert depths == [3, 2, 1]
+
+
+def test_a_crash_between_delivery_and_rewrite_costs_at_most_one_duplicate(
+    fake_ssh, monkeypatch
+):
+    """The verifier's crash case. With an end-of-loop rewrite this resent the
+    WHOLE delivered prefix; per-row persistence bounds it to the single row
+    whose acknowledgement was lost."""
+    fake_ssh.go_down()
+    for text in ("aaa", "bbb", "ccc"):
+        sync.post("test-d7", "alpha", "comment", text)
+    fake_ssh.come_up()
+
+    real_save = sync._save_outbox
+    calls = {"n": 0}
+
+    def crashing_save(host, records):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the rewrite acknowledging "bbb" never lands
+            raise OSError("simulated crash: disk gone")
+        return real_save(host, records)
+
+    monkeypatch.setattr(sync, "_save_outbox", crashing_save)
+    with pytest.raises(OSError):
+        sync.flush()
+
+    monkeypatch.setattr(sync, "_save_outbox", real_save)
+    sync.flush()  # restart
+
+    texts = hub_texts(fake_ssh, "test-d7")
+    assert texts == ["aaa", "bbb", "bbb", "ccc"]
+    rows = remote_rows(fake_ssh, "test-d7")
+    assert sync.redundant_row_count(rows) == 1, "exactly one row was resent"
+
+
+def test_cli_dupes_reports_the_duplicate(fake_ssh):
+    fake_ssh.ambiguous("ambiguous row")
+    sync.post("test-d8", "alpha", "comment", "ambiguous row")
+    fake_ssh.clear_ambiguous()
+    sync.flush()
+    cp = run_cli(["dupes", "test-d8"])
+    assert cp.returncode == 0
+    assert b"redundant_rows=1" in cp.stdout
+    assert b"ambiguous row" in cp.stdout
+
+
+def test_cli_dupes_on_a_clean_board_reports_zero(fake_ssh):
+    sync.post("test-d9", "alpha", "comment", "only once")
+    cp = run_cli(["dupes", "test-d9"])
+    assert cp.returncode == 0
+    assert b"redundant_rows=0" in cp.stdout
+
+
+def test_cli_dupes_exits_2_when_the_hub_is_unreachable(fake_ssh):
+    fake_ssh.go_down()
+    assert run_cli(["dupes", "test-da"]).returncode == 2
+
+
+# ---- the outbox quarantines what it cannot parse -------------------------
+#
+# Verifier finding 2 (LOW). A line that will not parse is a QUEUED ROW THAT
+# WILL NEVER BE DELIVERED. Skipping it silently loses a message with no trace.
+
+
+def _corrupt_outbox(host="studio", line="{not json"):
+    with open(sync._outbox_path(host), "a") as fh:
+        fh.write(line + "\n")
+
+
+def test_read_outbox_separates_records_from_malformed_lines(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-q1", "alpha", "comment", "good")
+    _corrupt_outbox()
+    records, malformed = sync.read_outbox()
+    assert [r["text"] for r in records] == ["good"]
+    assert malformed == ["{not json"]
+
+
+def test_flush_quarantines_a_malformed_line_verbatim(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-q2", "alpha", "comment", "good")
+    _corrupt_outbox(line='{"half": "written"')
+    report = sync.flush()
+    assert report["malformed"] == 1
+    bad = open(sync._quarantine_path("studio")).read()
+    assert '{"half": "written"' in bad, "the row must be recoverable by a human"
+
+
+def test_quarantine_removes_the_bad_line_from_the_queue(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-q3", "alpha", "comment", "good")
+    _corrupt_outbox()
+    sync.flush()
+    _records, malformed = sync.read_outbox()
+    assert malformed == [], "already quarantined, must not be re-reported forever"
+
+
+def test_a_malformed_line_does_not_block_the_good_rows(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-q4", "alpha", "comment", "good")
+    _corrupt_outbox()
+    fake_ssh.come_up()
+    report = sync.flush()
+    assert (report["delivered"], report["malformed"]) == (1, 1)
+    assert hub_texts(fake_ssh, "test-q4") == ["good"]
+
+
+def test_clean_flush_reports_zero_malformed_and_writes_no_bad_file(fake_ssh):
+    sync.post("test-q5", "alpha", "comment", "fine")
+    assert sync.flush()["malformed"] == 0
+    assert not os.path.exists(sync._quarantine_path("studio"))
+
+
+def test_cli_flush_surfaces_the_malformed_count(fake_ssh):
+    fake_ssh.go_down()
+    sync.post("test-q6", "alpha", "comment", "good")
+    _corrupt_outbox()
+    fake_ssh.come_up()
+    cp = run_cli(["flush"])
+    assert b"malformed=1" in cp.stdout
+
+
+# ---- echo and skipped are different facts --------------------------------
+#
+# Verifier finding 3 (LOW): both were reported under one counter named "echo",
+# so a third machine's mirror rows read as this machine's own traffic.
+
+
+def test_classify_names_the_three_reasons():
+    assert sync.classify(_row("alpha~laptop", "1"), "laptop") == "echo"
+    assert sync.classify(_row("remote~pi", "1"), "laptop") == "skipped"
+    assert sync.classify(_row("bravo~studio", "1"), "laptop") == "mirror"
+
+
+def test_pull_counts_echo_and_skipped_separately(fake_ssh):
+    """The verifier's exact fixture: a real peer seat plus a third machine's
+    mirror file. Only one of the two dropped rows is an echo -- and neither
+    of them is, here, which is the point: the old counter said echo=1."""
+    remote_post(fake_ssh, "test-e1", "bravo", "comment", "real peer")
+    remote_post(fake_ssh, "test-e1", "remote~pi", "comment", "third machine")
+    counts = sync.pull("test-e1")
+    assert counts["inspected"] == 2
+    assert counts["mirrored"] == 1
+    assert counts["echo"] == 0, "a third machine's mirror row is NOT our echo"
+    assert counts["skipped"] == 1
+
+
+def test_pull_counts_a_real_echo_as_echo(fake_ssh):
+    sync.post("test-e2", "alpha", "comment", "ours")
+    remote_post(fake_ssh, "test-e2", "remote~pi", "comment", "third machine")
+    counts = sync.pull("test-e2")
+    assert counts["echo"] == 1
+    assert counts["skipped"] == 1
+    assert counts["mirrored"] == 0
+
+
+def test_cli_pull_prints_both_counters(fake_ssh):
+    remote_post(fake_ssh, "test-e3", "remote~pi", "comment", "third machine")
+    cp = run_cli(["pull", "test-e3"])
+    assert b"echo=0 skipped=1" in cp.stdout
+
+
+# ---- identity comes from a shared module, not the Discord adapter --------
+#
+# Verifier finding 4 (LOW): cross-machine correctness must not depend on a
+# display adapter for a chat service.
+
+
+def test_machine_label_is_the_shared_implementation():
+    """Both consumers must be the SAME function object. Two machines' worth of
+    provenance tagging and the echo filter all depend on one answer; a second
+    implementation would be free to drift into a second answer.
+
+    The test adds adapters/discord to sys.path itself -- sync.py no longer
+    does, which is the whole point of the fix."""
+    import comms_machine
+
+    sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "discord"))
+    import mirror
+
+    assert sync.machine_label is comms_machine.machine_label
+    assert mirror.machine_label is comms_machine.machine_label
+
+
+def test_sync_does_not_import_the_discord_adapter():
+    source = open(os.path.join(REPO_ROOT, "adapters", "remote", "sync.py")).read()
+    assert "adapters\", \"discord\"" not in source
+    assert "import mirror" not in source
+
+
+def test_machine_label_still_honors_the_env_override(monkeypatch):
+    monkeypatch.setenv("COMMS_MACHINE_LABEL", "somewhere")
+    assert sync.machine_label() == "somewhere"
 
 
 # ---- the wire: what actually reaches the remote shell --------------------
@@ -436,9 +775,9 @@ def test_remote_bin_is_shell_expanded_end_to_end(fake_ssh, monkeypatch):
     a remote bin naming a variable must resolve on the far side."""
     monkeypatch.setenv("COMMS_REPO_FOR_TEST", REPO_ROOT)
     monkeypatch.setenv("COMMS_REMOTE_BIN", "$COMMS_REPO_FOR_TEST/bin/comms")
-    delivered, remaining = sync.post("test-w1", "alpha", "comment", "expanded")
-    assert (delivered, remaining) == (1, 0)
-    assert [r["text"] for r in remote_rows(fake_ssh, "test-w1")] == ["expanded"]
+    report = sync.post("test-w1", "alpha", "comment", "expanded")
+    assert (report["delivered"], report["remaining"]) == (1, 0)
+    assert hub_texts(fake_ssh, "test-w1") == ["expanded"]
 
 
 # ---- pull ----------------------------------------------------------------
@@ -447,7 +786,9 @@ def test_remote_bin_is_shell_expanded_end_to_end(fake_ssh, monkeypatch):
 def test_pull_mirrors_remote_rows_into_the_local_mailbox(fake_ssh):
     remote_post(fake_ssh, "test-y1", "bravo", "comment", "from the studio")
     counts = sync.pull("test-y1")
-    assert counts == {"inspected": 1, "mirrored": 1, "echo": 0}
+    assert counts == {
+        "inspected": 1, "mirrored": 1, "echo": 0, "skipped": 0, "dupes": 0,
+    }
     local = swarm_mailbox.read_siblings("test-y1", "alpha")
     assert [r["text"] for r in local] == ["from the studio"]
 
@@ -499,7 +840,9 @@ def test_pull_advances_the_cursor_over_dropped_echoes(fake_ssh):
     """A dropped row still counts, or every pass re-scans it forever."""
     sync.post("test-y7", "alpha", "comment", "ours")
     sync.pull("test-y7")
-    assert sync.pull("test-y7") == {"inspected": 1, "mirrored": 0, "echo": 0}
+    assert sync.pull("test-y7") == {
+        "inspected": 1, "mirrored": 0, "echo": 0, "skipped": 0, "dupes": 0,
+    }
 
 
 def test_pull_skips_another_machines_mirror_file(fake_ssh):
@@ -515,7 +858,9 @@ def test_pull_skips_another_machines_mirror_file(fake_ssh):
 
 
 def test_pull_on_an_empty_remote_run_reports_zero_inspected(fake_ssh):
-    assert sync.pull("test-y9") == {"inspected": 0, "mirrored": 0, "echo": 0}
+    assert sync.pull("test-y9") == {
+        "inspected": 0, "mirrored": 0, "echo": 0, "skipped": 0, "dupes": 0,
+    }
 
 
 def test_pull_raises_when_the_hub_is_unreachable(fake_ssh):
@@ -566,7 +911,7 @@ def test_round_trip_both_directions(fake_ssh):
     remote_post(fake_ssh, "test-z1", "bravo", "comment", "studio -> laptop")
     sync.pull("test-z1")
 
-    on_hub = [r["text"] for r in remote_rows(fake_ssh, "test-z1")]
+    on_hub = hub_texts(fake_ssh, "test-z1")
     on_laptop = [r["text"] for r in swarm_mailbox.read_siblings("test-z1", "alpha")]
     assert "laptop -> studio" in on_hub
     assert on_laptop == ["studio -> laptop"]
