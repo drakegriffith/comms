@@ -73,6 +73,7 @@ sugar on top.
 | pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
 | Discord     | mirror   | `adapters/discord/` mirrors mailbox rows to a channel (in flight, issue #2) |
 | Claude Code (ambient) | push + mirror | `adapters/claude-code/ambient/` -- SessionStart + SendMessage-bridge hooks enroll every session into standing run `machine-ops` (topic `ops`; only message SUMMARIES are bridged), mirrored to Discord as the machine dashboard |
+| GitHub (landings) | poll + mirror | `adapters/github/` polls `gh api` for merged/closed PRs and closed issues, posts each to Discord with attribution ("who merged/closed what") -- source is GitHub itself, not the comms mailbox |
 | anything else | poll   | `bin/comms read <runid> <seat>` in the agent's own loop |
 
 ## Quickstart
@@ -116,6 +117,8 @@ adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
 adapters/kimi/               resume-driver for a runtime with no hook surface
 adapters/pi/                 poll-loop recipe for pi and any hook-less runtime
+adapters/discord/            mirrors mailbox rows to a Discord channel
+adapters/github/             polls gh api for merged/closed PRs and issues, posts landings to Discord
 tests/                       pytest suites + heartbeat suite + CLI smoke test
 ```
 
