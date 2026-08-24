@@ -198,6 +198,33 @@ def test_session_start_skips_private_var_folders_cwd(env):
     assert throwaway in ambient_log(env)
 
 
+def test_session_start_skips_var_folders_cwd_nonprivate_spelling(env):
+    # Verifier2 finding (PR#14 LOW): on macOS /var is a symlink to
+    # /private/var, so a cwd reported in the /var/... spelling (TMPDIR
+    # unset, or a different tool that doesn't realpath) must be caught the
+    # same as the /private/var/... spelling -- this is what realpath(cwd) in
+    # the guard is for. A NONEXISTENT path is used deliberately: the guard
+    # must not require the directory to actually be there (session-start.sh
+    # only ever reads cwd as a string).
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    throwaway = "/var/folders/xx/yy/T/pytest-of-x/pytest-1/test0"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    assert throwaway in ambient_log(env)
+
+
+def test_session_start_skips_var_tmp_cwd(env):
+    env.pop("COMMS_AMBIENT_FORCE", None)
+    throwaway = "/var/tmp/some-throwaway-session-dir"
+    r = run(SESSION_START, env, start_payload(throwaway))
+    assert r.returncode == 0
+    assert participants(env) == []
+    assert mailbox_rows(env) == []
+    assert throwaway in ambient_log(env)
+
+
 def test_session_start_skips_mutgate_worktree_cwd(env):
     env.pop("COMMS_AMBIENT_FORCE", None)
     throwaway = "/Users/drake/.claude/jobs/abc/tmp/mutgate-wt.9f2c/repo"
@@ -221,7 +248,15 @@ def test_session_start_force_overrides_tmp_guard(env, tmp_path):
 
 def test_session_start_normal_repo_cwd_writes_row_without_force(env):
     env.pop("COMMS_AMBIENT_FORCE", None)
-    normal = os.path.join(REPO, "not-a-throwaway-checkout")
+    # A FIXED LITERAL, deliberately NOT derived from REPO: session-start.sh
+    # only ever reads cwd as a string (never stats it), so a literal is a
+    # faithful "normal checkout" fixture. REPO itself is not a safe stand-in
+    # -- the mutation gate runs this suite from inside a worktree at
+    # $TMPDIR/mutgate-wt.*/wt, and any /tmp checkout hits the same trap: REPO
+    # would then BE a throwaway path, the guard would correctly silence it,
+    # and this test would go red for a reason that has nothing to do with a
+    # mutation -- a contaminated baseline the gate can't tell from a kill.
+    normal = "/Users/someone/code/not-a-throwaway-checkout"
     r = run(SESSION_START, env, start_payload(normal))
     assert r.returncode == 0
     assert len(participants(env)) == 1

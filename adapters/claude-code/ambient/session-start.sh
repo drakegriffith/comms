@@ -41,14 +41,19 @@
 #
 # SKIP CONDITIONS (exit 0, no write, before the session is touched):
 #   * COMMS_AMBIENT_OPTOUT is non-empty -- checked FIRST, before even the
-#     state dir is created. Test harnesses and the mutation gate export this.
-#   * the session cwd is a throwaway directory: under $TMPDIR, /tmp,
-#     /private/tmp, /private/var/folders, or a path with a `mutgate-wt.*`
-#     segment (a mutation-gate worktree). One line naming the skipped cwd
-#     goes to ambient.log; nothing is enrolled and no row is posted, so a
-#     board reader never sees "session started in /private/var/folders/...".
-#     Escape hatch: COMMS_AMBIENT_FORCE=1 overrides this guard for a session
-#     that legitimately runs in a throwaway-shaped path.
+#     state dir is created. Harnesses that never want ambient writes SHOULD
+#     export this (nothing does today; the active defense against the
+#     leaked-seat bug below is the cwd guard, not this opt-out).
+#   * the REALPATH of the session cwd is a throwaway directory: under
+#     $TMPDIR, /tmp, /var/tmp, /private/tmp, /private/var/tmp,
+#     /var/folders, /private/var/folders, or a path with a `mutgate-wt.*`
+#     segment (a mutation-gate worktree). realpath'd first so /var/folders
+#     and /private/var/folders (macOS symlinks one to the other) both match.
+#     One line naming the skipped cwd goes to ambient.log; nothing is
+#     enrolled and no row is posted, so a board reader never sees "session
+#     started in /private/var/folders/...". Escape hatch:
+#     COMMS_AMBIENT_FORCE=1 overrides this guard for a session that
+#     legitimately runs in a throwaway-shaped path.
 #
 # ISOLATION KNOBS (tests set these; production uses the defaults):
 #   COMMS_STATE_DIR      arm/roster state + ambient.log (default ~/.comms/state)
@@ -124,14 +129,22 @@ MUTGATE_WT_RE = re.compile(r"/mutgate-wt\.[^/]*/")
 
 
 def throwaway_cwd(cwd):
-    """True when cwd sits under a throwaway root: $TMPDIR, /tmp,
-    /private/tmp, /private/var/folders, or a path with a mutgate-wt.*
-    segment (a mutation-gate worktree)."""
-    norm = (cwd or "").rstrip("/") or "/"
-    roots = ["/tmp", "/private/tmp", "/private/var/folders"]
+    """True when the REALPATH of cwd sits under a throwaway root: $TMPDIR,
+    /tmp, /var/tmp, /private/tmp, /private/var/tmp, /var/folders,
+    /private/var/folders, or a path with a mutgate-wt.* segment (a
+    mutation-gate worktree). realpath'd before matching so both spellings of
+    a symlinked location match -- macOS's /var is a symlink to /private/var,
+    so a cwd reported as /var/folders/... (TMPDIR unset or non-default) must
+    match the same root as the /private/var/folders/... spelling."""
+    norm = os.path.realpath(cwd or "/").rstrip("/") or "/"
+    roots = [
+        "/tmp", "/private/tmp",
+        "/var/tmp", "/private/var/tmp",
+        "/var/folders", "/private/var/folders",
+    ]
     tmpdir_env = os.environ.get("TMPDIR")
     if tmpdir_env:
-        roots.append(tmpdir_env.rstrip("/"))
+        roots.append(os.path.realpath(tmpdir_env).rstrip("/"))
     for root in roots:
         if root and (norm == root or norm.startswith(root + "/")):
             return True
