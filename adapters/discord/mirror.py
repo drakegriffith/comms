@@ -13,11 +13,27 @@ is the write-side gate, and it is being extended on a parallel branch
 (comment|reply|status). A mirror that hardcoded the vocabulary would silently
 drop the new kinds; this one renders whatever the row carries.
 
-IDENTITY: a seat that enrolled with --model/--project/--area (lib/swarm_arm)
-renders as human-readable prose -- "[machine] Kimi K3 on agent-os (hooks/) |
-seat kimi1 | finding: ..." -- joined row.seat -> roster at format time. A seat
-without identity renders in the pre-identity "[machine/seat] kind: text"
-format, byte-identical. Identity is display-only and never gates anything.
+RENDERING (human-readable, three visible verbs): a mailbox row renders as
+TWO parts -- an author (Discord webhook `username`, one seat's identity per
+POST) and a content string (an emoji-prefixed one-liner). See build_author,
+build_content, format_row.
+
+  author:  "<seat> · <model> on <project> (<machine>)", or, without
+           enrollment identity (lib/swarm_arm --model/--project/--area),
+           "<seat> (<machine>)". Sanitized against @everyone/@here and
+           zero-width characters (see _sanitize_author) -- identity is
+           display-only prose and never gates anything.
+  content: one leading emoji chosen by the row's shape (see KIND_EMOJI and
+           build_content's docstring) -- the "posted to mailbox" verb. The
+           "agent born" verb (the ambient session-started status row) and
+           the "heard from mailbox" verb (posted by adapters/discord/
+           ingest_mirror.py from the heartbeat telemetry log, NOT this
+           module's mailbox tail) round out the three visible verbs.
+
+Because a single POST's Discord `username` is one value, rows batched into
+one message must share an author -- chunk_rows batches per (seat), never
+mixing two seats into the same POST even when they would fit under the
+content cap.
 
 WHAT IS NOT MIRRORED: claims, arming, subscriptions, cursors -- machine-local
 state stays machine-local. Command direction (Discord -> machine) is out of
@@ -79,6 +95,7 @@ Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
 
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -207,36 +224,126 @@ def machine_label():
     return os.environ.get("COMMS_MACHINE_LABEL") or socket.gethostname().split(".")[0]
 
 
-def format_row(row, machine, identity=None):
-    """One line per row, first 300 chars of text.
+# ---- author (Discord webhook `username`) ----------------------------------
+# Zero-width chars a seat/model name could smuggle in to make a rendered
+# author line invisible-but-present; stripped before ever leaving this
+# process. @everyone/@here are stripped too -- Discord's webhook username
+# field is plain text, not a mention, but a seat literally named "@everyone"
+# must never render as one in a human's eye.
+_ZERO_WIDTH_CHARS = "​‌‍﻿"  # ZWSP, ZWNJ, ZWJ, BOM/ZWNBSP
+_ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH_CHARS + "]")
+_MENTION_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
 
-    IDENTITY: `identity` is the seat's enrollment metadata (swarm_arm
-    seat_identities: {model, project, area}, declared keys only), joined to
-    the row BY SEAT at format time. It is display-only prose for the human
-    watching the channel -- never parsed, never gating. With identity:
 
-        [machine] Kimi K3 on agent-os (hooks/) | seat kimi1 | finding: text
+def _sanitize_author(author):
+    author = _ZERO_WIDTH_RE.sub("", author)
+    author = _MENTION_RE.sub(lambda m: m.group(0).replace("@", ""), author)
+    return author
 
-    Any subset of the three fields renders (absent parts drop out). Without
-    identity the line is the pre-identity format, byte-identical:
 
-        [machine/seat] finding: text
+def build_author(seat, identity, machine):
+    """This message's Discord webhook `username` -- one seat's authorship per
+    POST (see chunk_rows). With identity (swarm_arm seat_identities:
+    {model, project, area}, declared keys only):
+
+        <seat> · <model> on <project> (<machine>)
+
+    Any subset of model/project renders (absent parts drop out); without
+    identity at all:
+
+        <seat> (<machine>)
+
+    Sanitized against @everyone/@here and zero-width characters -- see
+    _sanitize_author.
+    """
+    identity = identity or {}
+    parts = []
+    if identity.get("model"):
+        parts.append(str(identity["model"]))
+    if identity.get("project"):
+        parts.append("on %s" % identity["project"])
+    if parts:
+        author = "%s · %s (%s)" % (seat, " ".join(parts), machine)
+    else:
+        author = "%s (%s)" % (seat, machine)
+    return _sanitize_author(author)
+
+
+# ---- content (kind -> emoji prefix) ----------------------------------------
+# Values are the literal emoji this event kind renders with in Discord (Drake's
+# explicit ask -- content only, never in a comment describing them, so this
+# dict is the one place their glyphs appear in this file).
+KIND_EMOJI = {
+    "finding": "\U0001f4ec✅",       # mailbox-with-mail + check mark: broadcast finding
+    "comment": "\U0001f4ec\U0001f4ac",   # mailbox-with-mail + speech balloon: broadcast comment
+    "reply": "↩️",             # leftwards arrow with hook: reply
+    "claim": "\U0001f4cc",               # pushpin: claim
+    "blocker": "\U0001f6a7",             # construction sign: blocker
+    "status": "ℹ️",            # information source: status (non-ambient)
+}
+
+# The ambient "session started" status row's exact text shape (see
+# adapters/claude-code's ambient status post); parsed out so it can render as
+# the "agent born" verb instead of the generic status emoji.
+_SESSION_STARTED_RE = re.compile(r"^session started in (.+)$")
+
+# The sendmessage-bridge's row shape: "-> <target>: <summary>". <target> is
+# either a real seat name or a bare agent_id (the complaint this feature
+# exists to fix -- see PR description). Agent ids observed in this run's
+# roster are 17 lowercase-hex characters; matched generically so any future
+# id of the same shape is caught, not just ones seen so far.
+_BRIDGE_RE = re.compile(r"^-> ([^:]+): (.*)$")
+_AGENT_ID_RE = re.compile(r"^[0-9a-f]{17}$")
+
+
+def build_content(row):
+    """This row's Discord message CONTENT (no author -- that is the webhook
+    `username`, see build_author): first TEXT_CAP chars of text, one leading
+    emoji chosen by event shape, in this precedence:
+
+      1. the ambient "session started in <dir>" status row -> the "agent
+         born" verb: hatching-chick emoji + "I am awake in <dir>"
+      2. a unicast (topic starts with "@") -> incoming-envelope emoji +
+         "to <seat>: <text>"
+      3. a sendmessage-bridge row (text starts with "-> ") -> the target
+         rendered readably; a bare agent_id target is NEVER the bare object
+         of the sentence (a raw 17-hex id means nothing to a human) --
+         shortened to its first 8 chars and phrased as "a subagent (<short>)"
+      4. otherwise: kind's emoji (KIND_EMOJI, default the info-source emoji)
+         + text
     """
     text = str(row.get("text", ""))[:TEXT_CAP].replace("\n", " ")
-    seat = row.get("seat", "?")
     kind = row.get("kind", "?")
-    if identity:
-        parts = []
-        if identity.get("model"):
-            parts.append(str(identity["model"]))
-        if identity.get("project"):
-            parts.append("on %s" % identity["project"])
-        if identity.get("area"):
-            parts.append("(%s)" % identity["area"])
-        return "[%s] %s | seat %s | %s: %s" % (
-            machine, " ".join(parts), seat, kind, text
-        )
-    return "[%s/%s] %s: %s" % (machine, seat, kind, text)
+    topic = str(row.get("topic", ""))
+
+    if kind == "status":
+        m = _SESSION_STARTED_RE.match(text)
+        if m:
+            return "\U0001f423 I am awake in %s" % m.group(1)
+
+    if topic.startswith("@"):
+        return "\U0001f4e8 to %s: %s" % (topic[1:], text)
+
+    m = _BRIDGE_RE.match(text)
+    if m:
+        target, summary = m.group(1), m.group(2)
+        if _AGENT_ID_RE.match(target):
+            rendered = "sent to a subagent (%s): %s" % (target[:8], summary)
+        else:
+            rendered = "sent to %s: %s" % (target, summary)
+        return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), rendered)
+
+    return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), text)
+
+
+def format_row(row, machine, identity=None):
+    """(author, content) for one row -- author is this row's seat's Discord
+    webhook `username` (build_author), content is the emoji-prefixed message
+    body (build_content). Split because Discord authorship rides the
+    per-POST `username` field, not message text; see chunk_rows for how rows
+    sharing an author are batched into one POST."""
+    seat = row.get("seat", "?")
+    return build_author(seat, identity, machine), build_content(row)
 
 
 def _load_cursor(runid, lane=DEFAULT_LANE):
@@ -299,30 +406,53 @@ def collect_new(runid, lane=DEFAULT_LANE):
 
 
 def chunk_rows(rows, machine, cap=CONTENT_CAP, identities=None):
-    """Batch rows into as few Discord messages as fit under the content cap.
-    Returns a list of (content, rows_in_chunk) so a failed POST can name
-    exactly which rows it skipped. `identities` (optional) maps seat ->
-    enrollment identity for format_row; omitted = identity-free rendering."""
+    """Batch rows into as few Discord messages as fit under the content cap,
+    NEVER mixing two seats into one message: Discord's webhook `username` is
+    per-POST, so a batch that mixed seats could only speak with one seat's
+    voice for the others' rows too. A seat change always starts a new chunk,
+    even when the next row would still fit under `cap`.
+
+    Returns a list of (author, content, rows_in_chunk) so a failed POST can
+    name exactly which rows it skipped and which author it failed under.
+    `identities` (optional) maps seat -> enrollment identity for build_author;
+    omitted = identity-free authorship ("<seat> (<machine>)")."""
+    identities = identities or {}
     chunks = []
+    cur_author, cur_seat = None, None
     cur_lines, cur_rows, size = [], [], 0
+
+    def flush():
+        if cur_lines:
+            chunks.append((cur_author, "\n".join(cur_lines), list(cur_rows)))
+
     for row in rows:
-        line = format_row(row, machine, (identities or {}).get(row.get("seat")))
-        if cur_lines and size + 1 + len(line) > cap:
-            chunks.append(("\n".join(cur_lines), cur_rows))
+        seat = row.get("seat", "?")
+        author, line = format_row(row, machine, identities.get(seat))
+        new_seat = cur_seat is not None and seat != cur_seat
+        over_cap = cur_lines and size + 1 + len(line) > cap
+        if new_seat or over_cap:
+            flush()
             cur_lines, cur_rows, size = [], [], 0
+        cur_seat, cur_author = seat, author
         cur_lines.append(line)
         cur_rows.append(row)
         size += len(line) + (1 if size else 0)
-    if cur_lines:
-        chunks.append(("\n".join(cur_lines), cur_rows))
+    flush()
     return chunks
 
 
-def post_content(url, content):
+def post_content(url, content, username=None):
     """POST one message. Honours 429 Retry-After, caps retries. Returns True
     delivered / False gave up. Never raises for HTTP-level failure and never
-    prints the URL."""
-    body = json.dumps({"content": content}).encode("utf-8")
+    prints the URL.
+
+    `username` (optional): per-message Discord webhook author override --
+    the "post as this seat" mechanism (see build_author). Omitted -> the
+    webhook's own configured name, exactly the pre-authorship behavior."""
+    payload = {"content": content}
+    if username:
+        payload["username"] = username
+    body = json.dumps(payload).encode("utf-8")
     attempt = 0
     while True:
         req = urllib.request.Request(
@@ -393,8 +523,8 @@ def run_once(runid, lane=DEFAULT_LANE):
         # format_row. A run with no arm state (or a pre-identity roster)
         # yields {} and every line renders in the identity-free format.
         identities = swarm_arm.seat_identities(runid)
-        for content, chunk in chunk_rows(fresh, machine, identities=identities):
-            if not post_content(url, content):
+        for author, content, chunk in chunk_rows(fresh, machine, identities=identities):
+            if not post_content(url, content, username=author):
                 _log_skipped(runid, chunk, "webhook delivery failed", lane)
                 skipped = True
     # Advance past everything, delivered or skipped: the skipped file is the
@@ -460,6 +590,24 @@ def follow(runid, interval, lane=DEFAULT_LANE):
             return rc
 
 
+def _tail_ingest_logged(url):
+    """Run adapters/discord/ingest_mirror.py's tail_once under the same S1
+    per-pass exception guard as _run_once_logged, so a broken beat in the
+    heartbeat-telemetry tailer never kills this loop either. Imported HERE,
+    not at module scope, to avoid a load-time cycle (ingest_mirror imports
+    this module for post_content/build_author/machine_label -- see its
+    docstring)."""
+    try:
+        import ingest_mirror
+        return ingest_mirror.tail_once(url)
+    except Exception as exc:
+        sys.stderr.write(
+            "discord mirror: ingest tail failed (%s); continuing\n"
+            % exc.__class__.__name__
+        )
+        return 1
+
+
 def follow_all(interval, lane=DEFAULT_LANE):
     """Poll EVERY run under the mailbox root, once per pass, forever.
     Discovery is swarm_mailbox.run_ids() so a newly-armed run is picked up
@@ -468,15 +616,28 @@ def follow_all(interval, lane=DEFAULT_LANE):
     before touching any run -- warns once and backs off 60s exactly like
     follow() when absent, instead of re-discovering the same failure once
     per run. A per-run exception (S1) is caught by _run_once_logged so one
-    broken run does not stop the pass from reaching the rest."""
+    broken run does not stop the pass from reaching the rest.
+
+    INGEST WIRE-UP: when lane is "convo", each pass ALSO tails the
+    swarm-heartbeat telemetry log (adapters/discord/ingest_mirror.py) once,
+    after the mailbox-row runs, posting a "read N row(s)" event per delivery
+    -- one process, no second launchd job. The heartbeat log is fleet-wide,
+    not per-run (it has no run-scoped tail point), so this lives in
+    follow_all's whole-fleet pass rather than follow()'s single-run one;
+    `follow(<runid>, lane="convo")` mirrors that run's mailbox rows only and
+    does not tail ingest -- a deliberate scope choice, not an oversight (see
+    PR description)."""
     rc = 0
     while True:
-        if _find_webhook_url(lane) is None:
+        url = _find_webhook_url(lane)
+        if url is None:
             _warn_missing_secret(lane)
             sleep_for = MISSING_SECRET_RETRY_SECONDS
         else:
             for runid in swarm_mailbox.run_ids():
                 rc = max(rc, _run_once_logged(runid, lane))
+            if lane == "convo":
+                rc = max(rc, _tail_ingest_logged(url))
             sleep_for = interval
         try:
             time.sleep(sleep_for)
