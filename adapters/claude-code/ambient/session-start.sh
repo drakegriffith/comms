@@ -39,9 +39,27 @@
 # SessionStart stdout is injected into the session's context, so success is
 # byte-silent).
 #
+# SKIP CONDITIONS (exit 0, no write, before the session is touched):
+#   * COMMS_AMBIENT_OPTOUT is non-empty -- checked FIRST, before even the
+#     state dir is created. Harnesses that never want ambient writes SHOULD
+#     export this (nothing does today; the active defense against the
+#     leaked-seat bug below is the cwd guard, not this opt-out).
+#   * the REALPATH of the session cwd is a throwaway directory: under
+#     $TMPDIR, /tmp, /var/tmp, /private/tmp, /private/var/tmp,
+#     /var/folders, /private/var/folders, or a path with a `mutgate-wt.*`
+#     segment (a mutation-gate worktree). realpath'd first so /var/folders
+#     and /private/var/folders (macOS symlinks one to the other) both match.
+#     One line naming the skipped cwd goes to ambient.log; nothing is
+#     enrolled and no row is posted, so a board reader never sees "session
+#     started in /private/var/folders/...". Escape hatch:
+#     COMMS_AMBIENT_FORCE=1 overrides this guard for a session that
+#     legitimately runs in a throwaway-shaped path.
+#
 # ISOLATION KNOBS (tests set these; production uses the defaults):
-#   COMMS_STATE_DIR  arm/roster state + ambient.log (default ~/.comms/state)
-#   COMMS_ROOT       mailbox root (default /tmp)
+#   COMMS_STATE_DIR      arm/roster state + ambient.log (default ~/.comms/state)
+#   COMMS_ROOT           mailbox root (default /tmp)
+#   COMMS_AMBIENT_OPTOUT non-empty -> exit 0 before any write
+#   COMMS_AMBIENT_FORCE  non-empty -> bypass the throwaway-cwd guard
 #
 # COMPLETENESS MARKER: the FINAL line of this file is
 #   # hook-eof-marker v1 do-not-remove
@@ -51,6 +69,11 @@
 # the shim treat this file as torn and skip it.
 
 set -uo pipefail
+
+# ---- opt-out: honored BEFORE any write, even before STATE_DIR is touched --
+if [ -n "${COMMS_AMBIENT_OPTOUT:-}" ]; then
+  exit 0
+fi
 
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 
@@ -87,6 +110,7 @@ python3 <<'PY' || true
 import datetime
 import json
 import os
+import re
 import sys
 
 state_dir = os.environ.get("AMB_STATE_DIR") or os.path.expanduser("~/.comms/state")
@@ -99,6 +123,32 @@ def log(msg):
             fh.write("%s session-start: %s\n" % (at, msg))
     except OSError:
         pass
+
+
+MUTGATE_WT_RE = re.compile(r"/mutgate-wt\.[^/]*/")
+
+
+def throwaway_cwd(cwd):
+    """True when the REALPATH of cwd sits under a throwaway root: $TMPDIR,
+    /tmp, /var/tmp, /private/tmp, /private/var/tmp, /var/folders,
+    /private/var/folders, or a path with a mutgate-wt.* segment (a
+    mutation-gate worktree). realpath'd before matching so both spellings of
+    a symlinked location match -- macOS's /var is a symlink to /private/var,
+    so a cwd reported as /var/folders/... (TMPDIR unset or non-default) must
+    match the same root as the /private/var/folders/... spelling."""
+    norm = os.path.realpath(cwd or "/").rstrip("/") or "/"
+    roots = [
+        "/tmp", "/private/tmp",
+        "/var/tmp", "/private/var/tmp",
+        "/var/folders", "/private/var/folders",
+    ]
+    tmpdir_env = os.environ.get("TMPDIR")
+    if tmpdir_env:
+        roots.append(os.path.realpath(tmpdir_env).rstrip("/"))
+    for root in roots:
+        if root and (norm == root or norm.startswith(root + "/")):
+            return True
+    return bool(MUTGATE_WT_RE.search(norm + "/"))
 
 try:
     sys.path.insert(0, os.environ.get("AMB_SWARM_LIB") or "")
@@ -121,6 +171,11 @@ try:
         or "pid-%s" % os.environ.get("AMB_PPID", os.getppid())
     )
     cwd = payload.get("cwd") or os.getcwd()
+
+    if throwaway_cwd(cwd) and not os.environ.get("COMMS_AMBIENT_FORCE"):
+        log("skipped throwaway cwd: %s" % cwd)
+        sys.exit(0)
+
     project = os.path.basename(cwd.rstrip("/")) or "root"
     safe_project = "".join(c for c in project if c.isalnum() or c in "-_.") or "root"
     safe_id = "".join(c for c in agent_id if c.isalnum()) or "0000"
