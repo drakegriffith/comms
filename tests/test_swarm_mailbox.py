@@ -21,8 +21,12 @@ _spec.loader.exec_module(mb)
 
 class TestMailbox(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="comms-test-root-")
-        os.environ["COMMS_ROOT"] = self.tmp
+        # conftest.py's autouse fixture already points COMMS_ROOT at a fresh
+        # per-test tmp_path dir before setUp runs; adopt it rather than
+        # minting our own via tempfile.mkdtemp() (its default dir is the
+        # platform tempdir, which IS /tmp on Linux when TMPDIR is unset --
+        # that used to write real dirs into /tmp on CI).
+        self.tmp = os.environ["COMMS_ROOT"]
 
     def test_init_creates_dir(self):
         d = mb.init("run1")
@@ -117,8 +121,8 @@ class TestMailbox(unittest.TestCase):
 
 class TestTopics(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="comms-test-root-")
-        os.environ["COMMS_ROOT"] = self.tmp
+        # See TestMailbox.setUp: adopt the isolated root conftest.py already set.
+        self.tmp = os.environ["COMMS_ROOT"]
 
     def test_row_carries_default_topic_when_unset(self):
         mb.init("t1")
@@ -195,8 +199,8 @@ class TestSubscriptions(unittest.TestCase):
     unicasts, never the whole board -- the 50-agent scale lever."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="comms-test-root-")
-        os.environ["COMMS_ROOT"] = self.tmp
+        # See TestMailbox.setUp: adopt the isolated root conftest.py already set.
+        self.tmp = os.environ["COMMS_ROOT"]
 
     def test_unregistered_seat_sees_whole_board(self):
         # Backward compat: no subscribe() => read_for behaves like whole-board.
@@ -322,8 +326,8 @@ class TestRunIds(unittest.TestCase):
     up front."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="comms-test-root-")
-        os.environ["COMMS_ROOT"] = self.tmp
+        # See TestMailbox.setUp: adopt the isolated root conftest.py already set.
+        self.tmp = os.environ["COMMS_ROOT"]
 
     def test_empty_root_yields_empty_list(self):
         self.assertEqual(mb.run_ids(), [])
@@ -355,7 +359,10 @@ class TestRunIds(unittest.TestCase):
         # Same footgun test_root() protects against: COMMS_ROOT set AFTER
         # module import must still be honored, because _root() reads env
         # every call rather than caching at import time.
-        second_root = tempfile.mkdtemp(prefix="comms-test-root2-")
+        # Nested inside self.tmp (itself under conftest.py's isolated
+        # tmp_path tree), not the ambient platform tempdir -- see
+        # TestMailbox.setUp for why that matters on Linux.
+        second_root = tempfile.mkdtemp(prefix="comms-test-root2-", dir=self.tmp)
         os.environ["COMMS_ROOT"] = second_root
         mb.init("only-in-second-root")
         self.assertEqual(mb.run_ids(), ["only-in-second-root"])
