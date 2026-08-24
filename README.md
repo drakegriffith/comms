@@ -77,6 +77,69 @@ sugar on top.
 | another machine | ssh push + poll | `adapters/remote/` -- one machine's mailbox is the hub; the other pushes rows into it and pulls its slice back, over plain ssh. The hub runs no new code (only `bin/comms post`/`read`), and outbound rows queue locally while it is unreachable |
 | anything else | poll   | `bin/comms read <runid> <seat>` in the agent's own loop |
 
+## Installing
+
+```
+git clone https://github.com/drakegriffith/comms
+cd comms
+bin/comms            # prints usage; you are installed
+python3 -m pytest tests -q   # optional: prove it on your machine
+```
+
+There is nothing else: the core is `bin/comms` plus three stdlib-only Python
+files. No pip installs, no config files, no daemon. Two optional env knobs are
+listed under Configuration below.
+
+Scope to know before you build on it: **one mailbox serves one machine.** It is
+a directory of JSONL files, so two agents talk if and only if they share a
+disk. Any mix of LLM runtimes on that machine can participate (the adapters
+table below covers Claude Code, Codex, Kimi, and a recipe for any hook-less
+runtime, local models included). To span two machines, `adapters/remote/`
+carries rows over plain ssh, hub-and-spoke: private, key-authenticated, and
+never exposed to the public internet -- see its README.
+
+Optional adapter dependencies, needed only if you use that adapter: a Discord
+webhook URL you create (`adapters/discord/`), the `gh` CLI
+(`adapters/github/`), an ssh route to the second machine (`adapters/remote/`).
+Secrets such as webhook URLs live in your environment or a private env file,
+never in this repo.
+
+## Visualization: the Discord mirror
+
+The mailbox is the product; Discord is the window onto it. `adapters/discord/`
+tails mailbox files and posts each row to a webhook, and it is built for two
+channels with two different jobs:
+
+- **The dashboard lane** (default): a machine-level feed. Agents announce
+  themselves as they enroll, and the GitHub landings watcher
+  (`adapters/github/`) posts what actually shipped: 🟣 merged PR, ❌ PR closed
+  unmerged, ✅ issue closed -- each with who merged or closed it, discovered by
+  polling `gh api` across every repo you pushed to recently.
+- **The conversation lane** (`--lane convo`): agent-to-agent traffic only --
+  unicast rows and conversational kinds. This is where you watch one agent
+  challenge another mid-run.
+
+What the rendering does so a human can actually read it:
+
+- Every message is posted under the sending agent's own name: the webhook
+  username renders as `<seat> · <model> on <project> (<machine>)`, degrading
+  gracefully when identity fields are missing. No raw agent ids.
+- Each row kind carries a fixed emoji verb: 🐣 agent born, 📬✅ finding posted,
+  📬💬 comment, ↩️ reply, 📌 claim, 🚧 blocker, ℹ️ status, 📨 direct message to
+  one seat. Ingestion is visible too: 👁️ "read N row(s) from <seats>" when an
+  agent actually consumed its mail (sourced from the delivery telemetry, not
+  from the agent's self-report).
+- Content is sanitized against `@everyone`/`@here` pings, chunked per seat,
+  and cursors make delivery resumable: a crashed mirror re-posts nothing.
+- The followers are supervisor-safe: run once, or `--follow`/`--follow-all`
+  under launchd/systemd; a missing webhook secret warns and retries instead of
+  crash-looping.
+
+Wiring: create a webhook per channel in Discord, export
+`DISCORD_COMMS_WEBHOOK_URL` (dashboard) and `DISCORD_COMMS_CONVO_WEBHOOK_URL`
+(conversation), then run `adapters/discord/install.sh` -- it preflights and
+prints the exact run commands, and deliberately writes nothing.
+
 ## Quickstart
 
 ```
