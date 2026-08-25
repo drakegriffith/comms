@@ -338,7 +338,13 @@ and a per-run map opens a second thread for the same file.
 
 Step 4 before step 5 is the load-bearing pair. The cursor advancing means "I
 have read these"; the held file existing means "I still owe these". Making
-held durable first is what makes advancing the cursor safe -- a crash between
+held durable first is what makes advancing the cursor safe -- and *durable*
+is meant literally: every one of the three state files (held, cursor, thread
+map) is written to a temp file, `flush`ed, `fsync`ed, and only then renamed
+into place, with a best-effort `fsync` of the directory after. Ordering two
+Python writes does not order two disk writes; without the `fsync` both files
+are still dirty page cache when `os.replace` returns, and a power cut is free
+to keep the newer cursor while losing the held file it depends on -- a crash between
 4 and 6 re-posts nothing and loses nothing, a crash between 6 and 7 duplicates
 a message, which is the same at-least-once trade every cursor in this repo
 makes. The reverse order would define a row that is read, not posted, and

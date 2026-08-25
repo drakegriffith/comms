@@ -123,16 +123,38 @@ def load_map(lane):
 
 
 def _save_map(lane, data):
-    """Atomic write: PID-suffixed tmp in the same dir, then os.replace. Raises
-    OSError to the caller, which is the ONE failure this module does not
-    swallow silently -- see thread_for."""
+    """Durable write: PID-suffixed tmp in the same dir, flush + fsync, then
+    os.replace, then a best-effort fsync of the directory.
+
+    The fsync is not ceremony (PR #51 review, Codex 3): thread_for returns an
+    id to a caller that is about to drop those rows from its held file, so
+    the mapping has to be on the platter before the rows stop being. A map
+    that loses its last entry to a power cut re-creates the thread AND the
+    rows are gone.
+
+    Raises OSError to the caller, which is the ONE failure this module does
+    not swallow silently -- see thread_for."""
     path = map_path(lane)
     tmp = path + ".tmp." + str(os.getpid())
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(tmp, "w") as fh:
             json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        try:
+            dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass  # some filesystems refuse a directory fsync; the
+                # rename has already happened, so this is best-effort
+            finally:
+                os.close(dir_fd)
     except OSError:
         try:
             os.unlink(tmp)

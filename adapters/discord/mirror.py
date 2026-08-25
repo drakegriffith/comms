@@ -627,13 +627,46 @@ def _cursor_tmp_path(runid, lane=DEFAULT_LANE):
     return _cursor_path(runid, lane) + ".tmp." + str(os.getpid())
 
 
+def _atomic_write_json(path, data, tmp):
+    """Write `data` to `path` DURABLY: temp file, flush, fsync, rename, then
+    fsync the containing directory.
+
+    ORDERING TWO PYTHON WRITES DOES NOT ORDER TWO DISK WRITES (PR #51 review,
+    Codex 3). This lane's entire crash-safety argument is "the held file is
+    durable before the cursor moves past its rows". Without the fsync, both
+    files are still dirty page cache when os.replace returns, and a power
+    loss is free to keep the newer cursor and lose the held file it depends
+    on -- which loses rows permanently, the one failure this lane refuses.
+    The rename itself is atomic either way; what the fsync buys is that the
+    BYTES are on the platter before the next file's rename can be.
+
+    The directory fsync (what makes the RENAME durable, not just the bytes)
+    is best-effort: some filesystems refuse an fsync on a directory fd, and
+    by then the rename has already happened, so refusing to fail here is the
+    difference between a weaker guarantee and no write at all.
+    """
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def _save_cursor(runid, cursor, lane=DEFAULT_LANE):
     os.makedirs(_mirror_dir(lane), exist_ok=True)
-    path = _cursor_path(runid, lane)
-    tmp = _cursor_tmp_path(runid, lane)
-    with open(tmp, "w") as fh:
-        json.dump(cursor, fh)
-    os.replace(tmp, path)
+    _atomic_write_json(
+        _cursor_path(runid, lane), cursor, _cursor_tmp_path(runid, lane)
+    )
 
 
 def collect_new(runid, lane=DEFAULT_LANE):
@@ -825,8 +858,8 @@ def _load_held(runid, lane):
 
 
 def _save_held(runid, lane, buckets):
-    """Persist the held rows, tmp + os.replace (PID-suffixed tmp), cloning
-    _save_cursor's durability. Buckets that are empty are dropped rather than
+    """Persist the held rows durably (see _atomic_write_json: fsync before
+    the rename, so the bytes beat the cursor to the platter). Buckets that are empty are dropped rather than
     written as [], so a drained thread leaves no residue.
 
     Writes NOTHING when there is nothing held and no file exists yet -- the
@@ -838,10 +871,7 @@ def _save_held(runid, lane, buckets):
     if not buckets and not os.path.exists(path):
         return
     os.makedirs(_mirror_dir(lane), exist_ok=True)
-    tmp = path + ".tmp." + str(os.getpid())
-    with open(tmp, "w") as fh:
-        json.dump(buckets, fh)
-    os.replace(tmp, path)
+    _atomic_write_json(path, buckets, path + ".tmp." + str(os.getpid()))
 
 
 def _bucket_rows(held, fresh):

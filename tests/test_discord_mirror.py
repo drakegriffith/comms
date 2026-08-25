@@ -1898,6 +1898,93 @@ def test_board_an_undeliverable_chunk_is_recorded_and_never_wedges(board):
     assert [r["text"] for r in _held()[DOC]] == ["row 1"]
 
 
+# ---- durable ordering: fsync before replace, for both state files --------
+#
+# The whole crash-safety argument is "held is durable BEFORE the cursor
+# moves". Ordering two Python writes does not order two DISK writes: after
+# os.replace returns, both files can still be dirty page cache, and a power
+# loss is free to keep the newer cursor while losing the held file it depends
+# on -- which loses rows permanently, the one failure this lane refuses.
+
+
+class _SyncSpy:
+    """Records the ORDER of os.fsync and os.replace calls, delegating to the
+    real ones so the writes still happen."""
+
+    def __init__(self, monkeypatch):
+        self.calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            self.calls.append("fsync")
+            return real_fsync(fd)
+
+        def replace(src, dst):
+            self.calls.append("replace:" + os.path.basename(dst))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "replace", replace)
+
+    def fsynced_before(self, name):
+        """True if at least one fsync happened before the replace of `name`."""
+        idx = next(
+            i for i, c in enumerate(self.calls) if c.startswith("replace:") and name in c
+        )
+        return "fsync" in self.calls[:idx]
+
+
+def test_held_file_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.fsynced_before(".held.json")
+
+
+def test_cursor_file_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.fsynced_before(".cursor.json")
+
+
+def test_the_default_lanes_cursor_is_fsynced_too(webhook, monkeypatch):
+    # Same argument, older file: the skipped log already fsyncs before the
+    # cursor moves past a row, which only helps if the cursor write itself
+    # is durable in the same sense.
+    posted = []
+    _fake_post(monkeypatch, posted)
+    spy = _SyncSpy(monkeypatch)
+    swarm_mailbox.post(RUNID, "alpha", "finding", "a row")
+    mirror.run_once(RUNID)
+    assert spy.fsynced_before(".cursor.json")
+
+
+def test_thread_map_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.fsynced_before("threads.json")
+
+
+def test_held_write_survives_a_directory_that_cannot_be_fsynced(board, monkeypatch):
+    # Some filesystems refuse an fsync on a directory fd. That must degrade
+    # to "no directory fsync", never to a lost write: the file rename has
+    # already happened by then.
+    real_fsync = os.fsync
+
+    def picky(fd):
+        if os.fstat(fd).st_mode & 0o040000:  # a directory
+            raise OSError("no fsync on directories here")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", picky)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["held row"]
+
+
 # ---- the hold cap ---------------------------------------------------------
 
 
