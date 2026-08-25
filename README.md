@@ -81,6 +81,11 @@ is per-runtime sugar on top.
 | another machine | ssh push + poll | `adapters/remote/` -- one machine's mailbox is the hub; the other pushes rows into it and pulls its slice back, over plain ssh. The hub runs no new code (only `bin/comms post`/`read`), and outbound rows queue locally while it is unreachable |
 | anything else | poll   | `bin/comms read <runid> <seat>` in the agent's own loop |
 
+Your CLI is not in that table, or the row says something you want to change?
+The categories are defined by falsifiable membership tests, not by vendor docs
+-- see `adapters/CONTRACT.md`, and "Connect your CLI" below for the four blocks
+that connect any of them.
+
 ## Installing
 
 ```
@@ -107,6 +112,101 @@ webhook URL you create (`adapters/discord/`), the `gh` CLI
 (`adapters/github/`), an ssh route to the second machine (`adapters/remote/`).
 Secrets such as webhook URLs live in your environment or a private env file,
 never in this repo.
+
+## Connect your CLI
+
+Bringing your own agent CLI -- a Grok CLI, a local model, anything -- takes
+**four copy-paste blocks, clone to enrolled seat.** Count them below: 1 clone,
+2 arm, 3 brief, 4 launch. None of it depends on your runtime having hooks. If
+your runtime turns out to have PROVEN injection, that is an upgrade you make
+afterwards, and it changes nothing you did here.
+
+**Block 1 of 4** -- clone and prove the CLI runs (the same block as Installing,
+above):
+
+```
+git clone https://github.com/drakegriffith/comms
+cd comms
+bin/comms                    # prints usage; you are installed
+```
+
+**Block 2 of 4** -- the dispatcher arms the run once, before any seat starts:
+
+```
+bin/comms arm myrun --topic proj
+```
+
+**Block 3 of 4** -- the brief. Replace `myrun`, `alpha`, `proj` and the path,
+then paste verbatim into your agent's prompt, above the actual task:
+
+```
+## Mailbox protocol (comms)
+COMMS=$HOME/code/comms/bin/comms
+
+Run this FIRST, before any other comms command:
+  $COMMS enroll myrun --agent-id alpha-mycli --topics proj --seat alpha
+
+After EVERY work step (a file edited, a test run, a conclusion reached):
+  $COMMS read myrun alpha
+Empty output = nothing new. A row on topic @alpha is a peer commenting on
+your live work: answer it BEFORE your next work step:
+  $COMMS post myrun alpha reply "<your answer>" --to <their-seat>
+
+When you land a result worth a peer's attention:
+  $COMMS post myrun alpha finding "<one-line result>" --topic proj
+If you are blocked:
+  $COMMS post myrun alpha blocker "<what and who owns it>" --topic proj
+```
+
+**Block 4 of 4** -- launch the seat, adding whatever flag your runtime needs to
+run commands without stopping for approval:
+
+```
+<your-cli> "<the brief from block 3><the task>"
+# grok, for example:
+grok --allow "Bash(*/bin/comms *)" "<the brief from block 3><the task>"
+```
+
+The seat is enrolled the moment it runs the enroll line, and `bin/comms status
+myrun` from any other shell lists it under `participants`. That is the whole
+integration: your runtime is now in the **poll** category, which is the floor
+every shell-capable runtime already meets.
+
+### Can it do better than poll?
+
+Push delivery -- rows appearing in the agent's turn without it asking -- is an
+upgrade, and it is a MEASUREMENT, never a docs claim:
+
+```
+Can your CLI run a shell command in its loop?
+  no  -> it cannot participate at all; nothing here helps.
+  yes -> it is POLL already. The four blocks above are the entire install.
+
+Does it PROVE it injects a hook's stdout back into the agent's turn?
+  Run the injection probe in adapters/CONTRACT.md. Do not read vendor docs:
+  a hook SURFACE is not push. grok loads Claude-shaped hooks, fires them,
+  and throws their stdout away.
+    probe passes                      -> PUSH. Wire the one existing heartbeat
+                                         (adapters/claude-code/swarm-heartbeat.sh)
+                                         the way adapters/codex/install.sh does.
+    probe fails, positive control OK  -> stay POLL. This is where grok landed.
+    positive control MISSING          -> COULD NOT DETERMINE. Fix the wiring
+                                         and re-run; record no category. A
+                                         probe that inspected zero subjects is
+                                         not a negative result.
+
+No injection, and the agent has no way to read the mailbox from inside its
+own turn at all?
+  -> RESUME-DRIVER: an outside loop delivers rows as resume turns
+     (adapters/kimi/). Only if it also cannot poll -- a runtime that can run
+     a shell command should stay poll and skip the second process.
+```
+
+To contribute the adapter back, copy the template for your category
+(`adapters/pi/` for poll, `adapters/kimi/` for resume-driver, `adapters/codex/`
+for push), record the version and date of what you measured, and add one row to
+the table above. Nothing in `bin/` or `lib/` learns your runtime's name -- that
+rule is the contract's, and `adapters/CONTRACT.md` states the rest of it.
 
 ## Visualization: the Discord mirror
 
@@ -195,6 +295,7 @@ bin/comms                    dispatcher CLI (routes to lib/, preserves exit code
 lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
 lib/swarm_claims.py          run-scoped write-set claims arbiter
+adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
 adapters/kimi/               resume-driver for a runtime with no hook surface
