@@ -47,8 +47,13 @@ an unlisted kind is a loud error, never a silent default.
   different files and cannot race; a transport that lies about delivery cannot
   lose anything, because there is no transport.
 - Topic subscriptions. Every row carries a topic; a seat subscribes to a topic
-  SET and reads only its slice plus its own unicast channel `@<seat>`. This is
-  what keeps per-reader context bounded as the swarm grows.
+  SET and reads only its slice, plus its own unicast channel `@<seat>`, plus
+  any row whose `thread` key it subscribes to. Topic answers "who receives
+  this"; thread answers "what document is this about", so editing a file
+  subscribes you to `doc:<repo>/<relpath>` and sibling rows about that file
+  start arriving with no topic name agreed in advance. Delivery on a new doc
+  subscription is FORWARD-ONLY (issue #57). This is what keeps per-reader
+  context bounded as the swarm grows.
 - Run-scoped arming. A run is armed per-participant: an armed run with an empty
   roster reaches nobody, and bystander agents on the same machine stay silent
   by default. Enrollment is self-service, keyed on a command that names the

@@ -88,7 +88,30 @@
 #       row) and appends no telemetry line, so the log records enrolments, not
 #       keystrokes.
 #   It runs BEFORE the per-run row pass, so a key learned on this beat filters
-#   this beat's rows.
+#   this beat's rows -- and a run whose subscription grew this beat BYPASSES
+#   the mtime short-circuit below, for this beat only. That short-circuit asks
+#   "did the mailbox change", but the subscription is the other half of the
+#   same query: a new doc key can make an ALREADY-PRESENT row match, and
+#   skipping the scan would defer the first delivery on that subscription
+#   until some unrelated seat happened to post.
+#
+#   DELIVERY IS FORWARD-ONLY (v1 ruling; replay design is issue #57). A row
+#   about the doc that is ALREADY BEHIND this seat's cursor is not replayed
+#   after the subscription grows. The rescan above genuinely inspects it -- it
+#   now matches the filter -- and the cursor test then drops it, deliberately.
+#   The cursor is ONE position over the whole board, not one per topic, so
+#   rewinding it to reach a newly-interesting row would re-deliver every other
+#   row past that point as well. The cost, named: a doc discussed for an hour
+#   before you opened it shows you only what is said from now on; `comms read
+#   <runid> <seat> --replay` is the manual way to see the rest.
+#
+#   TWO TELEMETRY LINES ON AN ENROL BEAT is expected and accepted: one
+#   "doc-enrol <key>" line from this leg (rows_inspected 0, delta_emitted 0)
+#   and one ordinary scan line from process_run. They answer different
+#   questions -- what did this agent subscribe to, and what did it receive --
+#   and merging them would make an enrolment invisible on a beat that
+#   delivered nothing. Readers keyed on delta_emitted > 0 (the Discord ingest
+#   mirror) ignore the enrol line by construction.
 #
 #   Env vars do NOT work as a knob: a hook's environment is fixed at host
 #   launch, so a swarm dispatched INSIDE a live session could never set one.
