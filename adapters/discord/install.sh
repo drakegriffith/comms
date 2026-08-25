@@ -7,6 +7,12 @@
 #   * python3 present
 #   * mirror.py present beside this script
 #   * DISCORD_COMMS_WEBHOOK_URL configured (env, or a line in the secrets file)
+#   * DISCORD_COMMS_FORUM_WEBHOOK_URL configured -- INFORMATIONAL ONLY, does
+#     not block install. mirror.py resolves this var (find_forum_webhook_url)
+#     but nothing posts to it yet: it is not a lane, there is no --lane forum,
+#     and slice 2 owns the posting path (thread_name / ?thread_id=). Gating
+#     install on it would fail every existing install that has not yet done
+#     the forum channel/webhook human step.
 #
 # Exit: 0 ready | 2 secret missing (prints the exact drop-in) | 1 broken.
 
@@ -36,6 +42,21 @@ install: webhook secret not configured. Drop-in (3 steps):
 Then re-run this script.
 EOF
   exit 2
+fi
+
+# Existence check ONLY, and non-blocking: the forum board webhook is
+# optional in this slice (see header comment). Only affects the status
+# line printed below.
+have_forum_secret=0
+if [ -n "${DISCORD_COMMS_FORUM_WEBHOOK_URL:-}" ]; then
+  have_forum_secret=1
+elif [ -f "$SECRETS" ] && [ "$(grep -c '^DISCORD_COMMS_FORUM_WEBHOOK_URL=' "$SECRETS")" -ge 1 ]; then
+  have_forum_secret=1
+fi
+if [ "$have_forum_secret" -eq 1 ]; then
+  forum_status="configured"
+else
+  forum_status="not yet configured (optional -- slice 2 will need it to post forum threads)"
 fi
 
 cat <<EOF
@@ -97,4 +118,11 @@ with a plain --follow-all job):
 Env knobs: COMMS_MACHINE_LABEL (prefix; default hostname -s),
 COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped state),
 COMMS_SECRETS_FILE (default ~/.secrets/comms.env), COMMS_MIRROR_INTERVAL.
+
+Forum board webhook (DISCORD_COMMS_FORUM_WEBHOOK_URL): $forum_status.
+This is resolution only -- nothing in this build posts to it yet (see
+README.md, Forum board webhook). To set it up ahead of slice 2:
+  1. open -e ~/.secrets/comms.env
+  2. add line: DISCORD_COMMS_FORUM_WEBHOOK_URL=<paste webhook URL from the forum channel's webhook settings>
+  3. chmod 600 ~/.secrets/comms.env
 EOF

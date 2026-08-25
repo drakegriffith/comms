@@ -35,6 +35,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("COMMS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("COMMS_SECRETS_FILE", str(tmp_path / "comms.env"))
     monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     yield tmp_path
 
@@ -500,6 +501,64 @@ def test_state_writes_stay_in_tmp(webhook, tmp_path):
     cursor = mirror._cursor_path(RUNID)
     assert cursor.startswith(str(tmp_path))
     assert os.path.isfile(cursor)
+
+
+# ---- forum board webhook: resolution only, NOT a posting lane -------------
+#
+# Slice 1 (issue #38) resolves DISCORD_COMMS_FORUM_WEBHOOK_URL through the
+# same env-or-secrets-file path as the lane vars above. It is deliberately
+# NOT wired into LANE_SECRET_VARS / LANE_STATE_DIRS / --lane: forum posts
+# need thread_name / ?thread_id=, which slice 2 owns. These tests pin both
+# halves of that contract -- resolution works, lane-folding did not happen.
+
+
+def test_forum_secret_var_name():
+    assert mirror.FORUM_SECRET_VAR == "DISCORD_COMMS_FORUM_WEBHOOK_URL"
+
+
+def test_forum_webhook_resolved_from_env(monkeypatch):
+    monkeypatch.setenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", "http://example.invalid/forum")
+    assert mirror.find_forum_webhook_url() == "http://example.invalid/forum"
+
+
+def test_forum_webhook_resolved_from_secrets_file(tmp_path):
+    (tmp_path / "comms.env").write_text(
+        "DISCORD_COMMS_FORUM_WEBHOOK_URL=http://example.invalid/forum-from-file\n"
+    )
+    assert mirror.find_forum_webhook_url() == "http://example.invalid/forum-from-file"
+
+
+def test_forum_webhook_missing_returns_none_quietly(capsys):
+    assert mirror.find_forum_webhook_url() is None
+    err = capsys.readouterr().err
+    assert err == ""  # no side effects -- same contract as _find_webhook_url
+
+
+def test_forum_webhook_missing_exits_2_naming_drop_in(capsys):
+    with pytest.raises(SystemExit) as exc:
+        mirror.resolve_forum_webhook_url()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "DISCORD_COMMS_FORUM_WEBHOOK_URL=" in err
+    assert "~/.secrets/comms.env" in err
+    assert "http" not in err  # never echoes any URL value
+
+
+def test_forum_board_secret_not_folded_into_lane_secret_vars():
+    assert "forum" not in mirror.LANE_SECRET_VARS
+    assert mirror.FORUM_SECRET_VAR not in mirror.LANE_SECRET_VARS.values()
+
+
+def test_forum_board_secret_not_folded_into_lane_state_dirs():
+    assert "forum" not in mirror.LANE_STATE_DIRS
+
+
+def test_cli_lane_forum_is_rejected_not_a_posting_lane(capsys):
+    # --lane forum must NOT work: forum is a resolved secret, not a lane.
+    assert mirror.main(["mirror.py", "--once", RUNID, "--lane", "forum"]) == 2
+    err = capsys.readouterr().err
+    assert "--lane must be one of" in err
+    assert "forum" not in err
 
 
 # ---- CLI ------------------------------------------------------------------
