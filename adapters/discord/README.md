@@ -151,6 +151,39 @@ one failure mode; it does not make concurrent pollers on one (run, lane)
 safe.) One lane's `all` job and another's `convo` job on the SAME runid are
 fine -- they are different (run, lane) pairs with separate state dirs.
 
+## Forum board webhook (resolution only, not a lane yet)
+
+`DISCORD_COMMS_FORUM_WEBHOOK_URL` resolves through the exact same
+env-or-secrets-file path as the two webhook vars above
+(`mirror.find_forum_webhook_url()` / `mirror.resolve_forum_webhook_url()`),
+but it is deliberately **not** a third lane: it is absent from
+`LANE_SECRET_VARS` and `LANE_STATE_DIRS`, so it has no cursor, no state dir,
+and `--lane forum` is rejected by the CLI the same way any unknown lane name
+is. Nothing in this codebase posts to it yet.
+
+Why not fold it in as a lane: the two existing lanes post to a normal text
+channel with a bare `{"content": ..., "username": ...}` payload. A forum
+channel requires `thread_name` on the first post (or `?thread_id=` on a
+reply into an existing thread) -- a different POST shape, not just a
+different webhook URL. Building that posting lane is slice 2's job. Adding
+`forum` to `LANE_SECRET_VARS` now would stand up a `--lane forum` that
+resolves a URL and then posts the wrong payload shape to it.
+
+Setup (same three steps as the other vars, once the forum channel and its
+webhook exist -- creating both is a human, Discord-UI step, not scripted
+here): add `DISCORD_COMMS_FORUM_WEBHOOK_URL=<url>` to
+`~/.secrets/comms.env` (or export it), `chmod 600` the file.
+`adapters/discord/install.sh` reports whether it is configured (existence
+only, never the value) but does not block install on it -- see
+install.sh's own header comment.
+
+**Live check is a manual step, not code**: this slice's tests only prove
+resolution (env var, then secrets file, then the exact drop-in message on
+`resolve_forum_webhook_url()` when absent) with a fake local HTTP server,
+the same as the other webhook vars. Whether posting `thread_name` to this
+URL actually creates a Discord forum post is verified by hand once the
+webhook exists and slice 2 lands the posting code.
+
 ## Env knobs
 
 | Var | Default | Meaning |

@@ -119,6 +119,16 @@ MAX_RETRIES = 3  # additional attempts after the first
 SECRET_VAR = "DISCORD_COMMS_WEBHOOK_URL"
 DEFAULT_LANE = "all"
 
+# The forum board's webhook var. Resolved through the SAME env-or-secrets
+# path as the lane vars below (see _find_webhook_url_for_var), but
+# deliberately NOT a lane: it is absent from LANE_SECRET_VARS and
+# LANE_STATE_DIRS, so it has no cursor/state dir and --lane forum is
+# rejected by the CLI's LANE_SECRET_VARS membership check. Forum posts
+# need thread_name / ?thread_id=, which slice 2 (issue #39/#40) owns --
+# folding this into LANE_SECRET_VARS now would stand up a posting lane
+# for a channel this slice cannot post to yet.
+FORUM_SECRET_VAR = "DISCORD_COMMS_FORUM_WEBHOOK_URL"
+
 # Lane name -> secret var. The default lane keeps the pre-lane var so an
 # un-flagged invocation is byte-identical to before this feature existed.
 LANE_SECRET_VARS = {
@@ -175,15 +185,13 @@ def _is_convo_row(row):
     return topic.startswith("@") or row.get("kind") in swarm_mailbox.CONVO_KINDS
 
 
-def _find_webhook_url(lane=DEFAULT_LANE):
-    """Resolve this lane's webhook URL with NO side effects (no stderr, no
-    exit): returns the URL or None. Env var first, else parsed from the
-    secrets file. Factored out of resolve_webhook_url so a caller that must
-    not exit or print on every poll -- the follow loops' launchd-safety
-    check, see module docstring LAUNCHD SAFETY -- can test for presence
-    quietly instead of triggering the multi-line drop-in message once per
-    poll."""
-    var = LANE_SECRET_VARS[lane]
+def _find_webhook_url_for_var(var):
+    """Resolve VAR's webhook URL with NO side effects (no stderr, no exit):
+    returns the URL or None. Env var first, else parsed from the secrets
+    file. This is the one env-or-secrets-file resolution path in this
+    module -- _find_webhook_url (lane-keyed) and find_forum_webhook_url
+    (the forum board's non-lane var) both delegate here, so a NEW webhook
+    var resolves the same way as the lane vars without needing a lane."""
     url = os.environ.get(var)
     if url:
         return url
@@ -203,13 +211,12 @@ def _find_webhook_url(lane=DEFAULT_LANE):
     return None
 
 
-def resolve_webhook_url(lane=DEFAULT_LANE):
-    """Env var first, else parse the secrets file. Exits 2 with the exact
-    drop-in line for THIS lane's var when absent. Never prints the value."""
-    url = _find_webhook_url(lane)
+def _resolve_webhook_url_for_var(var):
+    """Same as _find_webhook_url_for_var but exits 2 with the exact drop-in
+    line for VAR when absent. Never prints the value."""
+    url = _find_webhook_url_for_var(var)
     if url:
         return url
-    var = LANE_SECRET_VARS[lane]
     sys.stderr.write(
         "discord mirror: no webhook configured.\n"
         "  1. open -e ~/.secrets/comms.env\n"
@@ -218,6 +225,39 @@ def resolve_webhook_url(lane=DEFAULT_LANE):
         "  3. chmod 600 ~/.secrets/comms.env\n" % var
     )
     sys.exit(2)
+
+
+def _find_webhook_url(lane=DEFAULT_LANE):
+    """Resolve this lane's webhook URL with NO side effects (no stderr, no
+    exit): returns the URL or None. Factored out of resolve_webhook_url so
+    a caller that must not exit or print on every poll -- the follow loops'
+    launchd-safety check, see module docstring LAUNCHD SAFETY -- can test
+    for presence quietly instead of triggering the multi-line drop-in
+    message once per poll."""
+    return _find_webhook_url_for_var(LANE_SECRET_VARS[lane])
+
+
+def resolve_webhook_url(lane=DEFAULT_LANE):
+    """Env var first, else parse the secrets file. Exits 2 with the exact
+    drop-in line for THIS lane's var when absent. Never prints the value."""
+    return _resolve_webhook_url_for_var(LANE_SECRET_VARS[lane])
+
+
+def find_forum_webhook_url():
+    """Resolve the forum board's webhook URL, same env-or-secrets-file path
+    as the lane vars, with no side effects. NOT a lane: there is no
+    LANE_SECRET_VARS/LANE_STATE_DIRS entry for "forum" and no --lane forum,
+    because posting to it needs thread_name / ?thread_id=, which slice 2
+    owns. This function only resolves the URL; nothing in this module posts
+    to it yet."""
+    return _find_webhook_url_for_var(FORUM_SECRET_VAR)
+
+
+def resolve_forum_webhook_url():
+    """Same as find_forum_webhook_url but exits 2 with the drop-in message
+    when absent, mirroring resolve_webhook_url's contract. Still not a
+    lane -- no CLI path calls this in this slice."""
+    return _resolve_webhook_url_for_var(FORUM_SECRET_VAR)
 
 
 # machine_label lives in lib/comms_machine.py and is RE-EXPORTED here, not
