@@ -144,6 +144,19 @@ def _cursor(pulls_ts="2000-01-01T00:00:00Z", pulls_seen=None,
     }
 
 
+def _freeze(monkeypatch, iso):
+    """Pin landings._utcnow() -- THE ONE clock seam the module routes every
+    now()/today lookup through (_today_utc_start, discover_repos' window
+    cutoff) -- to a fixed instant, so a test's "today" no longer depends on
+    the real wall clock (see #22: any test that leans on first-sight cursor
+    seeding at start-of-today-UTC while hard-coding event timestamps on a
+    specific calendar day goes red for hours every day the moment the real
+    UTC date rolls past that day). Production code is untouched -- only the
+    test's own monkeypatch replaces the seam for the duration of the test."""
+    frozen = landings._parse_iso(iso)
+    monkeypatch.setattr(landings, "_utcnow", lambda: frozen)
+
+
 # ---- classification: merged / closed-unmerged / closed-issue ---------------
 
 
@@ -334,6 +347,8 @@ def test_pr_merged_and_issue_closed_same_second_across_three_passes(fake_gh, pos
     on the next pass, still posts (no longer shadowed by a shared
     high-water mark); a third pass -- nothing changed -- posts nothing."""
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    _freeze(monkeypatch, "2026-08-24T20:00:00Z")  # same day as `t` below, so
+    # first-sight cursor seeding (start-of-today-UTC) lands before it.
     t = "2026-08-24T18:39:21Z"
 
     # Pass 1: only the merged PR is visible.
@@ -440,6 +455,8 @@ def test_collect_new_isolates_one_repo_failure_the_healthy_repo_advances_the_fai
     fake_gh, monkeypatch, capsys
 ):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets,acme/gizmos")
+    _freeze(monkeypatch, "2026-08-24T12:00:00Z")  # same day as the merged_at
+    # below, so widgets' first-sight cursor seed lands before it.
     # Seed a pre-existing cursor for gizmos, as if an earlier pass had
     # already succeeded there -- so "unchanged" is a real, checkable claim,
     # not just "the key happens to be absent".
@@ -469,6 +486,7 @@ def test_collect_new_isolates_one_repo_failure_the_healthy_repo_advances_the_fai
 
 def test_run_once_survives_one_repo_exception_and_delivers_the_rest(fake_gh, posted, monkeypatch):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets,acme/gizmos")
+    _freeze(monkeypatch, "2026-08-24T12:00:00Z")  # same day as merged_at below
     fake_gh.add(["api", PULLS_URL], [_pr(1, "Good one", "a", merged_at="2026-08-24T10:00:00Z")])
     fake_gh.add(["api", ISSUES_URL], [])
     fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
@@ -569,6 +587,7 @@ def test_discover_repos_window_hours_env_override(fake_gh, monkeypatch):
 
 def test_run_once_uses_landings_author_with_machine_label(fake_gh, posted, monkeypatch):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    _freeze(monkeypatch, "2026-08-24T12:00:00Z")  # same day as merged_at below
     fake_gh.add(["api", PULLS_URL], [
         _pr(1, "One", "a", merged_at="2026-08-24T10:00:00Z"),
     ])
@@ -600,6 +619,8 @@ def test_log_skipped_counts_individual_events_not_the_joined_chunk(fake_gh, monk
     # so a chunk of 4 events logged "SKIPPED 1 event(s)". It must now log the
     # real count -- same shape as mirror.py's _log_skipped(runid, rows, ...).
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    _freeze(monkeypatch, "2026-08-24T12:00:00Z")  # same day as merged/closed
+    # timestamps below, so first-sight cursor seeding lands before them.
 
     def failing_post(url, content, username=None):
         return False
@@ -697,6 +718,7 @@ def test_main_interval_bad_value_returns_2(capsys):
 
 def test_cursor_file_lives_under_state_dir_github_landings(fake_gh, posted, monkeypatch):
     monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    _freeze(monkeypatch, "2026-08-24T12:00:00Z")  # same day as merged_at below
     fake_gh.add(["api", PULLS_URL], [
         _pr(1, "One", "a", merged_at="2026-08-24T10:00:00Z"),
     ])
@@ -714,3 +736,38 @@ def test_cursor_file_lives_under_state_dir_github_landings(fake_gh, posted, monk
 def test_cursor_tmp_path_includes_pid():
     tmp = landings._cursor_tmp_path()
     assert tmp == landings._cursor_path() + ".tmp." + str(os.getpid())
+
+
+# ---- regression: #22, the exact UTC-midnight-vs-local-date geometry --------
+
+
+def test_first_sight_seeds_from_utc_date_even_when_local_date_is_a_day_earlier(
+    fake_gh, posted, monkeypatch
+):
+    """#22: the suite went red for hours every day, west of UTC, because six
+    tests hard-coded event timestamps on one calendar day while leaning on
+    first-sight cursor seeding at start-of-today-UTC -- and "today" drifted
+    out from under them whenever the real run happened to straddle UTC
+    midnight. This test locks in the underlying rule those six depend on:
+    first sight must seed from _utcnow()'s (UTC) calendar date, never a
+    local one, using the EXACT failure geometry -- frozen clock at
+    00:30 UTC, a moment where a machine west of UTC (e.g. America/New_York,
+    UTC-4 in August) has its own local wall clock still reading the
+    PREVIOUS day. A PR merged 15 minutes into the new UTC day must still be
+    "today" and post -- proving the seam is UTC-only, not
+    datetime.now()-without-a-timezone in disguise."""
+    monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    _freeze(monkeypatch, "2026-08-25T00:30:00Z")  # UTC just past midnight;
+    # local (America/New_York, UTC-4 in August) is still 2026-08-24 ~20:30.
+    assert landings._today_utc_start() == "2026-08-25T00:00:00Z"  # UTC date,
+    # not the local one (which would wrongly be "2026-08-24T00:00:00Z").
+
+    fake_gh.add(["api", PULLS_URL], [
+        _pr(1, "Just landed", "a", merged_at="2026-08-25T00:15:00Z"),
+    ])
+    fake_gh.add(["api", ISSUES_URL], [])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
+
+    assert landings.run_once() == 0
+    assert len(posted) == 1
+    assert "Just landed" in posted[0][1]
