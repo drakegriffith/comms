@@ -168,6 +168,21 @@ check "post short form with no COMMS_SEAT and no session id fails loud" 1 "$rc" 
 out="$("$COMMS" post "$RUN" alpha reply "explicit form unaffected" --topic t0 2>&1)"; rc=$?
 check "post explicit 4-positional form still works unchanged" 0 "$rc" "$out" "explicit form unaffected"
 
+# ---- threads metric routing (swarm_threads.py; issue #43) ------------------
+# One smoke check: a FRESH, empty COMMS_ROOT (not the shared one above, which
+# already has a --thread row from the post-short-form block) has zero
+# threaded rows anywhere, which is the metric's own positive control (a
+# metric that inspected nothing is never a quiet, healthy exit 0) -- the
+# fixture-driven cases (alive/seats/--run/--json) already live in
+# tests/test_swarm_threads.py, so this only proves the WRAPPER reaches that
+# module and preserves its exit code, not the predicate's own logic (same
+# division of labor as every other case here).
+EMPTY_ROOT="$(mktemp -d)"
+out="$(COMMS_ROOT="$EMPTY_ROOT" "$COMMS" threads 2>&1)"; rc=$?
+check "threads on an empty mailbox preserves the positive control, exit 2" \
+  2 "$rc" "$out" "inspected nothing"
+rm -rf "$EMPTY_ROOT"
+
 # ---- claims routing BEFORE arming (the not-armed edge) ---------------------
 out="$("$COMMS" claim "$RUN" alpha /tmp/x 2>&1)"; rc=$?
 check "claim on unarmed run preserves claims exit 3" 3 "$rc" "$out" "not-armed"
