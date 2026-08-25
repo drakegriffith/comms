@@ -284,7 +284,146 @@ def post(runid, seat, kind, text, topic=None, to=None):
     return row
 
 
-def _all_sibling_rows(runid, seat):
+# ---- SOURCE-FILE IDENTITY --------------------------------------------------
+#
+# WHY A ROW NEEDS TO REMEMBER WHICH FILE IT CAME OUT OF:
+#   read_siblings merges every seat file in a run into one `at`-sorted stream,
+#   which erases the one fact two live bugs turned on. After adapters/remote
+#   landed, ONE seat string can own rows in TWO files on a machine -- its
+#   first-class `<seat>.jsonl` and the pull mirror `remote~<hub>.jsonl` -- and
+#   then (a) a per-SEAT count cursor is not stable, because a newly pulled row
+#   with an older `at` shifts that seat's merged index sequence and pushes an
+#   already-delivered row back under the cursor (issue #23), and (b) a reader
+#   cannot tell a row it must deliver from a COPY of a row the hub's own
+#   reader already delivered (issue #20). Direction is the discriminator, and
+#   direction lives in the filename, not in the row.
+#
+# NON-PERSISTED AND OPT-IN: the annotation is a READ-TIME fact about this
+#   machine's disk, not part of the row a peer authored. append_mirrored
+#   writes rows VERBATIM to another machine's mirror file and the CLI prints
+#   them as JSON to an agent, so an always-on annotation would leak a local
+#   detail into both. Callers that key a cursor ask for it (with_source=True);
+#   everyone else sees byte-identical rows to before.
+SOURCE_KEY = "_src"
+
+# Separates the seat from its source tag in a cursor key. It has to be "/":
+# that is the ONE character neither half can contain -- _valid_seat rejects it
+# in a seat name, and no filename holds it -- while "@" and "#" are both legal
+# in a seat name and in a machine label (so `beta~studio#2` is a nameable seat
+# whose mirror file is `remote~studio#2.jsonl`). A separator either half can
+# contain makes a key ambiguous, and an ambiguous key is a miscounted cursor.
+# A legacy cursor's keys are bare seat names, so a key containing "/" is
+# unambiguously a post-#39 one (see fresh_rows_by_seat's migration).
+CURSOR_KEY_SEP = "/"
+
+# The pull-mirror file's name shape, as adapters/remote/sync.py spells it
+# (MIRROR_PREFIX + QUALIFIER + <hub label>). RECOGNIZED here, NAMED there --
+# tests/test_swarm_mailbox.py asserts the two agree, because two spellings of
+# one convention is exactly how #20 comes back.
+MIRROR_FILE_PREFIX = "remote~"
+
+
+def source_tag(fh, name):
+    """This open file's identity: "<name>#<inode>", or "<name>" if unstattable.
+
+    IDENTITY, NOT NAME, and the difference is a silent drop: a purged and
+    re-created `<seat>.jsonl` reuses the filename while restarting its row
+    numbering at zero, so a name-keyed count cursor would carry the old count
+    forward and skip the new file's first rows forever. A new inode reads as a
+    new source, whose count starts at zero -- the new rows post again instead
+    of vanishing. That direction is the mailbox's standing rule: a visible
+    duplicate beats an invisible loss.
+
+    Stats the OPEN FILE (not the path) so the tag names the bytes actually
+    read, even if the name is replaced mid-pass.
+    """
+    try:
+        return "%s#%d" % (name, os.fstat(fh.fileno()).st_ino)
+    except OSError:
+        return name
+
+
+def source_of(row):
+    """The source tag a with_source read stamped on this row, or None."""
+    return row.get(SOURCE_KEY)
+
+
+def source_name(src):
+    """The FILE NAME inside a source tag: "alpha.jsonl#8912345" ->
+    "alpha.jsonl", and a tag that never got an inode (source_tag degrades to
+    the bare name when fstat fails) -> itself.
+
+    Split from the right and checked, not `split("#")[0]`: "#" is legal in a
+    seat name and in a machine label, so `remote~studio#2.jsonl` is a
+    nameable file and cutting at the FIRST "#" would hand back
+    "remote~studio" -- a name that fails the .jsonl test and takes a pulled
+    row's rows back into the post path (#20, all over again).
+    """
+    head, sep, tail = src.rpartition("#")
+    if sep and tail.isdigit() and head.endswith(".jsonl"):
+        return head
+    return src
+
+
+def without_source(row):
+    """A copy of `row` as its author wrote it, with any read-time source tag
+    removed. Use before persisting or forwarding a row that came from a
+    with_source read (the skipped-rows log, any re-export)."""
+    return {k: v for k, v in row.items() if k != SOURCE_KEY}
+
+
+def is_mirror_source(row):
+    """True if this row was READ OUT OF a pull-mirror file (`remote~<hub>.jsonl`),
+    i.e. it is a copy of some other machine's row whose original that machine's
+    own readers already handled.
+
+    The test is the SOURCE FILE, never the seat string: a pushed row lands on
+    the hub as a first-class `alpha~macbook.jsonl` and the hub is its only
+    mirror, so "skip any seat containing ~" would silence exactly the rows
+    that most need posting. An untagged row (a read without with_source, or a
+    row from a non-file source like adapters/remote's subprocess) reads as
+    False -- not-known is never treated as not-deliverable.
+
+    The `~<label>` suffix is REQUIRED, and the label must be non-empty: a
+    plain `remote.jsonl` is a first-class seat file that some agent could
+    legitimately own (adapters/remote reserves the name in prose, _valid_seat
+    does not enforce it), and matching it here would silently drop that
+    seat's every row. Erring toward "not a mirror" costs a duplicate at
+    worst; erring the other way loses rows.
+    """
+    src = source_of(row)
+    if not src:
+        return False
+    name = source_name(src)
+    if not name.endswith(".jsonl"):
+        return False
+    stem = name[: -len(".jsonl")]
+    return stem.startswith(MIRROR_FILE_PREFIX) and len(stem) > len(MIRROR_FILE_PREFIX)
+
+
+def cursor_key(row):
+    """The identity a count cursor must key on: "<seat>/<source tag>" for a
+    tagged row, the bare seat for an untagged one. The separator is "/" for
+    the reason CURSOR_KEY_SEP gives: it is the one character neither a seat
+    name nor a filename can contain, so the key is never ambiguous.
+
+    The seat stays in the key even though the file is already there, because
+    ONE file can carry MANY seats: `remote~<hub>.jsonl` holds every seat the
+    hub exported. Counting per (seat, file) is what makes a count stable --
+    within one file, one seat's rows are appended in `at` order by a single
+    writer, so sorting the merged stream by `at` reproduces that file's order
+    for that seat exactly.
+
+    The bare-seat fallback is load-bearing back-compat: adapters/remote/sync.py
+    counts rows read off a subprocess's stdout, where no source file exists,
+    and its cursor keeps the pre-#39 flat {seat: count} shape.
+    """
+    seat = row.get("seat", "?")
+    src = source_of(row)
+    return seat if not src else seat + CURSOR_KEY_SEP + src
+
+
+def _all_sibling_rows(runid, seat, with_source=False):
     """Parse every OTHER seat's .jsonl into a flat, UNFILTERED, UNSORTED list.
 
     The one parser shared by read_siblings (topic filter) and read_for
@@ -292,6 +431,10 @@ def _all_sibling_rows(runid, seat):
     the caller's own rows -- a seat reads siblings, not itself. Malformed lines (a
     partially-flushed final line from a concurrent writer) are skipped rather than
     crashing the reader.
+
+    with_source=True stamps each row with SOURCE_KEY, the identity of the file
+    it was parsed out of (see source_tag). Off by default: the rows are handed
+    to agents and to other machines verbatim.
     """
     d = _dir(runid)
     if not os.path.isdir(d):
@@ -303,33 +446,43 @@ def _all_sibling_rows(runid, seat):
             continue
         try:
             with open(os.path.join(d, name)) as fh:
+                tag = source_tag(fh, name) if with_source else None
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        rows.append(json.loads(line))
+                        row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if tag is not None and isinstance(row, dict):
+                        row[SOURCE_KEY] = tag
+                    rows.append(row)
         except OSError:
             continue
     return rows
 
 
-def read_siblings(runid, seat, topic=None):
+def read_siblings(runid, seat, topic=None, with_source=False):
     """Return sibling rows sorted by `at`. When `topic` is given, return only rows
     in that topic (a row with no topic key counts as "default", so old rows filter
     coherently); when None, return every topic. Unchanged from the pre-
     subscription API -- read_for is the subscription-honoring reader.
+
+    with_source=True additionally stamps each row with the identity of the file
+    it came from (SOURCE_KEY / source_of) -- what a caller keeping a count
+    cursor over the merged stream needs, and what tells a pulled copy from a
+    first-class row. Default off, so every existing caller's rows are
+    byte-identical to what their author wrote.
     """
-    rows = _all_sibling_rows(runid, seat)
+    rows = _all_sibling_rows(runid, seat, with_source=with_source)
     if topic is not None:
         rows = [r for r in rows if (r.get("topic") or "default") == topic]
     rows.sort(key=lambda r: r.get("at", ""))
     return rows
 
 
-def read_for(runid, seat):
+def read_for(runid, seat, with_source=False):
     """Subscription-honoring read: return only the sibling rows this seat is
     subscribed to (its topic slice) plus any unicast rows addressed to it,
     sorted by `at`.
@@ -339,9 +492,12 @@ def read_for(runid, seat):
     EVERY sibling row -- identical to read_siblings(topic=None), so an un-enrolled
     seat keeps the old behavior. A seat's own unicast topic "@<seat>" is always in
     its subscription set, so a direct message always lands.
+
+    with_source=True stamps each row with its source file's identity, exactly
+    as in read_siblings -- the same opt-in, for the same cursor-keying reason.
     """
     subs = subscriptions(runid, seat)  # None if unregistered; else includes @self
-    rows = _all_sibling_rows(runid, seat)
+    rows = _all_sibling_rows(runid, seat, with_source=with_source)
     if subs is not None:
         rows = [r for r in rows if (r.get("topic") or "default") in subs]
     rows.sort(key=lambda r: r.get("at", ""))
@@ -423,38 +579,97 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
     preserves each seat's own file order inside the merged stream, so counting
     per seat over the merged stream reconstructs each file's position exactly.
 
+    WHY THE KEY IS (SEAT, SOURCE FILE) AND NOT THE SEAT (issue #23): the
+    sentence above holds only while a seat's rows live in ONE file. After
+    adapters/remote landed they can live in two on one machine -- the seat's
+    own file and the pull mirror `remote~<hub>.jsonl` -- and a pulled row with
+    an OLDER `at` inserts INTO the middle of that seat's merged sequence,
+    shifting every later index down one and pushing an already-delivered row
+    back under the cursor, where it posts a second time. Counting per
+    (seat, file) removes the coupling: what lands in one file cannot move
+    another file's indices. A row carrying no source tag (see cursor_key) keys
+    on the bare seat exactly as before, which is what keeps
+    adapters/remote/sync.py -- counting rows read off a subprocess's stdout,
+    where no file exists -- byte-identical.
+
     Lives here rather than in adapters/discord/mirror.py (where it was written)
     because a SECOND adapter now needs the identical arithmetic over a different
     source -- adapters/remote/sync.py, over another machine's rows, arriving as
     a subprocess's stdout instead of a local read. Two copies of a cursor rule
     are two things to keep in step; this is one.
 
-    behavior: walks rows in order tracking a per-seat index; a row at index >=
-      cursor[seat] is fresh. THE CURSOR ADVANCES OVER EVERY ROW, including rows
-      `keep` rejects -- a filtered row is seen, just not returned, and a cursor
-      that skipped it would re-scan it on every pass forever.
-    in: rows, a list of row dicts; cursor, a {seat: count} dict (a missing seat
-      reads as 0); keep, an optional predicate selecting which FRESH rows to
-      return.
+    BACK-COMPAT / MIGRATION IN PLACE: a cursor written before the key changed
+    holds bare seat names, and one of those counts means exactly "the first N
+    rows of this seat, IN MERGED ORDER, are already seen". So a bare count is
+    spent as a per-seat budget over that seat's tagged rows in the order this
+    pass walks them -- the same reading the old code would have made on this
+    same pass -- and the bare key is then retired from the returned cursor.
+    Migration therefore neither re-posts nor skips: it is the old answer,
+    re-expressed per file, once. The alternative considered and rejected was
+    assigning the whole legacy count to the seat's first-class file, which
+    would skip as many of that file's undelivered rows as the seat had
+    mirror-file rows -- a silent drop, the one failure this mailbox refuses.
+
+    ONE MIGRATION CASE IS DELIBERATELY NOT BEHAVIOR-PRESERVING: a legacy count
+    LARGER than the rows now visible for that seat (its file was truncated,
+    replaced, or restored from a shorter copy). The budget is spent down to
+    what is there, the legacy key is retired, and rows appended later POST --
+    where the old code would have kept treating them as already counted. That
+    is the #23 fix doing its job rather than a regression: the surplus count
+    was earned by rows that no longer exist, and banking it would skip live
+    rows to honor dead ones. Same trade as source_tag's inode, in the same
+    direction: a visible duplicate beats an invisible loss.
+
+    behavior: walks rows in order tracking a per-(seat, source) index; a row at
+      index >= cursor[key] is fresh. THE CURSOR ADVANCES OVER EVERY ROW,
+      including rows `keep` rejects -- a filtered row is seen, just not
+      returned, and a cursor that skipped it would re-scan it on every pass
+      forever.
+    in: rows, a list of row dicts; cursor, a {key: count} dict where key is
+      cursor_key(row) (a missing key reads as 0, and a legacy bare-seat key is
+      migrated as described above); keep, an optional predicate selecting which
+      FRESH rows to return.
     out: (fresh_rows, new_cursor). new_cursor is a new dict -- the caller's is
-      never mutated -- and never moves a seat's count backwards.
+      never mutated -- and never moves a key's count backwards. Keys for
+      sources not seen this pass are preserved untouched (a momentarily
+      unreadable file must not lose its place and re-post its whole history).
     side effects: none, this is pure. Persisting new_cursor is the caller's job.
     errors: none for ordinary input; a cursor value that is not int-able
       propagates its own ValueError.
     """
     seen = {}
     fresh = []
+    legacy_left = {}   # seat -> unspent legacy budget, filled on first sight
+    tagged_seats = set()
     for row in rows:
         seat = row.get("seat", "?")
-        idx = seen.get(seat, 0)
-        seen[seat] = idx + 1
-        if idx >= int(cursor.get(seat, 0)):
-            if keep is not None and not keep(row):
+        key = cursor_key(row)
+        if key != seat:
+            tagged_seats.add(seat)
+        idx = seen.get(key, 0)
+        seen[key] = idx + 1
+        if idx < int(cursor.get(key, 0)):
+            continue
+        if key != seat and cursor.get(key) is None:
+            # This source has no count of its own yet: spend the seat's
+            # legacy per-seat count, if any, before calling anything fresh.
+            if seat not in legacy_left:
+                legacy_left[seat] = int(cursor.get(seat, 0))
+            if legacy_left[seat] > 0:
+                legacy_left[seat] -= 1
                 continue
-            fresh.append(row)
+        if keep is not None and not keep(row):
+            continue
+        fresh.append(row)
     new_cursor = dict(cursor)
-    for seat, count in seen.items():
-        new_cursor[seat] = max(count, int(cursor.get(seat, 0)))
+    for key, count in seen.items():
+        new_cursor[key] = max(count, int(cursor.get(key, 0)))
+    for seat in tagged_seats:
+        # Retire the migrated bare-seat key -- leaving it would spend the same
+        # budget again on every later pass. Only when that seat has no untagged
+        # rows this pass, where the bare key is still a live count.
+        if seat in new_cursor and seat not in seen:
+            del new_cursor[seat]
     return fresh, new_cursor
 
 

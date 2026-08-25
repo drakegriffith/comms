@@ -684,5 +684,262 @@ class TestRunIds(unittest.TestCase):
         os.environ["COMMS_ROOT"] = self.tmp  # restore for other tests
 
 
+class TestSourceIdentity(unittest.TestCase):
+    """Cursor identity is (seat, SOURCE FILE), not seat alone (issues #20, #23).
+
+    After adapters/remote landed, ONE seat string can have rows in TWO files
+    on one machine: its own first-class `<seat>.jsonl` and the pull mirror
+    `remote~<hub>.jsonl`. read_siblings merges and sorts by `at`, so a newly
+    pulled row with an OLDER `at` used to shift that seat's merged index
+    sequence and push an already-delivered row back under the cursor (#23).
+    The source-file annotation is also the discriminator the discord mirror
+    needs to skip pulled rows instead of double-posting them (#20).
+    """
+
+    def setUp(self):
+        self.tmp = os.environ["COMMS_ROOT"]
+
+    def _write(self, runid, filename, rows):
+        d = mb.init(runid)
+        with open(os.path.join(d, filename), "a") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        return os.path.join(d, filename)
+
+    @staticmethod
+    def _row(seat, at, text="t"):
+        return {"seat": seat, "at": at, "kind": "finding", "text": text,
+                "topic": "default"}
+
+    # ---- annotation is opt-in, never persisted ---------------------------
+
+    def test_read_siblings_is_unannotated_by_default(self):
+        # The CLI read path and adapters/remote hand these rows onward (and
+        # append_mirrored writes them VERBATIM to another machine's mirror
+        # file); an always-on annotation would persist a read-time detail.
+        self._write("test-src1", "alpha.jsonl", [self._row("alpha", "1")])
+        rows = mb.read_siblings("test-src1", "reader")
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn(mb.SOURCE_KEY, rows[0])
+
+    def test_read_siblings_with_source_tags_each_row_with_its_file(self):
+        self._write("test-src2", "alpha.jsonl", [self._row("alpha", "1")])
+        self._write("test-src2", "remote~studio.jsonl", [self._row("alpha", "2")])
+        rows = mb.read_siblings("test-src2", "reader", with_source=True)
+        tags = sorted(mb.source_of(r).split("#")[0] for r in rows)
+        self.assertEqual(tags, ["alpha.jsonl", "remote~studio.jsonl"])
+
+    def test_read_for_can_tag_too(self):
+        self._write("test-src3", "alpha.jsonl", [self._row("alpha", "1")])
+        rows = mb.read_for("test-src3", "reader", with_source=True)
+        self.assertTrue(mb.source_of(rows[0]).startswith("alpha.jsonl#"))
+
+    def test_without_source_returns_the_row_as_authored(self):
+        row = dict(self._row("alpha", "1"))
+        authored = dict(row)
+        row[mb.SOURCE_KEY] = "alpha.jsonl#7"
+        self.assertEqual(mb.without_source(row), authored)
+
+    # ---- the tag is an IDENTITY, not just a name -------------------------
+
+    def test_recreated_file_gets_a_different_tag(self):
+        # Purge + recreate: same filename, new file. A name-only tag would
+        # carry the old count forward and SKIP the new file's rows, which is
+        # the one failure this mailbox refuses (a silent drop). A fresh tag
+        # re-posts instead -- a visible duplicate beats an invisible loss.
+        d = mb.init("test-src4")
+        path = os.path.join(d, "alpha.jsonl")
+        self._write("test-src4", "alpha.jsonl", [self._row("alpha", "1")])
+        first = mb.read_siblings("test-src4", "reader", with_source=True)[0]
+        os.remove(path)
+        self._write("test-src4", "alpha.jsonl", [self._row("alpha", "9")])
+        second = mb.read_siblings("test-src4", "reader", with_source=True)[0]
+        self.assertNotEqual(mb.source_of(first), mb.source_of(second))
+
+    def test_appending_never_changes_the_tag(self):
+        # The positive control for the test above: ordinary growth of a seat
+        # file keeps one identity, or every append would look like a new file.
+        self._write("test-src5", "alpha.jsonl", [self._row("alpha", "1")])
+        first = mb.read_siblings("test-src5", "reader", with_source=True)[0]
+        self._write("test-src5", "alpha.jsonl", [self._row("alpha", "2")])
+        rows = mb.read_siblings("test-src5", "reader", with_source=True)
+        self.assertEqual({mb.source_of(r) for r in rows}, {mb.source_of(first)})
+
+    # ---- cursor keys ------------------------------------------------------
+
+    def test_cursor_key_of_an_untagged_row_is_the_bare_seat(self):
+        # adapters/remote/sync.py reads rows off a subprocess's stdout: no
+        # source file exists, and its cursor must keep the pre-#39 shape.
+        self.assertEqual(mb.cursor_key(self._row("alpha", "1")), "alpha")
+
+    def test_cursor_key_of_a_tagged_row_names_seat_and_source(self):
+        row = dict(self._row("alpha", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio.jsonl#7"
+        self.assertEqual(mb.cursor_key(row), "alpha/remote~studio.jsonl#7")
+
+    def test_cursor_key_separator_is_illegal_in_both_halves(self):
+        # "#" and "@" are LEGAL in a seat name and in a machine label (only
+        # "/" is rejected by _valid_seat, and only "/" cannot be in a
+        # filename), so either of those as the separator makes a key
+        # ambiguous. The separator has to be the one character neither half
+        # can contain.
+        self.assertEqual(mb.CURSOR_KEY_SEP, "/")
+
+    def test_cursor_key_round_trips_a_seat_and_label_containing_hashes(self):
+        row = dict(self._row("a#b", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio#2.jsonl#8912345"
+        key = mb.cursor_key(row)
+        self.assertEqual(key, "a#b/remote~studio#2.jsonl#8912345")
+        seat, _, src = key.partition(mb.CURSOR_KEY_SEP)
+        self.assertEqual(seat, "a#b")
+        self.assertEqual(mb.source_name(src), "remote~studio#2.jsonl")
+
+    def test_source_name_of_an_unstattable_tag_is_the_whole_name(self):
+        # source_tag degrades to the bare filename when fstat fails, and that
+        # name may itself contain "#" -- so the inode split is a rsplit that
+        # must recognize it has nothing to split off.
+        self.assertEqual(mb.source_name("remote~a#12.jsonl"), "remote~a#12.jsonl")
+        self.assertEqual(mb.source_name("alpha.jsonl#88"), "alpha.jsonl")
+
+    def test_untagged_rows_keep_the_flat_per_seat_cursor(self):
+        rows = [self._row("a", "1"), self._row("b", "2"), self._row("a", "3")]
+        fresh, cursor = mb.fresh_rows_by_seat(rows, {})
+        self.assertEqual(len(fresh), 3)
+        self.assertEqual(cursor, {"a": 2, "b": 1})
+
+    # ---- #23: an older-`at` insertion in another file --------------------
+
+    def test_older_at_insertion_in_a_second_file_never_reposts(self):
+        """#23's repro: seat X has rows in its own file AND in the pull
+        mirror. A pull brings home a row whose `at` sorts BEFORE a row
+        already delivered from the other file. Under a per-seat count the
+        delivered row falls back under the cursor and posts twice."""
+        self._write("test-src6", "x~studio.jsonl",
+                    [self._row("x~studio", "2026-08-24T10:00:00+00:00", "pushed-A"),
+                     self._row("x~studio", "2026-08-24T12:00:00+00:00", "pushed-B")])
+        rows = mb.read_siblings("test-src6", "reader", with_source=True)
+        fresh, cursor = mb.fresh_rows_by_seat(rows, {})
+        self.assertEqual([r["text"] for r in fresh], ["pushed-A", "pushed-B"])
+        # The pull lands an OLDER row for the same seat, in a different file.
+        self._write("test-src6", "remote~laptop.jsonl",
+                    [self._row("x~studio", "2026-08-24T11:00:00+00:00", "pulled")])
+        rows = mb.read_siblings("test-src6", "reader", with_source=True)
+        fresh2, _ = mb.fresh_rows_by_seat(rows, cursor)
+        self.assertEqual([r["text"] for r in fresh2], ["pulled"])
+
+    def test_per_file_counting_survives_a_row_arriving_out_of_at_order(self):
+        rows = [self._row("a", "5", "first-seen")]
+        rows[0][mb.SOURCE_KEY] = "a.jsonl#1"
+        _, cursor = mb.fresh_rows_by_seat(rows, {})
+        older = self._row("a", "1", "older-elsewhere")
+        older[mb.SOURCE_KEY] = "remote~hub.jsonl#2"
+        fresh, cursor2 = mb.fresh_rows_by_seat([older] + rows, cursor)
+        self.assertEqual([r["text"] for r in fresh], ["older-elsewhere"])
+        self.assertEqual(cursor2["a/a.jsonl#1"], 1)
+        self.assertEqual(cursor2["a/remote~hub.jsonl#2"], 1)
+
+    # ---- back-compat: the old {seat: count} cursor migrates in place -----
+
+    def test_legacy_per_seat_cursor_is_consumed_in_merged_order(self):
+        """A cursor written before this change means exactly "the first N
+        rows of this seat, in merged order, are already seen" -- so migration
+        replays that reading, then records it per source file. Neither
+        re-posts nor skips."""
+        self._write("test-src7", "alpha.jsonl",
+                    [self._row("alpha", "1", "old-1"),
+                     self._row("alpha", "3", "new-1")])
+        self._write("test-src7", "remote~hub.jsonl",
+                    [self._row("alpha", "2", "old-2")])
+        rows = mb.read_siblings("test-src7", "reader", with_source=True)
+        fresh, cursor = mb.fresh_rows_by_seat(rows, {"alpha": 2})
+        self.assertEqual([r["text"] for r in fresh], ["new-1"])
+        self.assertNotIn("alpha", cursor)  # the legacy key is retired
+        self.assertEqual(sum(cursor.values()), 3)
+
+    def test_migrated_cursor_is_stable_on_the_next_pass(self):
+        self._write("test-src8", "alpha.jsonl", [self._row("alpha", "1", "one")])
+        rows = mb.read_siblings("test-src8", "reader", with_source=True)
+        _, cursor = mb.fresh_rows_by_seat(rows, {"alpha": 1})
+        fresh, cursor2 = mb.fresh_rows_by_seat(rows, cursor)
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor2, cursor)
+
+    def test_legacy_count_larger_than_the_rows_now_visible_posts_the_rest(self):
+        """The purge case, pinned deliberately. A legacy cursor claims 3 rows
+        for a seat whose file now holds 1 (truncated, replaced, or restored
+        from a shorter copy). Migration spends what it can, retires the
+        legacy key, and later appends POST. That is the #23 fix doing its
+        job: the old count was earned by rows that are no longer there, and
+        carrying the unspent budget forward would skip live rows to honor a
+        count for dead ones -- a silent drop to avoid a visible duplicate,
+        which is the wrong trade in this mailbox."""
+        self._write("test-src10", "alpha.jsonl", [self._row("alpha", "1", "survivor")])
+        rows = mb.read_siblings("test-src10", "reader", with_source=True)
+        fresh, cursor = mb.fresh_rows_by_seat(rows, {"alpha": 3})
+        self.assertEqual(fresh, [])          # the one visible row is still spent
+        self.assertNotIn("alpha", cursor)    # ...and the budget is not banked
+        self._write("test-src10", "alpha.jsonl", [self._row("alpha", "2", "appended")])
+        rows = mb.read_siblings("test-src10", "reader", with_source=True)
+        fresh2, _ = mb.fresh_rows_by_seat(rows, cursor)
+        self.assertEqual([r["text"] for r in fresh2], ["appended"])
+
+    def test_legacy_key_for_a_seat_with_no_rows_this_pass_is_kept(self):
+        # A seat file that is momentarily unreadable must not lose its
+        # position -- dropping the key would re-post the whole file.
+        self._write("test-src9", "alpha.jsonl", [self._row("alpha", "1")])
+        rows = mb.read_siblings("test-src9", "reader", with_source=True)
+        _, cursor = mb.fresh_rows_by_seat(rows, {"alpha": 1, "bravo": 4})
+        self.assertEqual(cursor["bravo"], 4)
+
+    # ---- the pull-mirror discriminator (#20) -----------------------------
+
+    def test_is_mirror_source_true_for_pulled_rows(self):
+        row = dict(self._row("alpha", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio.jsonl#7"
+        self.assertTrue(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_false_for_a_first_class_seat_file(self):
+        # Direction matters: `alpha~macbook.jsonl` is a PUSHED row's
+        # first-class file on the hub and the hub mirror must keep posting
+        # it. The discriminator is the file, never the "~" in the seat.
+        row = dict(self._row("alpha~macbook", "1"))
+        row[mb.SOURCE_KEY] = "alpha~macbook.jsonl#7"
+        self.assertFalse(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_false_for_an_untagged_row(self):
+        self.assertFalse(mb.is_mirror_source(self._row("alpha", "1")))
+
+    def test_is_mirror_source_false_for_a_seat_actually_named_remote(self):
+        # adapters/remote RESERVES the name; _valid_seat does not enforce the
+        # reservation, so a first-class `remote.jsonl` can exist. A pull
+        # mirror is always `remote~<label>.jsonl` with a non-empty label --
+        # matching the bare name too would silently drop that seat's rows,
+        # and a silent drop is the one failure this mailbox refuses.
+        row = dict(self._row("remote", "1"))
+        row[mb.SOURCE_KEY] = "remote.jsonl#7"
+        self.assertFalse(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_false_for_an_empty_label(self):
+        row = dict(self._row("remote~", "1"))
+        row[mb.SOURCE_KEY] = "remote~.jsonl#7"
+        self.assertFalse(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_survives_a_label_containing_a_hash(self):
+        row = dict(self._row("beta~studio#2", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio#2.jsonl#8912345"
+        self.assertTrue(mb.is_mirror_source(row))
+
+    def test_mirror_file_naming_agrees_with_adapters_remote(self):
+        """The drift guard: adapters/remote/sync.py NAMES the pull mirror
+        file, this module RECOGNIZES it. Two spellings of one convention is
+        how #20 comes back."""
+        sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "adapters", "remote"))
+        import sync  # noqa: E402
+
+        row = dict(self._row("alpha", "1"))
+        row[mb.SOURCE_KEY] = sync.mirror_seat("studio") + ".jsonl#7"
+        self.assertTrue(mb.is_mirror_source(row))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
