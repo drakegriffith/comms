@@ -7,12 +7,13 @@
 #   * python3 present
 #   * mirror.py present beside this script
 #   * DISCORD_COMMS_WEBHOOK_URL configured (env, or a line in the secrets file)
-#   * DISCORD_COMMS_FORUM_WEBHOOK_URL configured -- INFORMATIONAL ONLY, does
-#     not block install. mirror.py resolves this var (find_forum_webhook_url)
-#     but nothing posts to it yet: it is not a lane, there is no --lane forum,
-#     and slice 2 owns the posting path (thread_name / ?thread_id=). Gating
-#     install on it would fail every existing install that has not yet done
-#     the forum channel/webhook human step.
+#   * DISCORD_COMMS_FORUM_WEBHOOK_URL configured -- the BOARD lane's secret
+#     (--lane board: one Discord forum thread per document, see README.md).
+#     Reported, never blocking: the board lane is opt-in, and gating install
+#     on it would fail every existing install whose human has not yet created
+#     the forum channel and its webhook -- a Discord-UI step nothing here can
+#     script. Without it, --lane board exits 2 naming the drop-in line; the
+#     other two lanes are unaffected.
 #
 # Exit: 0 ready | 2 secret missing (prints the exact drop-in) | 1 broken.
 
@@ -54,9 +55,9 @@ elif [ -f "$SECRETS" ] && [ "$(grep -c '^DISCORD_COMMS_FORUM_WEBHOOK_URL=' "$SEC
   have_forum_secret=1
 fi
 if [ "$have_forum_secret" -eq 1 ]; then
-  forum_status="configured"
+  forum_status="configured -- 'mirror.py --follow-all --lane board' can run"
 else
-  forum_status="not yet configured (optional -- slice 2 will need it to post forum threads)"
+  forum_status="NOT configured -- the board lane cannot run (the other lanes are unaffected)"
 fi
 
 cat <<EOF
@@ -70,6 +71,7 @@ Or mirror EVERY run under the mailbox root in one process (picks up newly
 armed runs without a restart):
   python3 $MIRROR --follow-all                        # lane "all" (default)
   python3 $MIRROR --follow-all --lane convo           # conversation-only, 2nd webhook
+  python3 $MIRROR --follow-all --lane board           # one forum thread per document
 
 --lane convo on ANY of the above sends to DISCORD_COMMS_CONVO_WEBHOOK_URL
 (same drop-in steps as above, different var) instead of
@@ -116,13 +118,22 @@ with a plain --follow-all job):
   <key>KeepAlive</key><true/>
 
 Env knobs: COMMS_MACHINE_LABEL (prefix; default hostname -s),
-COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped state),
+COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped/held state),
 COMMS_SECRETS_FILE (default ~/.secrets/comms.env), COMMS_MIRROR_INTERVAL.
+Board lane only: COMMS_THREAD_ALIVE_SECONDS (default 1800),
+COMMS_THREAD_ALIVE_SEATS (2), COMMS_THREAD_HOLD_MAX (500).
 
-Forum board webhook (DISCORD_COMMS_FORUM_WEBHOOK_URL): $forum_status.
-This is resolution only -- nothing in this build posts to it yet (see
-README.md, Forum board webhook). To set it up ahead of slice 2:
-  1. open -e ~/.secrets/comms.env
-  2. add line: DISCORD_COMMS_FORUM_WEBHOOK_URL=<paste webhook URL from the forum channel's webhook settings>
-  3. chmod 600 ~/.secrets/comms.env
+Board lane webhook (DISCORD_COMMS_FORUM_WEBHOOK_URL): $forum_status.
+Setting it up is a HUMAN step in the Discord UI, in this order:
+  1. in Discord, create a FORUM channel (not a text channel -- the board
+     posts one thread per document, which only a forum can hold)
+  2. that channel's Settings -> Integrations -> Webhooks -> New Webhook,
+     then Copy Webhook URL
+  3. open -e ~/.secrets/comms.env
+  4. add line: DISCORD_COMMS_FORUM_WEBHOOK_URL=<paste that URL>
+  5. chmod 600 ~/.secrets/comms.env
+Then: python3 $MIRROR --once <runid> --lane board
+A row only reaches the board once its document's conversation is alive (two
+seats within 30 minutes, by default); until then it waits in the lane's
+held file. See README.md, The board lane.
 EOF

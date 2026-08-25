@@ -178,9 +178,24 @@ def seat_identities(runid, state_dir=None):
     Discord mirror) joins mailbox rows to it BY SEAT NAME at format time.
     Participants without a seat or without identity are simply absent, so a
     pre-identity roster yields {} and every consumer falls back to its
-    identity-free rendering. First seat occurrence wins (participants are read
-    in sorted filename order, so the winner is deterministic); seats are
-    unique per run in practice.
+    identity-free rendering.
+
+    SEAT UNIQUENESS IS A CONVENTION, NOT AN INVARIANT (issue #42). Nothing
+    stops two agents enrolling on one seat name -- enroll() deliberately
+    accepts it, see below -- so this function states its RESOLUTION RULE
+    instead of assuming the question cannot arise: participants are read in
+    sorted filename order and the FIRST occurrence of a seat wins. The
+    winner is therefore deterministic, never arbitrary.
+
+    THE CONSEQUENCE, NAMED: when two agents share seat "alpha", a unicast to
+    "@alpha" fans out to BOTH (a duplication, not a drop -- both receive it),
+    and both agents' rows render under the first one's identity, so a human
+    reading the board sees one agent where there are two. That is accepted,
+    not fixed here: rejecting a duplicate seat in enroll() would kill session
+    start (enroll runs at SessionStart and returns a bool) and would make a
+    legitimate re-enroll after a crash -- same seat, new agent_id -- run
+    UNENROLLED, i.e. invisible, which is strictly worse. seat_collisions()
+    below is the detector that makes the condition visible instead.
     """
     pdir = _participants_dir(runid, state_dir)
     try:
@@ -201,6 +216,56 @@ def seat_identities(runid, state_dir=None):
         if seat and ident and seat not in out:
             out[seat] = ident
     return out
+
+
+def seat_collisions(runid, state_dir=None):
+    """{seat: [agent_id, ...]} for every seat claimed by MORE THAN ONE
+    enrolled agent. Empty dict when the roster is clean (the normal case).
+
+    WHY DETECT AND NOT REJECT (issue #42, resolved in issue #40's D5): see
+    seat_identities' docstring above. Enforcement belongs nowhere on the
+    enroll path; visibility is what was actually missing. The Discord mirror
+    calls this once per pass and writes ONE stderr line when it is non-empty,
+    which turns a silent mis-render into a thing a human can read.
+
+    agent_ids come back in SORTED FILENAME ORDER -- the same order
+    seat_identities() resolves in -- so the first id in a list is the one
+    whose identity currently wins the render. A detector that reported a
+    different order than the resolver uses would name the wrong winner.
+
+    Reports on the SEAT, not on identity: a participant that declared no
+    model/project/area is absent from seat_identities but is still a full
+    claimant of its seat here. Two unidentified agents on one seat is the
+    same bug as two identified ones.
+
+    in: runid; state_dir (default $COMMS_STATE_DIR chain).
+    out: dict, possibly empty. Seatless participants are ignored -- enrolling
+      without a seat is normal for a read-only participant, and two of them
+      are not a collision on the seat named None.
+    side effects: none -- a pure read of the participants dir. An unarmed run,
+      an unreadable dir, or a malformed participant file yields {} or is
+      skipped: a detector that raised would take down the pass it is meant to
+      annotate.
+    """
+    pdir = _participants_dir(runid, state_dir)
+    try:
+        names = sorted(os.listdir(pdir))
+    except OSError:
+        return {}
+    claims = {}
+    for name in names:
+        try:
+            with open(os.path.join(pdir, name)) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        seat = data.get("seat")
+        if not seat:
+            continue
+        claims.setdefault(seat, []).append(name)
+    return {seat: ids for seat, ids in claims.items() if len(ids) > 1}
 
 
 def is_participant(runid, agent_id, state_dir=None):

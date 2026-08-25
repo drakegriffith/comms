@@ -62,6 +62,15 @@ writes topic "@seatC"; only seatC's read_for surfaces it. Real topics never begi
 with "@", so unicast and fan-out never collide and old rows (no "@" topic) are
 unaffected.
 
+THREADS ARE ABOUT-NESS, NOT ADDRESSING. A row may carry `thread`, a key naming
+the DOCUMENT it concerns (thread_key turns a path into "doc:<repo>/<relpath>").
+topic/to answer "who receives this"; thread answers "what is this about". They
+are orthogonal and compose: a unicast can be threaded, a fan-out can be
+threaded, and a row with no thread behaves exactly as before. Nothing in this
+module routes on `thread` -- it is written here and consumed by renderers
+(adapters/discord's board lane groups rows by it; lib/swarm_threads decides
+which groups are live enough to render).
+
 BACKWARD COMPATIBLE: a seat that never calls subscribe() has NO registered
 subscription, and read_for then returns every sibling row -- exactly the
 pre-subscription whole-board behavior. read_siblings and its --topic filter are
@@ -96,7 +105,7 @@ over one stream is how rows go missing quietly.
 CLI:
   swarm_mailbox.py init <runid>
   swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]      # register a seat's topic set
-  swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]  # kind: finding|claim|blocker|comment|reply|status
+  swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>] [--thread <key>]  # kind: finding|claim|blocker|comment|reply|status
   swarm_mailbox.py read <runid> <seat> [--topic <name>]               # NEW rows from every OTHER seat (one topic or all)
   swarm_mailbox.py read <runid> <seat> --subs                          # only this seat's subscribed slice + its unicasts
   swarm_mailbox.py read <runid> <seat> --replay                        # every row again; cursor neither read nor moved
@@ -239,7 +248,125 @@ def subscriptions(runid, seat):
     return set(topics) | {SELF_TOPIC_PREFIX + seat}
 
 
-def post(runid, seat, kind, text, topic=None, to=None):
+# ---- THREAD KEY ------------------------------------------------------------
+#
+# WHAT A THREAD IS: rows about the SAME DOCUMENT, grouped so a human reading
+# Discord sees one conversation per file instead of one flat firehose. The key
+# is derived from a path, not chosen by the poster, so two seats editing the
+# same file land in the same thread without coordinating a name.
+THREAD_KEY_PREFIX = "doc:"
+
+# The entry (dir OR file) whose presence makes a directory a repo root. It is
+# a FILE in a linked worktree ("gitdir: ..."), a DIRECTORY in a normal clone.
+# Testing only isdir would unthread every row written from a worktree.
+_REPO_MARKER = ".git"
+
+# What a linked worktree's `.git` FILE contains: one line, "gitdir: <path>",
+# pointing at <main checkout>/.git/worktrees/<name>. That path is the only
+# on-disk link from a worktree back to the checkout it belongs to.
+_GITDIR_PREFIX = "gitdir:"
+_WORKTREES_SEGMENT = os.sep + _REPO_MARKER + os.sep + "worktrees" + os.sep
+
+# A `.git` file is one short line. Cap the read: this runs per Write/Edit, and
+# a caller should never be able to make a hook slurp an arbitrary file.
+_GITDIR_READ_CAP = 4096
+
+
+def _repo_name(root):
+    """The repo NAME for a directory holding a `.git` entry.
+
+    Normally the directory's own basename. For a LINKED WORKTREE -- where
+    `.git` is a file reading "gitdir: <main>/.git/worktrees/<name>" -- it is
+    the MAIN CHECKOUT's basename instead, because a worktree is the same repo
+    in a different directory and keying on the worktree's name threads one
+    document separately per worktree. That is not hypothetical: the hook leg
+    that calls thread_key runs from worktrees routinely.
+
+    Every failure degrades to the local basename, never to None: a thread
+    named after the worktree is a mis-grouping a human can SEE, while no
+    thread at all is a row that silently never renders.
+
+    A `.git` file that is NOT a worktree pointer -- a submodule's, which
+    reads ".git/modules/<name>" -- keeps the local basename on purpose. A
+    submodule checkout is its own document space; borrowing the
+    superproject's name would merge two projects' threads.
+    """
+    marker = os.path.join(root, _REPO_MARKER)
+    if not os.path.isfile(marker):
+        return os.path.basename(root)
+    try:
+        with open(marker) as fh:
+            line = fh.read(_GITDIR_READ_CAP).strip()
+    except OSError:
+        return os.path.basename(root)
+    if not line.startswith(_GITDIR_PREFIX):
+        return os.path.basename(root)
+    gitdir = line[len(_GITDIR_PREFIX):].strip()
+    if not gitdir:
+        return os.path.basename(root)
+    if not os.path.isabs(gitdir):
+        # git writes an absolute path today; a relative one is legal, and a
+        # moved checkout produces one. It is relative to the worktree root.
+        gitdir = os.path.normpath(os.path.join(root, gitdir))
+    head, sep, _ = gitdir.partition(_WORKTREES_SEGMENT)
+    if not sep:
+        return os.path.basename(root)  # a submodule, or something else
+    return os.path.basename(head) or os.path.basename(root)
+
+
+def thread_key(path):
+    """The thread name for `path`: "doc:<repo>/<relpath>", or None if `path`
+    lives outside any repo.
+
+    <repo> is the basename of the NEAREST ancestor holding a `.git` entry;
+    <relpath> is the POSIX-spelled path from that ancestor down. `path` is
+    realpath'd first, so two spellings of one file (a symlink, /tmp vs
+    /private/tmp, a `..` segment) produce ONE key -- two keys for one document
+    is two Discord threads for one conversation, which is the whole failure
+    this function exists to prevent.
+
+    NEAREST ancestor, not outermost: a vendored repo inside a repo is its own
+    document space, and keying its files on the outer repo would merge two
+    projects' threads.
+
+    A LINKED WORKTREE keys on the MAIN CHECKOUT's name (see _repo_name): a
+    worktree is the same repo in a different directory, and the relpath is
+    identical in both, so one document must not thread twice just because it
+    was edited from a worktree.
+
+    NO SUBPROCESS, deliberately: the caller is a per-Write/Edit hook, and
+    `git rev-parse` costs a process spawn on every keystroke-scale edit (it
+    also appears nowhere else in this repo). The marker test is a stat.
+
+    ONE ARGUMENT, deliberately: no repo_root= override. A test builds a real
+    directory with a real `.git`; an override would widen a production
+    interface so a test could avoid making one.
+
+    OUTSIDE ANY REPO IS None, never a fabricated key like "doc:tmp/x.md": a
+    row with no thread takes the unthreaded path, which is a visible
+    non-grouping. A made-up key is an invisible mis-grouping.
+
+    The repo root itself keys on the repo alone ("doc:comms"), not
+    "doc:comms/." -- a deviation from the design note's literal formula,
+    because this string becomes a human-visible Discord thread name and a
+    trailing "." carries no information.
+    """
+    real = os.path.realpath(path)
+    cur = real if os.path.isdir(real) else os.path.dirname(real)
+    while True:
+        if os.path.exists(os.path.join(cur, _REPO_MARKER)):
+            repo = _repo_name(cur)
+            rel = os.path.relpath(real, cur)
+            if rel == os.curdir:
+                return THREAD_KEY_PREFIX + repo
+            return "%s%s/%s" % (THREAD_KEY_PREFIX, repo, rel.replace(os.sep, "/"))
+        parent = os.path.dirname(cur)
+        if parent == cur:  # hit the filesystem root without finding a marker
+            return None
+        cur = parent
+
+
+def post(runid, seat, kind, text, topic=None, to=None, thread=None):
     """Append one JSON-line row to the caller's OWN <seat>.jsonl.
 
     kind must be one of finding|claim|blocker|comment|reply|status (a closed
@@ -253,6 +380,14 @@ def post(runid, seat, kind, text, topic=None, to=None):
         passing both `to` and a conflicting `topic` is a hard error.
     A fan-out row is byte-identical to the pre-subscription format; a unicast row
     additionally carries a "to" key (for rendering and audit). Returns the row.
+
+    `thread` (optional) is a THREAD KEY -- see thread_key -- naming the
+    document this row is about. It is ORTHOGONAL to topic/to: topic answers
+    "who receives this", thread answers "what is this about", and a row can
+    carry both, either, or neither. Written ONLY when given, so a row posted
+    without it is byte-identical to the pre-thread format. Empty string reads
+    as absent for the same reason thread_key returns None outside a repo: an
+    empty key would bucket unrelated rows into one nameless thread.
     """
     if kind not in VALID_KINDS:
         raise ValueError(
@@ -275,6 +410,8 @@ def post(runid, seat, kind, text, topic=None, to=None):
     }
     if to is not None:
         row["to"] = to
+    if thread:
+        row["thread"] = thread
     path = _seat_path(runid, seat)
     # Append-only, one writer (this seat) per file. "a" opens at end atomically
     # per write for a single line, so a seat's own sequential appends never
@@ -951,15 +1088,16 @@ def read_delta(runid, seat, topic=None, subs=False):
 
 
 def _extract_flags(args):
-    """Pull optional `--topic <name>`, `--to <seat>`, and the booleans `--subs`
-    and `--replay` out of a positional arg list.
+    """Pull optional `--topic <name>`, `--to <seat>`, `--thread <key>`, and the
+    booleans `--subs` and `--replay` out of a positional arg list.
 
-    Returns (remaining_args, {topic, to, subs, replay}). Flags may appear
-    anywhere; existing calls that pass none are untouched, so the fixed-arity
-    checks below still hold for the common case.
+    Returns (remaining_args, {topic, to, thread, subs, replay}). Flags may
+    appear anywhere; existing calls that pass none are untouched, so the
+    fixed-arity checks below still hold for the common case.
     """
     topic = None
     to = None
+    thread = None
     subs = False
     replay = False
     out = []
@@ -977,6 +1115,12 @@ def _extract_flags(args):
             to = args[i + 1]
             i += 2
             continue
+        if args[i] == "--thread":
+            if i + 1 >= len(args):
+                raise ValueError("--thread needs a value")
+            thread = args[i + 1]
+            i += 2
+            continue
         if args[i] == "--subs":
             subs = True
             i += 1
@@ -987,7 +1131,13 @@ def _extract_flags(args):
             continue
         out.append(args[i])
         i += 1
-    return out, {"topic": topic, "to": to, "subs": subs, "replay": replay}
+    return out, {
+        "topic": topic,
+        "to": to,
+        "thread": thread,
+        "subs": subs,
+        "replay": replay,
+    }
 
 
 def _cmd_read(runid, seat, topic=None, subs=False, replay=False):
@@ -1089,7 +1239,7 @@ def main(argv):
         sys.stderr.write(
             "usage: swarm_mailbox.py init <runid>\n"
             "       swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]\n"
-            "       swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]\n"
+            "       swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>] [--thread <key>]\n"
             "       swarm_mailbox.py read <runid> <seat> [--topic <name> | --subs] [--replay]\n"
             "       swarm_mailbox.py cursor take <path>   (rows as JSONL on stdin)\n"
             "       swarm_mailbox.py cursor confirm <path> <receipt>\n"
@@ -1118,7 +1268,10 @@ def main(argv):
         if cmd == "post":
             if len(rest) != 4:
                 raise ValueError("post needs <runid> <seat> <kind> <text>")
-            row = post(rest[0], rest[1], rest[2], rest[3], topic=topic, to=to)
+            row = post(
+                rest[0], rest[1], rest[2], rest[3],
+                topic=topic, to=to, thread=flags["thread"],
+            )
             print(json.dumps(row))
             return 0
         if cmd == "read":

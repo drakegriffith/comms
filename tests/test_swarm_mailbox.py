@@ -1056,5 +1056,257 @@ class TestSourceIdentity(unittest.TestCase):
         self.assertTrue(mb.is_mirror_source(row))
 
 
+class TestThreadKey(unittest.TestCase):
+    """thread_key: the ONE function that names the thread a document's
+    discussion belongs to (issue #40, D4). Every test builds a REAL directory
+    with a real `.git` entry -- the function takes one argument and there is
+    no repo_root= override to inject, deliberately: an override would widen a
+    production interface for the test's convenience."""
+
+    def setUp(self):
+        # COMMS_ROOT is conftest's per-test tmp dir; it is a plain directory
+        # with no `.git` anywhere above it, which is exactly what the
+        # outside-any-repo case needs.
+        self.tmp = os.environ["COMMS_ROOT"]
+
+    def _repo(self, name, git_is_file=False):
+        root = os.path.join(self.tmp, name)
+        os.makedirs(root, exist_ok=True)
+        dot = os.path.join(root, ".git")
+        if git_is_file:
+            with open(dot, "w") as fh:
+                fh.write("gitdir: /elsewhere/.git/worktrees/%s\n" % name)
+        else:
+            os.makedirs(dot, exist_ok=True)
+        return root
+
+    def _touch(self, root, relpath):
+        path = os.path.join(root, *relpath.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("x\n")
+        return path
+
+    def test_file_at_repo_root(self):
+        root = self._repo("comms")
+        path = self._touch(root, "README.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/README.md")
+
+    def test_nested_file_walks_up_to_the_nearest_repo(self):
+        root = self._repo("comms")
+        path = self._touch(root, "docs/reference/llm-ops.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/docs/reference/llm-ops.md")
+
+    def test_worktree_dot_git_FILE_counts_as_a_repo(self):
+        # A linked worktree's `.git` is a FILE containing "gitdir: ...", not a
+        # directory. Testing only os.path.isdir would make every worktree --
+        # the shape this very slice is built in -- return None. The NAME then
+        # comes from the main checkout the file points at (see the worktree
+        # tests below); here the point is that the file is a marker at all.
+        root = self._repo("comms-wt", git_is_file=True)  # -> /elsewhere/.git/worktrees/
+        path = self._touch(root, "lib/swarm_mailbox.py")
+        self.assertEqual(mb.thread_key(path), "doc:elsewhere/lib/swarm_mailbox.py")
+
+    def test_a_linked_worktree_keys_on_the_MAIN_checkouts_name(self):
+        """The convener's finding on PR #51. `git worktree add` gives the
+        worktree its own directory name, so keying on that basename threads
+        the SAME document separately per worktree -- and slice 3b's hook leg
+        runs from worktrees routinely. The `.git` file names the main
+        checkout; follow it."""
+        main = self._repo("comms")
+        wt_admin = os.path.join(main, ".git", "worktrees", "wt-slice-2")
+        os.makedirs(wt_admin, exist_ok=True)
+        wt = os.path.join(self.tmp, "comms-wt-slice-2")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: %s\n" % wt_admin)
+        path = self._touch(wt, "lib/swarm_mailbox.py")
+        assert_ = self.assertEqual
+        assert_(mb.thread_key(path), "doc:comms/lib/swarm_mailbox.py")
+
+    def test_a_worktree_relpath_stays_relative_to_the_WORKTREE_root(self):
+        # Only the repo NAME comes from the main checkout. The path is where
+        # the file actually is, which is the same relpath in either place.
+        main = self._repo("comms")
+        wt_admin = os.path.join(main, ".git", "worktrees", "wt")
+        os.makedirs(wt_admin, exist_ok=True)
+        wt = os.path.join(self.tmp, "some-other-name")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: %s\n" % wt_admin)
+        path = self._touch(wt, "docs/a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/docs/a.md")
+
+    def test_a_worktree_gitdir_written_as_a_RELATIVE_path_resolves(self):
+        # git writes an absolute path today; a relative one is legal and a
+        # moved checkout produces it. Resolved against the worktree root.
+        main = self._repo("comms")
+        os.makedirs(os.path.join(main, ".git", "worktrees", "wt"), exist_ok=True)
+        wt = os.path.join(self.tmp, "wt-dir")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: ../comms/.git/worktrees/wt\n")
+        path = self._touch(wt, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/a.md")
+
+    def test_a_dot_git_FILE_that_is_not_a_worktree_keeps_the_local_basename(self):
+        # A submodule's .git file points at .git/modules/<name>, not
+        # /.git/worktrees/. Its checkout dir IS its own repo, so the local
+        # basename is the right answer -- guessing the superproject's name
+        # would merge two projects' threads.
+        root = self._repo("subproj", git_is_file=True)
+        with open(os.path.join(root, ".git"), "w") as fh:
+            fh.write("gitdir: ../../.git/modules/subproj\n")
+        path = self._touch(root, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:subproj/a.md")
+
+    def test_an_unreadable_dot_git_file_falls_back_to_the_local_basename(self):
+        # Degrade to the pre-fix answer, never to None: a thread named after
+        # the worktree is a mis-grouping a human can see; no thread at all is
+        # a row that silently never renders.
+        root = self._repo("comms-wt", git_is_file=True)
+        os.chmod(os.path.join(root, ".git"), 0o000)
+        path = self._touch(root, "a.md")
+        try:
+            self.assertEqual(mb.thread_key(path), "doc:comms-wt/a.md")
+        finally:
+            os.chmod(os.path.join(root, ".git"), 0o600)
+
+    def test_a_dot_git_file_with_junk_in_it_falls_back(self):
+        root = self._repo("comms-wt", git_is_file=True)
+        with open(os.path.join(root, ".git"), "w") as fh:
+            fh.write("this is not a gitdir line\n")
+        path = self._touch(root, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms-wt/a.md")
+
+    def test_nearest_ancestor_wins_over_an_outer_repo(self):
+        outer = self._repo("outer")
+        inner = self._repo("outer/vendor/inner")
+        path = self._touch(inner, "src/a.py")
+        self.assertEqual(mb.thread_key(path), "doc:inner/src/a.py")
+        self.assertTrue(os.path.isdir(os.path.join(outer, ".git")))
+
+    def test_path_outside_any_repo_is_None_never_a_fabricated_key(self):
+        path = os.path.join(self.tmp, "loose.md")
+        with open(path, "w") as fh:
+            fh.write("x\n")
+        self.assertIsNone(mb.thread_key(path))
+
+    def test_symlink_resolves_to_the_real_files_repo(self):
+        root = self._repo("comms")
+        target = self._touch(root, "docs/plan.md")
+        link = os.path.join(self.tmp, "plan-link.md")
+        os.symlink(target, link)
+        self.assertEqual(mb.thread_key(link), "doc:comms/docs/plan.md")
+
+    def test_symlink_INTO_a_repo_from_outside_is_not_None(self):
+        # The realpath happens FIRST, so a link living outside every repo
+        # still keys on where its target really lives -- the alternative
+        # (a lexical parent walk from the link) returns None and silently
+        # unthreads every row a symlinked editor path produces.
+        root = self._repo("comms")
+        target = self._touch(root, "a.md")
+        link_dir = os.path.join(self.tmp, "links")
+        os.makedirs(link_dir, exist_ok=True)
+        link = os.path.join(link_dir, "a.md")
+        os.symlink(target, link)
+        self.assertEqual(mb.thread_key(link), "doc:comms/a.md")
+
+    def test_a_directory_path_keys_on_the_directory(self):
+        root = self._repo("comms")
+        os.makedirs(os.path.join(root, "docs", "runbooks"), exist_ok=True)
+        self.assertEqual(
+            mb.thread_key(os.path.join(root, "docs", "runbooks")),
+            "doc:comms/docs/runbooks",
+        )
+
+    def test_the_repo_root_itself_keys_on_the_repo_alone(self):
+        # Deviation from the design note's literal "doc:%s/%s" formula, which
+        # renders "doc:comms/." here. A key becomes a human-visible Discord
+        # thread name; "." as a filename is noise, not information.
+        root = self._repo("comms")
+        self.assertEqual(mb.thread_key(root), "doc:comms")
+
+    def test_no_subprocess_is_spawned(self):
+        # The hook that calls this runs on every Write/Edit; `git rev-parse`
+        # appears nowhere in this repo and must not start here. Guarded by
+        # breaking subprocess outright for the duration of the call.
+        import subprocess
+
+        root = self._repo("comms")
+        path = self._touch(root, "a.md")
+        real_run, real_popen = subprocess.run, subprocess.Popen
+
+        def boom(*a, **kw):
+            raise AssertionError("thread_key must not spawn a subprocess")
+
+        subprocess.run, subprocess.Popen = boom, boom
+        try:
+            self.assertEqual(mb.thread_key(path), "doc:comms/a.md")
+        finally:
+            subprocess.run, subprocess.Popen = real_run, real_popen
+
+
+class TestPostThread(unittest.TestCase):
+    """post(..., thread=): the row field the board lane buckets on."""
+
+    def _rows(self, runid, seat):
+        path = os.path.join(
+            os.environ["COMMS_ROOT"], "comms-%s" % runid, "%s.jsonl" % seat
+        )
+        with open(path) as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def test_thread_absent_leaves_the_row_byte_identical_to_the_old_shape(self):
+        mb.post("t4", "alpha", "finding", "no thread here")
+        row = self._rows("t4", "alpha")[0]
+        self.assertNotIn("thread", row)
+        self.assertEqual(sorted(row), ["at", "kind", "seat", "text", "topic"])
+
+    def test_thread_given_is_written_as_a_row_field(self):
+        row = mb.post("t4", "beta", "comment", "on the doc", thread="doc:comms/a.md")
+        self.assertEqual(row["thread"], "doc:comms/a.md")
+        self.assertEqual(self._rows("t4", "beta")[0]["thread"], "doc:comms/a.md")
+
+    def test_empty_thread_is_treated_as_absent(self):
+        # thread_key returns None outside any repo; a CLI caller passing the
+        # empty string means the same thing, and an empty key would bucket
+        # unrelated rows into one thread named "".
+        row = mb.post("t4", "gamma", "finding", "x", thread="")
+        self.assertNotIn("thread", row)
+
+    def test_thread_composes_with_a_unicast(self):
+        row = mb.post(
+            "t4", "delta", "reply", "yes", to="alpha", thread="doc:comms/a.md"
+        )
+        self.assertEqual(row["topic"], "@alpha")
+        self.assertEqual(row["thread"], "doc:comms/a.md")
+
+    def test_cli_post_accepts_a_thread_flag(self):
+        rc = mb.main(
+            ["swarm_mailbox.py", "post", "t5", "eps", "finding", "hi",
+             "--thread", "doc:comms/a.md"]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._rows("t5", "eps")[0]["thread"], "doc:comms/a.md")
+
+    def test_cli_post_without_thread_writes_no_thread_key(self):
+        self.assertEqual(
+            mb.main(["swarm_mailbox.py", "post", "t5", "zed", "finding", "hi"]), 0
+        )
+        self.assertNotIn("thread", self._rows("t5", "zed")[0])
+
+    def test_extract_flags_pulls_thread_out_of_the_positional_args(self):
+        rest, flags = mb._extract_flags(
+            ["r", "s", "finding", "text", "--thread", "doc:comms/a.md"]
+        )
+        self.assertEqual(rest, ["r", "s", "finding", "text"])
+        self.assertEqual(flags["thread"], "doc:comms/a.md")
+
+    def test_extract_flags_thread_without_a_value_is_a_hard_error(self):
+        with self.assertRaises(ValueError):
+            mb._extract_flags(["r", "s", "finding", "text", "--thread"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

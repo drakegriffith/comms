@@ -11,6 +11,7 @@ mirror writes or reads through.
 import json
 import os
 import sys
+import builtins
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +25,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
 import mirror  # noqa: E402
 import swarm_arm  # noqa: E402
 import swarm_mailbox  # noqa: E402
+import swarm_threads  # noqa: E402
 
 RUNID = "mirror-test"
 
@@ -553,12 +555,17 @@ def test_forum_webhook_missing_exits_2_naming_drop_in(capsys):
     assert "http" not in err  # never echoes any URL value
 
 
-def test_forum_board_secret_not_folded_into_lane_secret_vars():
+def test_forum_secret_is_the_board_lanes_secret_and_no_lane_is_named_forum():
+    # UPDATED BY SLICE 2 (#40). Slice 1 pinned that this var was NOT wired
+    # into a lane, because nothing could post a forum's payload shape yet.
+    # This slice wires it -- to a lane named "board", after what it is to a
+    # human, not after Discord's channel type. The half that still holds:
+    # there is no lane named "forum", so `--lane forum` is still rejected.
+    assert mirror.LANE_SECRET_VARS["board"] == mirror.FORUM_SECRET_VAR
     assert "forum" not in mirror.LANE_SECRET_VARS
-    assert mirror.FORUM_SECRET_VAR not in mirror.LANE_SECRET_VARS.values()
 
 
-def test_forum_board_secret_not_folded_into_lane_state_dirs():
+def test_no_lane_is_named_forum_in_the_state_dirs_either():
     assert "forum" not in mirror.LANE_STATE_DIRS
 
 
@@ -1437,3 +1444,750 @@ def test_missing_secret_still_exits_2_when_another_poller_holds_the_lock(capsys)
         assert exc.value.code == 2
     finally:
         os.close(held)
+
+
+# ---- the board lane: threads, held rows, and the drain (issue #40) ---------
+#
+# The board lane is the only lane whose delivery is DEFERRED: a row about a
+# document is not posted when it arrives, it is posted when the document's
+# conversation goes alive (two seats, close together -- lib/swarm_threads).
+# That means a second piece of state besides the cursor: the HELD file, which
+# answers "what have I not yet posted" while the cursor keeps answering "what
+# have I read". These tests pin the per-pass order those two impose on each
+# other, and the drain, which is the thing the design note says an
+# implementer gets wrong.
+
+BOARD = "board"
+DOC = "doc:comms/docs/plan.md"
+T0 = "2026-08-21T00:00:00+00:00"
+
+
+def _at(seconds):
+    return "2026-08-21T00:%02d:%02d+00:00" % (seconds // 60, seconds % 60)
+
+
+def _append_thread_row(seat, text, thread=DOC, at=T0, kind="comment"):
+    """A row carrying a `thread` field, written straight to the seat's jsonl."""
+    d = os.path.join(os.environ["COMMS_ROOT"], "comms-%s" % RUNID)
+    os.makedirs(d, exist_ok=True)
+    row = {"seat": seat, "at": at, "kind": kind, "text": text, "topic": "default"}
+    if thread is not None:
+        row["thread"] = thread
+    with open(os.path.join(d, "%s.jsonl" % seat), "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+@pytest.fixture()
+def board(monkeypatch):
+    """The board lane with its secret set, a FAKE thread-creating poster, and
+    post_content captured. The real threads.thread_for runs (map file, lock,
+    atomic persist and all) -- only the network is faked, at the composition
+    root, which is the seam the design note put there for exactly this."""
+    monkeypatch.setenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", "http://127.0.0.1:1/forum")
+    created = []
+
+    def fake_webhook_poster(url):
+        def poster(name, content):
+            created.append((url, name, content))
+            return "T%d" % len(created)
+
+        return poster
+
+    monkeypatch.setattr(mirror.threads, "webhook_poster", fake_webhook_poster)
+
+    posted = []
+    script = []
+
+    def fake_post(url, content, username=None, allowed_mentions=None):
+        posted.append(
+            {
+                "url": url,
+                "content": content,
+                "username": username,
+                "allowed_mentions": allowed_mentions,
+            }
+        )
+        return script.pop(0) if script else True
+
+    monkeypatch.setattr(mirror, "post_content", fake_post)
+
+    class _Board:
+        pass
+
+    b = _Board()
+    b.created, b.posted, b.script = created, posted, script
+    return b
+
+
+def _held(lane=BOARD):
+    with open(mirror._held_path(RUNID, lane)) as fh:
+        return json.load(fh)
+
+
+def _texts(posted):
+    """Every row text that reached Discord, in POST order then line order."""
+    out = []
+    for p in posted:
+        out.extend(p["content"].split("\n"))
+    return out
+
+
+# ---- lane registration ----------------------------------------------------
+
+
+def test_board_lane_uses_the_forum_secret():
+    # Slice 1 kept DISCORD_COMMS_FORUM_WEBHOOK_URL out of LANE_SECRET_VARS
+    # because nothing could post to a forum yet. This slice is what changes
+    # that: the var is now the "board" lane's secret. The lane is named for
+    # what it is to a human (a board), not for Discord's channel type.
+    assert mirror.LANE_SECRET_VARS[BOARD] == mirror.FORUM_SECRET_VAR
+    assert "forum" not in mirror.LANE_SECRET_VARS
+
+
+def test_board_lane_state_dir_is_its_own_and_spelled_once():
+    assert mirror.LANE_STATE_DIRS[BOARD] == "discord-mirror-board"
+    # One spelling: threads.py owns the name (the thread map is its file) and
+    # the mirror imports it, so a cursor and a thread map can never end up in
+    # two different directories.
+    assert mirror.LANE_STATE_DIRS[BOARD] == mirror.threads.STATE_DIRS[BOARD]
+
+
+def test_every_lane_state_dir_is_disjoint():
+    dirs = list(mirror.LANE_STATE_DIRS.values())
+    assert len(set(dirs)) == len(dirs)
+
+
+def test_cli_lane_board_validates_and_names_the_forum_secret(monkeypatch, capsys):
+    monkeypatch.delenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        mirror.main(["mirror.py", "--once", RUNID, "--lane", BOARD])
+    assert exc.value.code == 2
+    assert "DISCORD_COMMS_FORUM_WEBHOOK_URL=" in capsys.readouterr().err
+
+
+def test_board_state_files_all_live_in_the_board_dir():
+    for path in (
+        mirror._cursor_path(RUNID, BOARD),
+        mirror._held_path(RUNID, BOARD),
+        mirror._skipped_path(RUNID, BOARD),
+        mirror._lock_path(RUNID, BOARD),
+        mirror.threads.map_path(BOARD),
+    ):
+        assert os.path.basename(os.path.dirname(path)) == "discord-mirror-board"
+
+
+# ---- a thread that is not alive: held, and the cursor still advances -------
+
+
+def test_board_not_alive_row_is_held_and_the_cursor_advances(board):
+    _append_thread_row("alpha", "one seat talking", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.posted == []          # nothing rendered
+    assert board.created == []         # and no thread created for a dead key
+    assert [r["text"] for r in _held()[DOC]] == ["one seat talking"]
+    cursor = mirror._load_cursor(RUNID, BOARD)
+    assert _cursor_count(cursor, "alpha") == 1
+
+
+def test_board_a_held_row_is_not_held_twice_across_passes(board):
+    _append_thread_row("alpha", "one", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    mirror.run_once(RUNID, lane=BOARD)
+    # The cursor is what stops the re-read; without it the row would be
+    # appended to its bucket again on every single poll, forever.
+    assert [r["text"] for r in _held()[DOC]] == ["one"]
+
+
+def test_board_held_rows_are_stored_as_their_author_wrote_them(board):
+    # The read-time source tag is a fact about THIS machine's disk. Persisting
+    # it would leak it back out when the row is finally posted or replayed.
+    _append_thread_row("alpha", "one", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert swarm_mailbox.SOURCE_KEY not in _held()[DOC][0]
+
+
+def test_board_rows_without_a_thread_are_counted_but_never_posted(board):
+    # Deviation from D1's literal "rows without thread take today's path": a
+    # forum webhook REJECTS a post carrying neither thread_name nor
+    # thread_id, so this lane has no un-threaded path to take. They are
+    # already mirrored by the `all` lane; here they are lane-filtered, which
+    # is the same count-but-skip the convo lane does.
+    _append_raw("alpha", "finding", "no thread on me")
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.posted == []
+    assert not os.path.exists(mirror._held_path(RUNID, BOARD))
+    assert _cursor_count(mirror._load_cursor(RUNID, BOARD), "alpha") == 1
+
+
+# ---- alive: the drain ------------------------------------------------------
+
+
+def test_board_second_seat_drains_the_WHOLE_backlog_in_at_order(board):
+    # THE bug the design note names: posting only the row that tripped
+    # `alive` and leaving the backlog behind. Three earlier rows from alpha
+    # are held; bravo answers; every held row must land, oldest first.
+    for i in range(3):
+        _append_thread_row("alpha", "old %d" % i, at=_at(i * 30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert board.posted == []
+
+    _append_thread_row("bravo", "answering", at=_at(90))
+    _append_thread_row("alpha", "and again", at=_at(120))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac old 0",
+        "\U0001f4ec\U0001f4ac old 1",
+        "\U0001f4ec\U0001f4ac old 2",
+        "\U0001f4ec\U0001f4ac answering",
+        "\U0001f4ec\U0001f4ac and again",
+    ]
+
+
+def test_board_drain_spans_multiple_chunks_because_a_seat_change_forces_one(board):
+    # The backlog spans seats and Discord's webhook `username` is per-POST,
+    # so the drain is necessarily several POSTs, not one.
+    for i in range(3):
+        _append_thread_row("alpha", "old %d" % i, at=_at(i * 30))
+    mirror.run_once(RUNID, lane=BOARD)
+    _append_thread_row("bravo", "answering", at=_at(90))
+    _append_thread_row("alpha", "and again", at=_at(120))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert [p["username"].split(" ")[0] for p in board.posted] == [
+        "alpha",
+        "bravo",
+        "alpha",
+    ]
+
+
+def test_board_a_drained_thread_leaves_an_empty_held_file(board):
+    _append_thread_row("alpha", "a", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert _held() == {}
+
+
+def test_board_posts_into_the_thread_not_the_channel(board):
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert board.created and board.created[0][1] == "comms/docs/plan.md"
+    assert all("thread_id=T1" in p["url"] for p in board.posted)
+
+
+def test_board_every_post_suppresses_mentions(board):
+    # A constant, not a knob: a mailbox row is prose written by an agent, and
+    # a row containing @everyone must never ring a phone.
+    _append_thread_row("alpha", "hey @everyone", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert board.posted
+    assert all(p["allowed_mentions"] == {"parse": []} for p in board.posted)
+
+
+def test_board_thread_title_drops_the_doc_prefix(board):
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert board.created[0][1] == "comms/docs/plan.md"
+
+
+def test_board_reuses_the_thread_across_passes_creating_it_once(board):
+    # FIXED (PR #51 review): this used to hand the second pass a fresh
+    # two-seat exchange, so it proved only that the map is read -- it would
+    # have passed even if alive() were re-required every pass. The single
+    # later row below is what actually tests reuse.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    _append_thread_row("alpha", "c", at=_at(60))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(board.created) == 1
+
+
+# ---- alive is a ONE-WAY transition; the map is its record -----------------
+#
+# Once a document has a thread, it HAS one. The alive predicate decides
+# whether to OPEN a thread, never whether to deliver into one that exists.
+# Re-asking it every pass was the bug: a drained thread's liveness history is
+# gone (the rows left held), so the next single row from one seat would sit
+# in held forever -- breaking README rehearsal step 13 and, worse, doing it
+# silently, since a held row looks exactly like a row that is merely waiting.
+
+
+def test_board_a_single_later_row_lands_in_the_EXISTING_thread(board):
+    # Rehearsal step 13, as a test. One seat, no second speaker, no window:
+    # none of that matters once the thread exists.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    del board.posted[:]
+
+    _append_thread_row("alpha", "a lone follow-up", at=_at(600))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac a lone follow-up"]
+    assert all("thread_id=T1" in p["url"] for p in board.posted)
+    assert _held() == {}
+
+
+def test_board_a_late_row_long_past_the_window_still_lands(board):
+    # The window is about when a conversation STARTS being one, not about
+    # expiring a thread. A day later is still that document's thread.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    del board.posted[:]
+    _append_thread_row("carol", "much later", at="2026-08-29T00:00:00+00:00")
+    mirror.run_once(RUNID, lane=BOARD)
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac much later"]
+
+
+def test_board_an_existing_thread_needs_no_create_call(board):
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    _append_thread_row("alpha", "c", at=_at(60))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(board.created) == 1  # no second create, and no second HTTP call
+
+
+def test_board_a_key_ALREADY_in_the_map_posts_without_ever_going_alive(board):
+    # The map is fleet-wide: another RUN (or another machine's operator) may
+    # have opened this thread. A single row from a single seat in THIS run
+    # then has a destination, and holding it would be holding a row whose
+    # thread is sitting right there.
+    os.makedirs(os.path.dirname(mirror.threads.map_path(BOARD)), exist_ok=True)
+    with open(mirror.threads.map_path(BOARD), "w") as fh:
+        json.dump({DOC: "T-preexisting"}, fh)
+    _append_thread_row("alpha", "solo", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.created == []
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac solo"]
+    assert all("thread_id=T-preexisting" in p["url"] for p in board.posted)
+
+
+def test_board_a_key_with_NO_thread_yet_still_has_to_earn_one(board):
+    # The other half: the transition is one-way, not absent. A document
+    # nobody has answered still does not open a thread.
+    _append_thread_row("alpha", "lonely", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.created == []
+    assert board.posted == []
+    assert [r["text"] for r in _held()[DOC]] == ["lonely"]
+
+
+def test_board_two_documents_get_two_threads(board):
+    other = "doc:comms/README.md"
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    _append_thread_row("alpha", "x", thread=other, at=_at(0))
+    _append_thread_row("bravo", "y", thread=other, at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert sorted(n for _, n, _ in board.created) == [
+        "comms/README.md",
+        "comms/docs/plan.md",
+    ]
+
+
+def test_board_a_dead_thread_is_untouched_while_a_live_one_drains(board):
+    dead = "doc:comms/dead.md"
+    _append_thread_row("alpha", "lonely", thread=dead, at=_at(0))
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac a",
+        "\U0001f4ec\U0001f4ac b",
+    ]
+    assert list(_held()) == [dead]
+
+
+# ---- the per-pass order: held is durable BEFORE the cursor moves -----------
+
+
+def test_board_a_crash_during_the_drain_leaves_held_intact(board, monkeypatch):
+    # The order that defines "held row lost" out of existence: held is
+    # written (step 4) and the cursor saved (step 5) BEFORE any posting, so a
+    # process that dies mid-drain has already recorded what it owes. It
+    # re-posts, at worst; it never forgets.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("killed mid-drain")
+
+    monkeypatch.setattr(mirror.threads, "thread_for", boom)
+    with pytest.raises(RuntimeError):
+        mirror.run_once(RUNID, lane=BOARD)
+    assert [r["text"] for r in _held()[DOC]] == ["a", "b"]
+    assert _cursor_count(mirror._load_cursor(RUNID, BOARD), "alpha") == 1
+
+
+def test_board_a_thread_that_cannot_be_created_keeps_its_rows_held(board, monkeypatch):
+    # D6: thread_for degrades to None on every failure. None means "not
+    # renderable yet", so the rows wait rather than being dropped or posted
+    # somewhere else.
+    monkeypatch.setattr(mirror.threads, "thread_for", lambda *a, **k: None)
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.posted == []
+    assert [r["text"] for r in _held()[DOC]] == ["a", "b"]
+
+
+def test_board_corrupt_held_file_reads_as_empty_and_says_so(board, capsys):
+    os.makedirs(mirror._mirror_dir(BOARD), exist_ok=True)
+    with open(mirror._held_path(RUNID, BOARD), "w") as fh:
+        fh.write("{this is not json")
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac a",
+        "\U0001f4ec\U0001f4ac b",
+    ]
+    assert "held" in capsys.readouterr().err.lower()  # never silent
+
+
+def test_board_held_file_holding_a_non_dict_reads_as_empty(board):
+    os.makedirs(mirror._mirror_dir(BOARD), exist_ok=True)
+    with open(mirror._held_path(RUNID, BOARD), "w") as fh:
+        fh.write(json.dumps(["not", "a", "map"]))
+    _append_thread_row("alpha", "a", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["a"]
+
+
+# ---- the drain rewrites held PER CHUNK ------------------------------------
+
+
+def test_board_a_failed_middle_chunk_reposts_only_its_remainder(board):
+    # The second bug the design note names. Four chunks (a, b, a, b); the
+    # SECOND POST fails. Held must keep only what was never delivered --
+    # chunks 3 and 4 -- so the next pass posts two lines, not six. Dropping
+    # from held after the LAST chunk instead of each one re-posts the whole
+    # backlog; that is a duplicate storm every time one POST 500s.
+    for i, seat in enumerate(("alpha", "bravo", "alpha", "bravo")):
+        _append_thread_row(seat, "row %d" % i, at=_at(i * 30))
+    board.script.extend([True, False])
+    assert mirror.run_once(RUNID, lane=BOARD) == 1  # 1 = something was skipped
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac row 0",
+        "\U0001f4ec\U0001f4ac row 1",
+    ]
+    assert [r["text"] for r in _held()[DOC]] == ["row 2", "row 3"]
+
+    del board.posted[:]
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac row 2",
+        "\U0001f4ec\U0001f4ac row 3",
+    ]
+    assert _held() == {}
+
+
+def test_board_an_undeliverable_chunk_is_recorded_and_never_wedges(board):
+    for i, seat in enumerate(("alpha", "bravo")):
+        _append_thread_row(seat, "row %d" % i, at=_at(i * 30))
+    board.script.append(False)
+    assert mirror.run_once(RUNID, lane=BOARD) == 1
+    with open(mirror._skipped_path(RUNID, BOARD)) as fh:
+        recorded = [json.loads(line) for line in fh if line.strip()]
+    assert [r["row"]["text"] for r in recorded] == ["row 0"]
+    # ...and it is gone from held, so one bad batch cannot block the rest
+    # forever. The skipped file is its durable record.
+    assert [r["text"] for r in _held()[DOC]] == ["row 1"]
+
+
+# ---- the held merge is idempotent ----------------------------------------
+#
+# Kimi's finding on PR #51, and the window nothing else covers: held is
+# written (step 4) BEFORE the cursor is saved (step 5). If the process dies
+# in between -- or _save_cursor itself raises -- the next pass loads the
+# already-held rows AND re-reads the same fresh rows against the OLD cursor,
+# appending a second copy of each. Nothing is lost, but the backlog grows a
+# duplicate per crash and every one of them posts when the document goes
+# alive. The fix is that merging the same row twice is a no-op.
+
+
+def _breakable_cursor_save(monkeypatch):
+    """Make _save_cursor raise while `flag["broken"]` is True, and work
+    normally otherwise. A toggle rather than monkeypatch.undo(): the `board`
+    fixture shares this same monkeypatch instance, so undo() would also rip
+    out the fake poster and let a test reach for the network."""
+    flag = {"broken": True}
+    real = mirror._save_cursor
+
+    def maybe(*args, **kwargs):
+        if flag["broken"]:
+            raise OSError("cursor save failed")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mirror, "_save_cursor", maybe)
+    return flag
+
+
+def test_board_a_cursor_save_failure_does_not_duplicate_held_rows(board, monkeypatch):
+    _append_thread_row("alpha", "one", at=_at(0))
+    flag = _breakable_cursor_save(monkeypatch)
+    with pytest.raises(OSError):
+        mirror.run_once(RUNID, lane=BOARD)
+    assert [r["text"] for r in _held()[DOC]] == ["one"]  # held survived
+
+    flag["broken"] = False
+    # The cursor never advanced, so this pass re-reads the very same row.
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["one"]
+
+
+def test_board_a_row_re_read_after_a_cursor_failure_posts_ONCE(board, monkeypatch):
+    # The consequence a human would actually see: the duplicate is not just
+    # a bigger file, it is a doubled message in the thread.
+    _append_thread_row("alpha", "one", at=_at(0))
+    flag = _breakable_cursor_save(monkeypatch)
+    with pytest.raises(OSError):
+        mirror.run_once(RUNID, lane=BOARD)
+    flag["broken"] = False
+
+    _append_thread_row("bravo", "two", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac one",
+        "\U0001f4ec\U0001f4ac two",
+    ]
+
+
+def test_board_repeated_cursor_failures_do_not_compound(board, monkeypatch):
+    _append_thread_row("alpha", "one", at=_at(0))
+    _breakable_cursor_save(monkeypatch)
+    for _ in range(3):
+        with pytest.raises(OSError):
+            mirror.run_once(RUNID, lane=BOARD)
+    assert [r["text"] for r in _held()[DOC]] == ["one"]
+
+
+def test_board_two_genuinely_distinct_rows_are_both_kept(board):
+    # The other direction, and the reason the identity includes `at`: dedupe
+    # must not swallow a real second row. Two seats, same text, same instant.
+    _append_thread_row("alpha", "same words", at=_at(0))
+    _append_thread_row("bravo", "same words", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(_held()[DOC]) == 2
+
+
+def test_board_one_seat_repeating_itself_later_keeps_both_rows(board):
+    _append_thread_row("alpha", "ping", at=_at(0))
+    _append_thread_row("alpha", "ping", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(_held()[DOC]) == 2
+
+
+# ---- durable ordering: fsync before replace, for both state files --------
+#
+# The whole crash-safety argument is "held is durable BEFORE the cursor
+# moves". Ordering two Python writes does not order two DISK writes: after
+# os.replace returns, both files can still be dirty page cache, and a power
+# loss is free to keep the newer cursor while losing the held file it depends
+# on -- which loses rows permanently, the one failure this lane refuses.
+
+
+class _SyncSpy:
+    """Records writable opens, fsyncs and renames PER FILE, delegating to the
+    real calls so the writes still happen.
+
+    PER FILE IS THE WHOLE POINT (delta-verify on PR #51). The first version of
+    this spy asked "did any fsync happen before this replace", which three
+    separate files satisfy with ONE fsync between them: a pass writes held,
+    then the cursor, then the thread map, so the held file's fsync sat before
+    every later rename and the two later assertions were vacuous. Mutation
+    proved it -- deleting the fsync from threads._save_map left all six of
+    these tests green. A gate that inspects the wrong subject passes for
+    reasons that have nothing to do with the thing it names.
+
+    The question is now: for the temp file THIS rename is promoting, was there
+    an fsync on THAT file's own descriptor, after it was opened and before it
+    was renamed? Descriptor numbers are reused after a close, which is why the
+    match walks the events in order and pairs a rename with the LAST open of
+    its source path.
+    """
+
+    def __init__(self, monkeypatch):
+        self.events = []  # ("open", path, fd) | ("fsync", fd) | ("replace", src, dst)
+        real_open = builtins.open
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if any(c in mode for c in "wax+"):
+                try:
+                    self.events.append(("open", os.fspath(file), fh.fileno()))
+                except (TypeError, ValueError, OSError):
+                    pass  # opened on an fd, or not a real file
+            return fh
+
+        def spy_fsync(fd):
+            self.events.append(("fsync", fd))
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            self.events.append(("replace", os.fspath(src), os.fspath(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(builtins, "open", spy_open)
+        monkeypatch.setattr(os, "fsync", spy_fsync)
+        monkeypatch.setattr(os, "replace", spy_replace)
+
+    def _replace_index(self, name):
+        for i, ev in enumerate(self.events):
+            if ev[0] == "replace" and name in os.path.basename(ev[2]):
+                return i
+        raise AssertionError(
+            "no os.replace of a file named %r happened at all, so this test "
+            "proved nothing about durability. Events: %r" % (name, self.events)
+        )
+
+    def durably_renamed(self, name):
+        """True if the temp file promoted into `name` was fsynced on ITS OWN
+        descriptor, between its own open and its rename."""
+        idx = self._replace_index(name)
+        src = self.events[idx][1]
+        opened_at, fd = None, None
+        for i, ev in enumerate(self.events[:idx]):
+            if ev[0] == "open" and ev[1] == src:
+                opened_at, fd = i, ev[2]  # last open of this path wins
+        if opened_at is None:
+            return False
+        return any(
+            ev[0] == "fsync" and ev[1] == fd
+            for ev in self.events[opened_at + 1: idx]
+        )
+
+
+def test_held_file_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.durably_renamed(".held.json")
+
+
+def test_cursor_file_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.durably_renamed(".cursor.json")
+
+
+def test_the_default_lanes_cursor_is_fsynced_too(webhook, monkeypatch):
+    # Same argument, older file: the skipped log already fsyncs before the
+    # cursor moves past a row, which only helps if the cursor write itself
+    # is durable in the same sense.
+    posted = []
+    _fake_post(monkeypatch, posted)
+    spy = _SyncSpy(monkeypatch)
+    swarm_mailbox.post(RUNID, "alpha", "finding", "a row")
+    mirror.run_once(RUNID)
+    assert spy.durably_renamed(".cursor.json")
+
+
+def test_thread_map_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
+    spy = _SyncSpy(monkeypatch)
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert spy.durably_renamed("threads.json")
+
+
+def test_held_write_survives_a_directory_that_cannot_be_fsynced(board, monkeypatch):
+    # Some filesystems refuse an fsync on a directory fd. That must degrade
+    # to "no directory fsync", never to a lost write: the file rename has
+    # already happened by then.
+    real_fsync = os.fsync
+
+    def picky(fd):
+        if os.fstat(fd).st_mode & 0o040000:  # a directory
+            raise OSError("no fsync on directories here")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", picky)
+    _append_thread_row("alpha", "held row", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["held row"]
+
+
+# ---- the hold cap ---------------------------------------------------------
+
+
+def test_board_hold_cap_drops_the_oldest_and_records_them(board, monkeypatch, capsys):
+    monkeypatch.setenv("COMMS_THREAD_HOLD_MAX", "2")
+    for i in range(4):
+        _append_thread_row("alpha", "row %d" % i, at=_at(i * 30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["row 2", "row 3"]
+    with open(mirror._skipped_path(RUNID, BOARD)) as fh:
+        recorded = [json.loads(line) for line in fh if line.strip()]
+    assert [r["row"]["text"] for r in recorded] == ["row 0", "row 1"]
+    assert capsys.readouterr().err  # loud, never a silent truncation
+
+
+def test_board_hold_cap_default_is_500():
+    assert mirror.HOLD_MAX_DEFAULT == 500
+
+
+# ---- the alive knobs pass through -----------------------------------------
+
+
+def test_board_alive_seats_knob_can_demand_three_speakers(board, monkeypatch):
+    monkeypatch.setenv("COMMS_THREAD_ALIVE_SEATS", "3")
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.posted == []
+    _append_thread_row("carol", "c", at=_at(60))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert len(_texts(board.posted)) == 3
+
+
+def test_board_alive_seconds_knob_narrows_the_window(board, monkeypatch):
+    monkeypatch.setenv("COMMS_THREAD_ALIVE_SECONDS", "10")
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))  # 30s apart, window is 10s
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.posted == []
+
+
+def test_board_alive_defaults_match_the_config_table():
+    assert mirror.ALIVE_SECONDS_DEFAULT == 1800
+    assert mirror.ALIVE_SEATS_DEFAULT == 2
+    assert swarm_threads.DEFAULT_WINDOW_S == mirror.ALIVE_SECONDS_DEFAULT
+    assert swarm_threads.DEFAULT_MIN_SEATS == mirror.ALIVE_SEATS_DEFAULT
+
+
+def test_board_a_junk_knob_value_falls_back_to_the_default(board, monkeypatch):
+    # A typo in a launchd plist must not take the lane down.
+    monkeypatch.setenv("COMMS_THREAD_ALIVE_SEATS", "two")
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert len(_texts(board.posted)) == 2
+
+
+# ---- seat collisions are named, once per pass -----------------------------
+
+
+def test_board_pass_names_a_seat_collision_once(board, capsys):
+    swarm_arm.arm(RUNID)
+    swarm_arm.enroll(RUNID, "agent-a", seat="alpha")
+    swarm_arm.enroll(RUNID, "agent-b", seat="alpha")
+    _append_thread_row("alpha", "a", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    err = capsys.readouterr().err
+    assert err.count("alpha") >= 1
+    assert len([ln for ln in err.splitlines() if "seat" in ln.lower()]) == 1
+
+
+def test_a_clean_roster_says_nothing(board, capsys):
+    swarm_arm.arm(RUNID)
+    swarm_arm.enroll(RUNID, "agent-a", seat="alpha")
+    _append_thread_row("alpha", "a", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert "collision" not in capsys.readouterr().err.lower()
