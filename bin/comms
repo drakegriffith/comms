@@ -36,7 +36,20 @@ usage: comms <subcommand> [args ...]
 mailbox (lib/swarm_mailbox.py; exit 0 ok, 1 bad args, 2 usage):
   init      <runid>
   subscribe <runid> <seat> <topic> [<topic> ...]
-  post      <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]
+  post      <runid> <seat> <kind> <text> [--topic <name> | --to <seat>] [--thread <key>]
+  post      <kind> <text> [--topic <name> | --to <seat>] [--thread <key>]
+            (SHORT FORM, no explicit <runid>/<seat>: this wrapper fills them
+             from COMMS_RUN (default machine-ops) and COMMS_SEAT (default:
+             this session's own ambient seat, resolved the SAME way
+             sendmessage-bridge.sh resolves it -- via CLAUDE_SESSION_ID's
+             enrollment in machine-ops -- never a second derivation). Used to
+             reply into a thread a peer's row named: swarm-heartbeat.sh
+             suffixes an injected row with " (thread <key>)" when it carries
+             one, and `--thread <key>` on the reply below carries that key
+             back, so both sides render under the same thread:
+               comms post reply --to <seat> --thread <key> "<text>"
+             The 4-positional form above still works when <runid>/<seat> are
+             given explicitly.)
   read      <runid> <seat> [--topic <name>] [--replay]
             (NEW rows only: a per-(runid, seat, filter) cursor under
              COMMS_STATE_DIR advances once the rows are printed.
@@ -74,12 +87,66 @@ EOF
   exit 2
 }
 
+# This session's own seat, resolved EXACTLY the way
+# adapters/claude-code/ambient/sendmessage-bridge.sh resolves it (a single
+# swarm_arm.participant_sub lookup on CLAUDE_SESSION_ID) -- not a second,
+# possibly-diverging derivation. Empty output means unresolvable (no session
+# id, or that session id is not enrolled in <runid>).
+_comms_default_seat() {  # _comms_default_seat <runid>
+  local runid="$1"
+  local agent="${CLAUDE_SESSION_ID:-}"
+  [ -n "$agent" ] || return 0
+  local state_dir="${COMMS_STATE_DIR:-$HOME/.comms/state}"
+  COMMS_CDS_LIB="$LIB" COMMS_CDS_STATE="$state_dir" COMMS_CDS_RUN="$runid" \
+  COMMS_CDS_AGENT="$agent" python3 - <<'PY'
+import os
+import sys
+sys.path.insert(0, os.environ.get("COMMS_CDS_LIB") or "")
+import swarm_arm
+_topics, seat = swarm_arm.participant_sub(
+    os.environ.get("COMMS_CDS_RUN"),
+    os.environ.get("COMMS_CDS_AGENT"),
+    state_dir=os.environ.get("COMMS_CDS_STATE"),
+)
+sys.stdout.write(seat or "")
+PY
+}
+
 [ "$#" -ge 1 ] || usage
 sub="$1"
 shift
 
 case "$sub" in
-  init|subscribe|post|read|cursor)
+  post)
+    # SHORT FORM (issue #41): `comms post <kind> <text> [flags]` with no
+    # explicit <runid>/<seat> -- count POSITIONAL (non-flag) args; the module
+    # needs exactly 4 (runid seat kind text). Exactly 2 means runid/seat were
+    # omitted, so fill them from env defaults. Any other count (0, 1, 3, 4+)
+    # passes through unchanged, so the pre-#41 explicit form and the module's
+    # own usage errors are untouched.
+    n=0
+    skip=0
+    for a in "$@"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      case "$a" in
+        --topic|--to|--thread) skip=1 ;;
+        --*) ;;
+        *) n=$((n + 1)) ;;
+      esac
+    done
+    if [ "$n" -eq 2 ]; then
+      run="${COMMS_RUN:-machine-ops}"
+      seat="${COMMS_SEAT:-}"
+      [ -n "$seat" ] || seat="$(_comms_default_seat "$run")"
+      if [ -z "$seat" ]; then
+        printf 'comms: post short form needs COMMS_SEAT, or an enrolled CLAUDE_SESSION_ID\n' >&2
+        exit 1
+      fi
+      exec python3 "$LIB/swarm_mailbox.py" post "$run" "$seat" "$@"
+    fi
+    exec python3 "$LIB/swarm_mailbox.py" post "$@"
+    ;;
+  init|subscribe|read|cursor)
     exec python3 "$LIB/swarm_mailbox.py" "$sub" "$@"
     ;;
   subs)
