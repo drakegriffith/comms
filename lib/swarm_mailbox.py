@@ -78,15 +78,24 @@ COMMS_ROOT was (or was not) set before the first import, so a caller that sets
 COMMS_ROOT afterward -- the normal case for a test fixture or a per-invocation
 env override -- would silently keep discovering runs in the wrong root.
 
+THE CLI READ IS INCREMENTAL. `read` hands a seat only the rows it has not been
+handed before and remembers the position in COMMS_STATE_DIR, so a poll loop that
+reads after every work step sees each row once instead of re-reading the whole
+board (which grows without bound and floods the reader's context). Pass --replay
+for the old whole-board behavior -- see the CLI READ CURSOR section below for
+what the cursor is keyed on and when it moves.
+
 CLI:
   swarm_mailbox.py init <runid>
   swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]      # register a seat's topic set
   swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]  # kind: finding|claim|blocker|comment|reply|status
-  swarm_mailbox.py read <runid> <seat> [--topic <name>]               # rows from every OTHER seat (one topic or all)
+  swarm_mailbox.py read <runid> <seat> [--topic <name>]               # NEW rows from every OTHER seat (one topic or all)
   swarm_mailbox.py read <runid> <seat> --subs                          # only this seat's subscribed slice + its unicasts
+  swarm_mailbox.py read <runid> <seat> --replay                        # every row again; cursor neither read nor moved
 """
 
 import datetime
+import hashlib
 import json
 import os
 import sys
@@ -441,17 +450,156 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
     return fresh, new_cursor
 
 
-def _extract_flags(args):
-    """Pull optional `--topic <name>`, `--to <seat>`, and boolean `--subs` out of
-    a positional arg list.
+# ---- CLI READ CURSOR -------------------------------------------------------
+#
+# WHY THE CURSOR SITS AT THE CLI AND NOT INSIDE read_siblings/read_for:
+#   those two are pure queries, and three in-repo readers already keep their
+#   OWN cursor over them on their own key and their own schedule -- the discord
+#   mirror (per run+lane), the remote sync (per host+run), the Claude Code
+#   heartbeat (per run+agent_id). A stateful query would advance all of those
+#   cursors out from under their owners. The CLI is where an agent's poll
+#   happens, so the CLI is where "what have I already been handed" belongs.
+#
+# ONE CURSOR PER VIEW, NOT PER SEAT:
+#   a read is keyed on (runid, seat, VIEW), where the view is the filter that
+#   read used: the whole board, one --topic, or the seat's --subs slice. The
+#   alternative -- one cursor per (runid, seat) advanced over every row the
+#   reader saw, which is what fresh_rows_by_seat's `keep` predicate is for --
+#   would let `read RUN seat --topic parser` mark rows on OTHER topics
+#   delivered, and those rows would then never appear in a later unfiltered
+#   read. Dropping a row invisibly is the one failure this mailbox refuses;
+#   handing the same row to two different views is merely redundant. So the
+#   cursor advances ONLY over the rows the chosen view actually selected.
+#   Consequence, and it is intended: a row inside topic X is delivered once to
+#   `read RUN seat` and once to `read RUN seat --topic X`. Pick one view per
+#   reader and stay on it.
+#
+# THE SUBS VIEW IS KEYED ON THE SUBSCRIPTION SET ITSELF (a digest of it), so
+#   re-subscribing a seat to a different topic set starts that set's own
+#   cursor at zero and re-delivers its slice, rather than silently skipping
+#   rows that predate the change (a count cursor cannot tell "row 3 of seatA
+#   in the old slice" from "row 3 in the new one").
+READ_CURSOR_SUBDIR = "read-cursor"
 
-    Returns (remaining_args, {topic, to, subs}). Flags may appear anywhere;
-    existing calls that pass none are untouched, so the fixed-arity checks below
-    still hold for the common case.
+
+def _state_dir():
+    """The machine-local state root (cursors live here), read at CALL TIME.
+
+    Same footgun as _root(): an import-time snapshot would pin whatever
+    COMMS_STATE_DIR was set before the first import and silently ignore a
+    later override, which is exactly how a test would write cursors into the
+    live state dir. Same default chain as lib/swarm_arm.py and the adapters so
+    every comms component keeps its state under one root. No legacy fallback
+    name on purpose: this cursor is new state, it never existed under a
+    pre-extraction name.
+    """
+    return os.environ.get("COMMS_STATE_DIR") or os.path.expanduser("~/.comms/state")
+
+
+def _slug(text):
+    """One filename-safe path segment for an arbitrary selector string.
+
+    Readable when the selector is already a plain name (the common case: a
+    runid or a topic like "parser-work"), and disambiguated with a short digest
+    when it is not, so two DIFFERENT selectors can never land on one cursor
+    file. Sharing a cursor between two views is the silent-drop bug this whole
+    section exists to avoid, and "a@b" and "a_b" flattening onto one file would
+    be exactly that.
+    """
+    safe = "".join(c if (c.isalnum() or c in "-_.@") else "_" for c in text)
+    if safe != text or not safe:
+        safe = (safe or "x") + "-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return safe
+
+
+def _read_cursor_path(runid, seat, view):
+    return os.path.join(
+        _state_dir(),
+        READ_CURSOR_SUBDIR,
+        _slug(runid),
+        "%s.%s.json" % (_slug(seat), view),
+    )
+
+
+def _load_read_cursor(path):
+    """The persisted {seat: count} map, or {} when there is none yet.
+
+    An unreadable or malformed cursor file reads as {} -- i.e. replay the view
+    from the start. That direction is deliberate: the recoverable failure is
+    seeing a row twice, the unrecoverable one is never seeing it.
+    """
+    try:
+        with open(path) as fh:
+            cursor = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return cursor if isinstance(cursor, dict) else {}
+
+
+def _save_read_cursor(path, cursor):
+    """Persist the cursor atomically: tmp + os.replace, tmp name PID-suffixed
+    so two concurrent readers of one view never collide on the tmp file. Same
+    shape as the discord mirror's and the remote sync's cursor writes."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp." + str(os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(cursor, fh)
+    os.replace(tmp, path)
+
+
+def read_delta(runid, seat, topic=None, subs=False):
+    """The rows this seat has NOT been handed yet in this view, plus the
+    callable that records having handed them over.
+
+    behavior: selects rows exactly as the equivalent whole-board read would
+      (read_for when subs, else read_siblings with the optional topic filter),
+      then keeps only the ones past this view's persisted per-seat counts. The
+      returned `advance` writes the new cursor; nothing is written until it is
+      called, so a caller delivers the rows FIRST and commits after. A crash
+      between the two re-delivers on the next read (visible), where committing
+      first would lose the rows (invisible).
+    in: runid; seat, the reader; topic, an optional single-topic filter; subs,
+      True to read the seat's subscribed slice instead.
+    out: (rows, advance). rows is the fresh slice, sorted by `at`; advance is a
+      zero-argument callable, safe to skip if the rows were not delivered.
+    side effects: none until advance() is called, which creates
+      <COMMS_STATE_DIR>/read-cursor/<runid>/ and writes one file.
+    errors: none here; advance() raises OSError if the state dir is not
+      writable (the caller decides whether that is fatal -- for the CLI it is
+      not, the rows were already printed and will simply replay).
+    """
+    if subs:
+        rows = read_for(runid, seat)
+        registered = subscriptions(runid, seat)
+        selector = "null" if registered is None else json.dumps(sorted(registered))
+        view = "subs-" + hashlib.sha1(selector.encode("utf-8")).hexdigest()[:12]
+    elif topic is not None:
+        rows = read_siblings(runid, seat, topic=topic)
+        view = "topic-" + _slug(topic)
+    else:
+        rows = read_siblings(runid, seat)
+        view = "all"
+    path = _read_cursor_path(runid, seat, view)
+    fresh, new_cursor = fresh_rows_by_seat(rows, _load_read_cursor(path))
+
+    def advance():
+        _save_read_cursor(path, new_cursor)
+
+    return fresh, advance
+
+
+def _extract_flags(args):
+    """Pull optional `--topic <name>`, `--to <seat>`, and the booleans `--subs`
+    and `--replay` out of a positional arg list.
+
+    Returns (remaining_args, {topic, to, subs, replay}). Flags may appear
+    anywhere; existing calls that pass none are untouched, so the fixed-arity
+    checks below still hold for the common case.
     """
     topic = None
     to = None
     subs = False
+    replay = False
     out = []
     i = 0
     while i < len(args):
@@ -471,9 +619,45 @@ def _extract_flags(args):
             subs = True
             i += 1
             continue
+        if args[i] == "--replay":
+            replay = True
+            i += 1
+            continue
         out.append(args[i])
         i += 1
-    return out, {"topic": topic, "to": to, "subs": subs}
+    return out, {"topic": topic, "to": to, "subs": subs, "replay": replay}
+
+
+def _cmd_read(runid, seat, topic=None, subs=False, replay=False):
+    """The CLI's read: print this seat's NEW rows as JSONL, then advance the
+    cursor for the view that was read.
+
+    PRINT FIRST, COMMIT AFTER (the heartbeat and the remote sync order their
+    writes the same way, for the same reason): if this process dies between the
+    two, the rows replay next time -- visible and recoverable -- where the
+    other order would drop rows that were never delivered.
+
+    A cursor that cannot be written is a WARNING, not a failure: the rows did
+    reach stdout, so the read succeeded; only the "do not replay" promise is
+    unmet, and saying so on stderr beats both a silent skip and an exit code
+    that tells the caller a successful read failed.
+    """
+    if replay:
+        rows = read_for(runid, seat) if subs else read_siblings(runid, seat, topic=topic)
+        advance = None
+    else:
+        rows, advance = read_delta(runid, seat, topic=topic, subs=subs)
+    for row in rows:
+        print(json.dumps(row))
+    sys.stdout.flush()
+    if advance is not None:
+        try:
+            advance()
+        except OSError as exc:
+            sys.stderr.write(
+                "warning: read cursor not saved (%s); these rows will replay\n" % exc
+            )
+    return 0
 
 
 def main(argv):
@@ -482,13 +666,14 @@ def main(argv):
             "usage: swarm_mailbox.py init <runid>\n"
             "       swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]\n"
             "       swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]\n"
-            "       swarm_mailbox.py read <runid> <seat> [--topic <name> | --subs]\n"
+            "       swarm_mailbox.py read <runid> <seat> [--topic <name> | --subs] [--replay]\n"
         )
         return 2
     cmd = argv[1]
     try:
         rest, flags = _extract_flags(argv[2:])
         topic, to, subs = flags["topic"], flags["to"], flags["subs"]
+        replay = flags["replay"]
         if cmd == "init":
             if len(rest) != 1:
                 raise ValueError("init needs <runid>")
@@ -509,15 +694,11 @@ def main(argv):
         if cmd == "read":
             if len(rest) != 2:
                 raise ValueError("read needs <runid> <seat>")
-            if subs:
-                if topic is not None:
-                    raise ValueError("pass either --topic or --subs, not both")
-                rows = read_for(rest[0], rest[1])
-            else:
-                rows = read_siblings(rest[0], rest[1], topic=topic)
-            for row in rows:
-                print(json.dumps(row))
-            return 0
+            if subs and topic is not None:
+                raise ValueError("pass either --topic or --subs, not both")
+            return _cmd_read(
+                rest[0], rest[1], topic=topic, subs=subs, replay=replay
+            )
     except ValueError as exc:
         sys.stderr.write(str(exc) + "\n")
         return 1

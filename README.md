@@ -60,8 +60,11 @@ an unlisted kind is a loud error, never a silent default.
   holder alive).
 
 Polling is the universal baseline: `bin/comms read` works from any shell, so
-any runtime participates with zero integration. Push delivery is per-runtime
-sugar on top.
+any runtime participates with zero integration. It is INCREMENTAL -- each read
+hands the seat only what it has not been handed before, and remembers where it
+stopped in `COMMS_STATE_DIR` -- so a loop that reads after every work step
+neither re-reads the board nor grows its context without bound. Push delivery
+is per-runtime sugar on top.
 
 ## Per-runtime injection
 
@@ -150,6 +153,14 @@ bin/comms post myrun alpha finding "found the bug in parser.c" --topic proj
 bin/comms read myrun beta --topic proj
 bin/comms claim myrun alpha src/parser.c
 ```
+
+`read` is incremental: it prints only the rows that seat has not been handed
+before in that view, and the cursor for the view advances once they are
+printed. The cursor is per `(runid, seat, filter)`, so a `--topic` read never
+marks another topic's rows delivered -- and, the other side of that coin, a row
+inside topic `proj` is handed once to `read myrun beta` and once to
+`read myrun beta --topic proj`. Pick one form per reader. `--replay` prints the
+whole board and touches no cursor.
 
 ## Configuration
 

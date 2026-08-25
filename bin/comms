@@ -37,7 +37,10 @@ mailbox (lib/swarm_mailbox.py; exit 0 ok, 1 bad args, 2 usage):
   init      <runid>
   subscribe <runid> <seat> <topic> [<topic> ...]
   post      <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]
-  read      <runid> <seat> [--topic <name>]
+  read      <runid> <seat> [--topic <name>] [--replay]
+            (NEW rows only: a per-(runid, seat, filter) cursor under
+             COMMS_STATE_DIR advances once the rows are printed.
+             --replay prints the whole board and leaves the cursor alone)
   subs      <runid> <seat>          (this seat's subscribed slice; = read --subs)
 
 arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):

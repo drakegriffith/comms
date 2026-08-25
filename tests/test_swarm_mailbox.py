@@ -308,6 +308,168 @@ class TestSubscriptions(unittest.TestCase):
         self.assertEqual(texts, {"in A", "hi all", "direct"})   # NOT "in B"
 
 
+class TestReadCursor(unittest.TestCase):
+    """The CLI read hands each row over ONCE (issue #33).
+
+    The defect these pin: `comms read` called read_siblings/read_for directly
+    and kept no cursor at all, so a second consecutive read for the same
+    (runid, seat) replayed everything -- while two adapter READMEs promised
+    "repeated reads never replay old rows". Every assertion below fails
+    against that code.
+    """
+
+    def setUp(self):
+        # Both knobs come from conftest.py's autouse isolation fixture: the
+        # mailbox under COMMS_ROOT, the cursor under COMMS_STATE_DIR.
+        self.tmp = os.environ["COMMS_ROOT"]
+        self.state = os.environ["COMMS_STATE_DIR"]
+
+    def _drain(self, runid, seat, **kw):
+        """One complete read: take the fresh rows AND commit the cursor."""
+        rows, advance = mb.read_delta(runid, seat, **kw)
+        advance()
+        return [r["text"] for r in rows]
+
+    def test_second_read_returns_nothing_new(self):
+        mb.post("test-rc1", "alpha", "finding", "first row")
+        self.assertEqual(self._drain("test-rc1", "reader"), ["first row"])
+        self.assertEqual(self._drain("test-rc1", "reader"), [])
+
+    def test_only_rows_posted_after_the_cursor_come_back(self):
+        mb.post("test-rc2", "alpha", "finding", "old")
+        self._drain("test-rc2", "reader")
+        mb.post("test-rc2", "alpha", "finding", "new")
+        self.assertEqual(self._drain("test-rc2", "reader"), ["new"])
+
+    def test_cursor_is_per_seat_not_per_run(self):
+        # One seat draining the board must not consume another seat's mail.
+        mb.post("test-rc3", "alpha", "finding", "shared")
+        self.assertEqual(self._drain("test-rc3", "readerA"), ["shared"])
+        self.assertEqual(self._drain("test-rc3", "readerB"), ["shared"])
+
+    def test_rows_not_committed_are_delivered_again(self):
+        # advance() is the caller's "I delivered these"; skipping it (a crash
+        # mid-print) must re-deliver, never drop.
+        mb.post("test-rc4", "alpha", "finding", "undelivered")
+        rows, _advance = mb.read_delta("test-rc4", "reader")
+        self.assertEqual([r["text"] for r in rows], ["undelivered"])
+        self.assertEqual(self._drain("test-rc4", "reader"), ["undelivered"])
+
+    def test_topic_read_does_not_consume_other_topics(self):
+        # THE FILTER INTERACTION: a --topic read advances only ITS view's
+        # cursor. If it advanced one shared cursor over every row it walked
+        # past, "off-topic" would be marked delivered here and never appear in
+        # any later read -- a row lost with no error anywhere.
+        mb.post("test-rc5", "alpha", "finding", "on-topic", topic="proj")
+        mb.post("test-rc5", "alpha", "finding", "off-topic", topic="other")
+        self.assertEqual(self._drain("test-rc5", "reader", topic="proj"), ["on-topic"])
+        self.assertEqual(self._drain("test-rc5", "reader", topic="proj"), [])
+        self.assertEqual(
+            sorted(self._drain("test-rc5", "reader")), ["off-topic", "on-topic"]
+        )
+
+    def test_each_topic_keeps_its_own_cursor(self):
+        mb.post("test-rc6", "alpha", "finding", "a1", topic="a")
+        mb.post("test-rc6", "alpha", "finding", "b1", topic="b")
+        self.assertEqual(self._drain("test-rc6", "reader", topic="a"), ["a1"])
+        self.assertEqual(self._drain("test-rc6", "reader", topic="b"), ["b1"])
+
+    def test_subs_view_has_its_own_cursor(self):
+        mb.subscribe("test-rc7", "reader", ["proj"])
+        mb.post("test-rc7", "alpha", "finding", "mine", topic="proj")
+        mb.post("test-rc7", "alpha", "finding", "theirs", topic="elsewhere")
+        self.assertEqual(self._drain("test-rc7", "reader", subs=True), ["mine"])
+        self.assertEqual(self._drain("test-rc7", "reader", subs=True), [])
+        # The unfiltered view never saw either row, so it still gets both.
+        self.assertEqual(
+            sorted(self._drain("test-rc7", "reader")), ["mine", "theirs"]
+        )
+
+    def test_resubscribing_redelivers_the_new_slice(self):
+        # A count cursor cannot tell "row 2 of alpha in the old slice" from
+        # "row 2 in the new one", so the subs cursor is keyed on the
+        # subscription set itself: widening it re-delivers rather than
+        # silently skipping rows that predate the change.
+        mb.subscribe("test-rc8", "reader", ["proj"])
+        mb.post("test-rc8", "alpha", "finding", "in-proj", topic="proj")
+        mb.post("test-rc8", "alpha", "finding", "in-ops", topic="ops")
+        self.assertEqual(self._drain("test-rc8", "reader", subs=True), ["in-proj"])
+        mb.subscribe("test-rc8", "reader", ["proj", "ops"])
+        self.assertEqual(
+            sorted(self._drain("test-rc8", "reader", subs=True)),
+            ["in-ops", "in-proj"],
+        )
+
+    def test_cursor_state_lives_under_the_state_dir(self):
+        mb.post("test-rc9", "alpha", "finding", "x")
+        self._drain("test-rc9", "reader")
+        found = []
+        for dirpath, _dirnames, filenames in os.walk(self.state):
+            found.extend(os.path.join(dirpath, f) for f in filenames)
+        self.assertTrue(found, "read_delta wrote no cursor under COMMS_STATE_DIR")
+        self.assertTrue(
+            all(p.startswith(self.state) for p in found),
+            "cursor written outside COMMS_STATE_DIR: %s" % found,
+        )
+        # And nothing landed in the mailbox root: cursors are machine-local
+        # state, not mailbox content the remote sync would mirror.
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["comms-test-rc9"])
+
+    def test_no_cursor_is_written_before_the_rows_are_taken(self):
+        mb.post("test-rc10", "alpha", "finding", "x")
+        mb.read_delta("test-rc10", "reader")
+        self.assertEqual(os.listdir(self.state), [])
+
+
+class TestReadCursorCLI(unittest.TestCase):
+    """The two-read reproduction from issue #33, at the level it was reported:
+    the CLI, one process per read, cursor surviving between them."""
+
+    def setUp(self):
+        self.env = dict(os.environ)  # already isolated by conftest.py
+        self.script = os.path.join(_LIB, "swarm_mailbox.py")
+
+    def _run(self, args):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, self.script] + args,
+            capture_output=True, text=True, env=self.env,
+        )
+
+    def _texts(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [json.loads(l)["text"] for l in result.stdout.splitlines() if l.strip()]
+
+    def test_two_consecutive_reads_do_not_replay(self):
+        self._run(["post", "test-cli1", "alpha", "finding", "row one"])
+        self.assertEqual(self._texts(self._run(["read", "test-cli1", "rd"])), ["row one"])
+        self.assertEqual(self._texts(self._run(["read", "test-cli1", "rd"])), [])
+
+    def test_replay_flag_returns_everything_and_moves_nothing(self):
+        self._run(["post", "test-cli2", "alpha", "finding", "row one"])
+        self._run(["read", "test-cli2", "rd"])                      # cursor to end
+        replayed = self._texts(self._run(["read", "test-cli2", "rd", "--replay"]))
+        self.assertEqual(replayed, ["row one"])
+        # --replay neither consumed the row nor rewound the cursor.
+        self.assertEqual(self._texts(self._run(["read", "test-cli2", "rd"])), [])
+
+    def test_replay_before_any_incremental_read_leaves_the_cursor_unset(self):
+        self._run(["post", "test-cli3", "alpha", "finding", "row one"])
+        self.assertEqual(
+            self._texts(self._run(["read", "test-cli3", "rd", "--replay"])), ["row one"]
+        )
+        # An auditor's --replay must not eat a real reader's first delivery.
+        self.assertEqual(
+            self._texts(self._run(["read", "test-cli3", "rd"])), ["row one"]
+        )
+
+    def test_subs_and_topic_together_still_refused(self):
+        r = self._run(["read", "test-cli4", "rd", "--subs", "--topic", "x"])
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not both", r.stderr)
+
+
 class TestConvoKinds(unittest.TestCase):
     """CONVO_KINDS is the kind-half of the discord mirror's convo-lane
     predicate (S5): it must never name a kind VALID_KINDS does not allow,
