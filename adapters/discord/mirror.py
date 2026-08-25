@@ -139,9 +139,12 @@ import urllib.request
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+sys.path.insert(0, SELF_DIR)  # so `import threads` works however this is loaded
 import comms_machine  # noqa: E402  (machine_label, re-exported below)
 import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
+import swarm_threads  # noqa: E402  (the alive predicate; shared with bin/comms)
+import threads  # noqa: E402  (the thread map; see BOARD LANE below)
 
 # Reserved observer seat name handed to read_siblings so the mirror sees every
 # REAL seat's rows (read_siblings excludes only the named seat's own file).
@@ -154,30 +157,79 @@ MAX_RETRIES = 3  # additional attempts after the first
 SECRET_VAR = "DISCORD_COMMS_WEBHOOK_URL"
 DEFAULT_LANE = "all"
 
-# The forum board's webhook var. Resolved through the SAME env-or-secrets
-# path as the lane vars below (see _find_webhook_url_for_var), but
-# deliberately NOT a lane: it is absent from LANE_SECRET_VARS and
-# LANE_STATE_DIRS, so it has no cursor/state dir and --lane forum is
-# rejected by the CLI's LANE_SECRET_VARS membership check. Forum posts
-# need thread_name / ?thread_id=, which slice 2 (issue #39/#40) owns --
-# folding this into LANE_SECRET_VARS now would stand up a posting lane
-# for a channel this slice cannot post to yet.
+# The forum board's webhook var, resolved through the SAME env-or-secrets
+# path as every other lane var (see _find_webhook_url_for_var). It IS a lane
+# now -- the board lane, below. Slice 1 deliberately kept it out of
+# LANE_SECRET_VARS because a forum channel needs thread_name / ?thread_id=
+# and nothing could post that shape yet; this slice is what changes that.
+# The LANE is named "board" (what it is to a human), not "forum" (Discord's
+# channel type), so `--lane forum` remains an unknown lane.
 FORUM_SECRET_VAR = "DISCORD_COMMS_FORUM_WEBHOOK_URL"
+
+BOARD_LANE = "board"
 
 # Lane name -> secret var. The default lane keeps the pre-lane var so an
 # un-flagged invocation is byte-identical to before this feature existed.
 LANE_SECRET_VARS = {
     DEFAULT_LANE: SECRET_VAR,
     "convo": "DISCORD_COMMS_CONVO_WEBHOOK_URL",
+    BOARD_LANE: FORUM_SECRET_VAR,
 }
 
 # Lane name -> state subdir. Separate dirs so cursors and skipped-rows logs
 # never mix between lanes (mixing would let one lane's cursor accidentally
-# skip rows the other lane never delivered).
+# skip rows the other lane never delivered). The board lane's dir name is
+# imported from threads.py rather than spelled again here: the thread map is
+# that module's file, and two spellings would eventually put a lane's cursor
+# and its thread map in two different directories.
 LANE_STATE_DIRS = {
     DEFAULT_LANE: "discord-mirror",
     "convo": "discord-mirror-convo",
+    BOARD_LANE: threads.STATE_DIRS[BOARD_LANE],
 }
+
+# ---- board lane knobs (issue #40's config table) --------------------------
+#
+# Defaults live in lib/swarm_threads (the predicate's own defaults); these
+# names are the env overrides, read HERE and passed through, so the predicate
+# stays pure and one lane's operational tuning never becomes a library's
+# ambient state.
+ALIVE_SECONDS_VAR = "COMMS_THREAD_ALIVE_SECONDS"
+ALIVE_SEATS_VAR = "COMMS_THREAD_ALIVE_SEATS"
+HOLD_MAX_VAR = "COMMS_THREAD_HOLD_MAX"
+
+ALIVE_SECONDS_DEFAULT = swarm_threads.DEFAULT_WINDOW_S
+ALIVE_SEATS_DEFAULT = swarm_threads.DEFAULT_MIN_SEATS
+
+# How many rows one thread key may hold un-posted before the oldest are
+# dropped (recorded in the skipped log, never silently). Bounds a key that
+# never goes alive: without it, one seat monologuing into a document grows a
+# state file without limit.
+HOLD_MAX_DEFAULT = 500
+
+# On EVERY board POST. A constant, not a knob: a mailbox row is prose an
+# agent wrote, and prose containing @everyone must never ring a phone.
+NO_MENTIONS = {"parse": []}
+
+# Discord's cap on a thread name.
+THREAD_NAME_CAP = 100
+
+
+def _env_int(var, default):
+    """This knob's value, or `default` if unset or unparseable. A typo in a
+    launchd plist must degrade to the documented default, not take the lane
+    down: the lane's job is delivering rows, and refusing to run because a
+    tuning parameter was misspelled loses more than it protects."""
+    raw = os.environ.get(var)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        sys.stderr.write(
+            "discord mirror: %s=%r is not a number; using %d\n" % (var, raw, default)
+        )
+        return default
 
 # LAUNCHD SAFETY: how long --follow / --follow-all wait before retrying a
 # poll after a missing-secret condition, instead of crash-looping under a
@@ -205,6 +257,13 @@ def _cursor_path(runid, lane=DEFAULT_LANE):
 
 def _skipped_path(runid, lane=DEFAULT_LANE):
     return os.path.join(_mirror_dir(lane), _safe(runid) + ".skipped.jsonl")
+
+
+def _held_path(runid, lane=DEFAULT_LANE):
+    """The board lane's HELD ROWS file: {thread_key: [rows]}, rows in `at`
+    order. See the module docstring's BOARD LANE section for why this is a
+    second file and not a smarter cursor."""
+    return os.path.join(_mirror_dir(lane), _safe(runid) + ".held.json")
 
 
 # ---- one poller per (run, lane) -------------------------------------------
@@ -270,7 +329,11 @@ def _lane_keep(lane):
     "is this row conversation" (a lane's taste) and "did some other machine's
     mirror already post this row" (a fleet-wide fact true in every lane).
     Rows either one rejects are still counted against the cursor."""
-    lane_filter = _is_convo_row if lane == "convo" else None
+    lane_filter = None
+    if lane == "convo":
+        lane_filter = _is_convo_row
+    elif lane == BOARD_LANE:
+        lane_filter = _is_threaded_row
 
     def keep(row):
         if _is_pulled_row(row):
@@ -291,6 +354,20 @@ def _is_convo_row(row):
     it. See adapters/discord/README.md, Lanes."""
     topic = str(row.get("topic", ""))
     return topic.startswith("@") or row.get("kind") in swarm_mailbox.CONVO_KINDS
+
+
+def _is_threaded_row(row):
+    """The board lane's filter: a row belongs to this lane iff it names the
+    document it is about (`thread`, written by swarm_mailbox.post).
+
+    DEVIATION from the #40 design note, which said rows without a thread take
+    "today's non-thread path, unchanged". In this lane there is no such path
+    to take: a forum webhook REJECTS a POST carrying neither thread_name nor
+    ?thread_id=, so an un-threaded row has nowhere to go here. It is
+    count-but-skipped exactly as the convo lane skips a non-conversation row
+    -- and it is not lost: the `all` lane mirrors every row, threaded or not.
+    """
+    return bool(row.get(swarm_threads.THREAD_FIELD))
 
 
 def _find_webhook_url_for_var(var):
@@ -593,17 +670,23 @@ def chunk_rows(rows, machine, cap=CONTENT_CAP, identities=None):
     return chunks
 
 
-def post_content(url, content, username=None):
+def post_content(url, content, username=None, allowed_mentions=None):
     """POST one message. Honours 429 Retry-After, caps retries. Returns True
     delivered / False gave up. Never raises for HTTP-level failure and never
     prints the URL.
 
     `username` (optional): per-message Discord webhook author override --
     the "post as this seat" mechanism (see build_author). Omitted -> the
-    webhook's own configured name, exactly the pre-authorship behavior."""
+    webhook's own configured name, exactly the pre-authorship behavior.
+
+    `allowed_mentions` (optional): Discord's mention-suppression object. Sent
+    only when given, so an omitted one leaves the payload byte-identical to
+    the pre-board shape. The board lane passes NO_MENTIONS on every post."""
     payload = {"content": content}
     if username:
         payload["username"] = username
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
     body = json.dumps(payload).encode("utf-8")
     attempt = 0
     while True:
@@ -675,6 +758,239 @@ def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
     )
 
 
+# ---- the board lane: held rows, alive threads, the drain ------------------
+
+
+def _load_held(runid, lane):
+    """The held-rows file as {thread_key: [rows]}, or {} if it is absent,
+    unreadable, corrupt, or not a dict.
+
+    Corrupt reads as EMPTY AND LOUD (D6): the cursor is already past these
+    rows, so the backlog is genuinely lost and no amount of retrying gets it
+    back -- what is left is to say so on stderr rather than crash the lane or
+    pretend. Same shape as _load_cursor's tolerance, for the same reason: a
+    state file this process wrote is not an input worth dying over.
+    """
+    path = _held_path(runid, lane)
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(
+            "discord mirror: held-rows file unreadable (%s) for run %r; "
+            "treating as empty -- un-posted rows in it are LOST (the cursor "
+            "is already past them)\n" % (exc.__class__.__name__, runid)
+        )
+        return {}
+    if not isinstance(data, dict):
+        sys.stderr.write(
+            "discord mirror: held-rows file for run %r is not an object; "
+            "treating as empty\n" % runid
+        )
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, list)}
+
+
+def _save_held(runid, lane, buckets):
+    """Persist the held rows, tmp + os.replace (PID-suffixed tmp), cloning
+    _save_cursor's durability. Buckets that are empty are dropped rather than
+    written as [], so a drained thread leaves no residue.
+
+    Writes NOTHING when there is nothing held and no file exists yet -- the
+    same no-orphan-file rule _mirror_pass applies to the cursor, so a run
+    that never held a row never grows a state file.
+    """
+    buckets = {k: v for k, v in buckets.items() if v}
+    path = _held_path(runid, lane)
+    if not buckets and not os.path.exists(path):
+        return
+    os.makedirs(_mirror_dir(lane), exist_ok=True)
+    tmp = path + ".tmp." + str(os.getpid())
+    with open(tmp, "w") as fh:
+        json.dump(buckets, fh)
+    os.replace(tmp, path)
+
+
+def _bucket_rows(held, fresh):
+    """{thread_key: [rows in `at` order]} from the held file plus this pass's
+    fresh rows.
+
+    Fresh rows are stripped of their read-time source tag before they land in
+    a bucket (swarm_mailbox.without_source): the held file is a durable copy
+    of rows as their AUTHOR wrote them, and a tag naming this machine's inode
+    has no business surviving into it -- the same rule the skipped log
+    follows.
+
+    Sorted by `at`, stably, so held rows keep their place ahead of fresh rows
+    written in the same instant. The sort is the drain's contract: the
+    backlog posts oldest-first, which is the only order a human can read.
+    """
+    buckets = {k: list(v) for k, v in held.items()}
+    for key, rows in swarm_threads.group_by_thread(fresh).items():
+        buckets.setdefault(key, []).extend(
+            swarm_mailbox.without_source(row) for row in rows
+        )
+    for rows in buckets.values():
+        rows.sort(key=lambda r: str(r.get("at", "")))
+    return {k: v for k, v in buckets.items() if v}
+
+
+def _apply_hold_cap(runid, lane, buckets):
+    """Trim every bucket to HOLD_MAX rows, OLDEST DROPPED FIRST, recording
+    each dropped row in the skipped log (which also shouts one stderr line).
+
+    Oldest first because the newest rows are the ones that can still make a
+    key go alive; the oldest are the ones a human would least miss. The cap
+    exists to bound a key that NEVER goes alive -- one seat monologuing into
+    a document -- which otherwise grows this file without limit.
+    """
+    cap = _env_int(HOLD_MAX_VAR, HOLD_MAX_DEFAULT)
+    for key, rows in buckets.items():
+        if cap >= 0 and len(rows) > cap:
+            dropped = rows[: len(rows) - cap]
+            buckets[key] = rows[len(rows) - cap:]
+            _log_skipped(
+                runid,
+                dropped,
+                "thread hold cap reached for %s (%s=%d)" % (key, HOLD_MAX_VAR, cap),
+                lane,
+            )
+    return buckets
+
+
+def thread_title(key):
+    """The human-visible Discord thread name for a thread key: the key
+    without its "doc:" prefix ("doc:comms/a.md" -> "comms/a.md"), capped at
+    Discord's THREAD_NAME_CAP. The prefix is a namespace for machines; a
+    person reading a forum sidebar wants the path."""
+    title = str(key)
+    if title.startswith(swarm_mailbox.THREAD_KEY_PREFIX):
+        title = title[len(swarm_mailbox.THREAD_KEY_PREFIX):]
+    return title[:THREAD_NAME_CAP] or str(key)[:THREAD_NAME_CAP]
+
+
+def _thread_url(url, thread_id):
+    """The webhook URL that posts INTO an existing thread."""
+    return url + ("&" if "?" in url else "?") + "thread_id=" + str(thread_id)
+
+
+def _without_rows(rows, delivered):
+    """`rows` minus exactly the row objects in `delivered` (identity, not
+    equality: two rows of one seat can be byte-identical, and dropping both
+    when one was posted is a silent loss)."""
+    done = {id(row) for row in delivered}
+    return [row for row in rows if id(row) not in done]
+
+
+def _board_pass(runid, lane, url):
+    """One board-lane pass, always under the (runid, lane) lock. The ORDER is
+    the design (issue #40, D1) and is the whole reason a row cannot be lost:
+
+      1. load held        -- what this lane owes but has not posted
+      2. collect_new      -- what it has not read
+      3. bucket held + fresh by thread key, `at` order
+      4. WRITE HELD, including the buckets about to post
+      5. save cursor
+      6. for each ALIVE key: get/create its thread, post the whole backlog
+      7. rewrite held minus what each chunk delivered, AFTER EACH CHUNK
+
+    Step 4 before step 5 is the load-bearing pair. The cursor advancing means
+    "I have read these"; held existing means "I still owe these". Making held
+    durable FIRST is what lets the cursor move safely -- a crash between them
+    re-posts, at worst. The reverse order defines a row that is read, not
+    posted, and remembered nowhere: the one failure this repo refuses.
+
+    TWO STATE FILES, TWO QUESTIONS, on purpose. The cursor could not answer
+    "post this later": its keep-predicate is a bool over one row and a
+    rejected row is simply dropped. Teaching it to defer would make one file
+    answer two questions whose right answers diverge.
+    """
+    machine = machine_label()
+    _warn_seat_collisions(runid)
+    old_cursor = _load_cursor(runid, lane)
+    held = _load_held(runid, lane)                              # 1
+    fresh, new_cursor = collect_new(runid, lane)                # 2
+    buckets = _apply_hold_cap(runid, lane, _bucket_rows(held, fresh))  # 3
+    _save_held(runid, lane, buckets)                            # 4
+    if new_cursor != old_cursor:                                # 5
+        _save_cursor(runid, new_cursor, lane)
+    if not buckets:
+        return 0
+    return _drain(runid, lane, url, buckets, machine)           # 6, 7
+
+
+def _drain(runid, lane, url, buckets, machine):
+    """Post every ALIVE key's WHOLE backlog into its thread, rewriting the
+    held file after each chunk. Returns 1 if any chunk was skipped.
+
+    THE WHOLE BACKLOG, not the row that tripped `alive`: the point of holding
+    rows is that they arrive before the conversation is visibly a
+    conversation, so the moment it becomes one, everything said so far has to
+    land -- oldest first, across as many POSTs as the seat changes and the
+    content cap force.
+
+    HELD IS REWRITTEN PER CHUNK, not once at the end (a small deviation from
+    the design note, which allowed once-per-drain). A drain of a long backlog
+    is many POSTs and many seconds; rewriting after each one means a crash or
+    a failed chunk in the middle costs only the chunks not yet delivered. The
+    once-at-the-end version re-posts the ENTIRE backlog next pass every time
+    one POST fails, which is a duplicate storm proportional to how long the
+    thread was held.
+
+    A CHUNK THAT WILL NOT DELIVER is recorded in the skipped log and dropped
+    from held -- never retried forever, because one poisoned batch must not
+    wedge every later row behind it -- and the drain of THAT thread stops
+    there, leaving its remainder held for the next pass. Other threads in the
+    same pass are unaffected.
+    """
+    identities = swarm_arm.seat_identities(runid)
+    window_s = _env_int(ALIVE_SECONDS_VAR, ALIVE_SECONDS_DEFAULT)
+    min_seats = _env_int(ALIVE_SEATS_VAR, ALIVE_SEATS_DEFAULT)
+    poster = threads.webhook_poster(url)
+    skipped = False
+    for key in sorted(buckets):
+        rows = buckets[key]
+        if not swarm_threads.alive(rows, window_s=window_s, min_seats=min_seats):
+            continue
+        thread_id = threads.thread_for(key, thread_title(key), lane, poster)
+        if thread_id is None:
+            continue  # D6: every thread_for failure leaves the rows held
+        target = _thread_url(url, thread_id)
+        for author, content, chunk in chunk_rows(rows, machine, identities=identities):
+            delivered = post_content(
+                target, content, username=author, allowed_mentions=NO_MENTIONS
+            )
+            if not delivered:
+                _log_skipped(runid, chunk, "webhook delivery failed", lane)
+                skipped = True
+            buckets[key] = _without_rows(buckets[key], chunk)
+            _save_held(runid, lane, buckets)
+            if not delivered:
+                break  # this thread's remainder waits for the next pass
+    return 1 if skipped else 0
+
+
+def _warn_seat_collisions(runid):
+    """ONE stderr line per pass when two agents share a seat name (issue #42,
+    resolved as detect-don't-reject in #40's D5). Nothing is blocked: the
+    rows still post, the seat still renders. The line is the only thing that
+    makes a duplicate seat visible at all -- without it, "@alpha" quietly
+    fans out to two agents and both render as one."""
+    collisions = swarm_arm.seat_collisions(runid)
+    if not collisions:
+        return
+    detail = "; ".join(
+        "%s <- %s" % (seat, ", ".join(ids)) for seat, ids in sorted(collisions.items())
+    )
+    sys.stderr.write(
+        "discord mirror: seat name claimed by more than one agent in run %r "
+        "(%s); rows render under the first agent's identity and a unicast "
+        "reaches both\n" % (runid, detail)
+    )
+
+
 def run_once(runid, lane=DEFAULT_LANE):
     """Mirror everything new in one lane, once. Exit-code semantics of
     main(). Raises SystemExit(2) via resolve_webhook_url if this lane's
@@ -711,6 +1027,8 @@ def run_once(runid, lane=DEFAULT_LANE):
         )
         return 0
     try:
+        if lane == BOARD_LANE:
+            return _board_pass(runid, lane, url)
         return _mirror_pass(runid, lane, url)
     finally:
         os.close(lock_fd)  # releases the flock, even on an exception
@@ -722,6 +1040,7 @@ def _mirror_pass(runid, lane, url):
     one unnested block that cannot be read past, and so the pass body has
     exactly one exit path to the release in run_once's finally."""
     machine = machine_label()
+    _warn_seat_collisions(runid)
     old_cursor = _load_cursor(runid, lane)
     fresh, new_cursor = collect_new(runid, lane)
     skipped = False
