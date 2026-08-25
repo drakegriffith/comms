@@ -179,8 +179,13 @@ def test_watermark_is_written_after_a_compile():
     _post_at("test-r1", "a", "doc:repoA/x.md", "2026-08-25T10:00:00+00:00")
     cct.compile_once()
     wm = _watermark("repoA")
-    assert wm["last_at"] == "2026-08-25T10:00:00+00:00"
-    assert wm["thread_dates"]["doc:repoA/x.md"] == "2026-08-25"
+    # The watermark is a per-date DIGEST map, not a high-water `at` mark: a
+    # mark keyed on `at` can never notice a row whose `at` sorts BEFORE it
+    # (a late sync, clock skew, a backdated post) because such a row never
+    # crosses the mark. A digest is recomputed from the full row set for
+    # that date every pass, so a late row changes the digest and forces a
+    # re-render regardless of where its `at` sorts.
+    assert "2026-08-25" in wm["digests"]
 
 
 def test_a_second_compile_with_no_new_rows_writes_no_notes():
@@ -221,6 +226,60 @@ def test_a_new_row_on_a_new_date_does_not_rewrite_the_old_dated_note():
     cct.compile_once()
     assert _note_text("repoA", "2026-08-25") == day1_before
     assert os.path.isfile(cct._note_path("repoA", "2026-08-26"))
+
+
+# ---- regression: a row arriving OUT OF `at`-order relative to what has
+# already been compiled (a late sync from another machine, clock skew, a
+# backdated post) must still be compiled -- an `at > last_at` high-water
+# mark can never see it, because it never crosses the mark. -----------------
+
+
+def test_a_late_row_on_an_already_compiled_date_appears_after_the_next_run():
+    _post_at("test-r1", "a", "doc:repoA/x.md", "2026-08-25T10:00:00+00:00")
+    cct.compile_once()
+    before = _note_text("repoA", "2026-08-25")
+    assert "carol" not in before
+    # Advance the watermark past today entirely, THEN append a row dated
+    # earlier than today -- the shape the verifier measured (watermark at
+    # 2026-08-22, a late row dated 2026-08-21).
+    _post_at("test-r1", "b", "doc:repoA/x.md", "2026-08-27T10:00:00+00:00")
+    cct.compile_once()
+    _post_at(
+        "test-r1", "c", "doc:repoA/x.md", "2026-08-25T10:30:00+00:00", text="late"
+    )
+    rows_inspected, notes_written = cct.compile_once()
+    assert rows_inspected == 3
+    assert notes_written == 1  # only 2026-08-25's content actually changed
+    after = _note_text("repoA", "2026-08-25")
+    assert "c: late" in after
+
+
+def test_a_row_earlier_than_last_at_appears():
+    # Same bug, phrased the other way: a row whose `at` is EARLIER than the
+    # newest `at` already compiled must still show up -- rows_inspected
+    # already counted it (the verifier's own measured symptom was
+    # rows_inspected=6 notes_written=0: it was seen but never rendered).
+    _post_at("test-r1", "a", "doc:repoA/x.md", "2026-08-25T10:00:00+00:00")
+    _post_at("test-r1", "a", "doc:repoA/x.md", "2026-08-26T10:00:00+00:00")
+    cct.compile_once()
+    _post_at(
+        "test-r1", "b", "doc:repoA/x.md", "2026-08-25T09:00:00+00:00", text="earlier"
+    )
+    cct.compile_once()
+    assert "b: earlier" in _note_text("repoA", "2026-08-25")
+
+
+def test_a_second_rerun_after_a_late_row_is_byte_identical():
+    _post_at("test-r1", "a", "doc:repoA/x.md", "2026-08-25T10:00:00+00:00")
+    cct.compile_once()
+    _post_at(
+        "test-r1", "b", "doc:repoA/x.md", "2026-08-25T09:00:00+00:00", text="earlier"
+    )
+    cct.compile_once()
+    settled = _note_text("repoA", "2026-08-25")
+    rows_inspected, notes_written = cct.compile_once()
+    assert notes_written == 0
+    assert _note_text("repoA", "2026-08-25") == settled
 
 
 # ---- continues pointer: a thread key spanning midnight -----------------------

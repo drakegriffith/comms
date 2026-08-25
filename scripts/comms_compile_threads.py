@@ -46,22 +46,35 @@ A key whose most recent PRIOR appearance was on an earlier date gets one line
 at the top of its section: "continues: <that date>.md".
 
 THE WATERMARK (P5: "close is a watermark, never a mutation"): one file per
-board, $COMMS_STATE_DIR/thread-compile/<board>.watermark.json, holding the
-`at` of the newest row this script has already compiled for that board, plus
-{thread key: date last compiled}. Nothing about the mailbox is ever touched --
-purging or truncating a seat's jsonl is not this script's job and it never
-attempts it. Re-running with no new rows touches no note files (every date
-whose bucket has no fresh rows is left alone) and re-running from a wiped
-watermark regenerates byte-identical notes, because a note's content is a
-pure function of that date's full row set, walked in the same chronological
-order every time.
+board, $COMMS_STATE_DIR/thread-compile/<board>.watermark.json, holding a
+per-date DIGEST -- sha256 of the last text this script rendered for that
+date -- never an `at` high-water mark. A mark keyed on "the newest `at` seen
+so far" can only move forward, so a row whose `at` sorts BEFORE the mark (a
+late sync from another machine, a clock-skewed writer, a backdated post)
+never crosses it and is silently never rendered, on this run or any later
+one, even though every pass reads it off the full board. A digest has no
+"before" or "after": every pass recomputes each date's full note from
+whatever rows currently exist for it and writes only when that changes the
+digest, so a late-arriving row is compiled the very next time this script
+runs, not never. This does mean every pass walks EVERY date the board has
+ever had activity on, not just "new" ones -- accepted, because content is a
+pure function of a date's row set and the digest check keeps the actual disk
+write (and the reported notes_written) to only the dates that changed.
+Nothing about the mailbox is ever touched -- purging or truncating a seat's
+jsonl is not this script's job and it never attempts it. Re-running with no
+changed dates writes no note files, and re-running from a wiped watermark
+regenerates byte-identical notes, because a note's content is a pure
+function of that date's full row set, walked in the same chronological
+order every time (thread_dates, the continuation map, is likewise rebuilt
+from scratch each pass rather than carried in the watermark, for the same
+reason -- it is cheap to re-derive and a second persisted copy is a second
+place for the two to disagree).
 
-WHY THIS MAKES 18:00 AND 01:00 THE SAME CODE PATH: the watermark is a
-high-water mark, not a clock check -- "close at 1 a.m." (P5) is just this
-script's SECOND scheduled invocation each day (see
-adapters/launchd/com.comms.thread-compile.plist), not a special branch here.
-Whatever has not yet been compiled gets compiled, regardless of what time it
-is when this runs.
+WHY THIS MAKES 18:00 AND 01:00 THE SAME CODE PATH: nothing here is a clock
+check -- "close at 1 a.m." (P5) is just this script's SECOND scheduled
+invocation each day (see adapters/launchd/com.comms.thread-compile.plist),
+not a special branch here. Whatever has changed gets rewritten, regardless
+of what time it is when this runs.
 
 THE POSITIVE CONTROL: exit 2 if zero threaded, non-status rows exist ANYWHERE
 on the board this pass -- a compile that inspected nothing is not a quiet,
@@ -83,6 +96,7 @@ Exit: 0 compiled (or nothing new to compile) | 2 zero rows inspected.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -188,27 +202,37 @@ def _atomic_write_json(path, data):
 
 
 def _load_watermark(board):
-    """{"last_at": str|None, "thread_dates": {key: date}} for `board`, or the
-    empty shape if there is no watermark file yet or it is unreadable/corrupt
-    -- a corrupt watermark degrades to "compile everything again", which
-    re-derives correct notes (content is a pure function of the row set); the
-    other direction (treating corrupt as "everything already compiled") would
-    silently stop compiling that board forever."""
+    """{"digests": {date: sha256 hex}} for `board`, or the empty shape if
+    there is no watermark file yet or it is unreadable/corrupt -- a corrupt
+    watermark degrades to "every date looks changed, re-render all of them",
+    which re-derives correct notes (content is a pure function of the row
+    set); the other direction (treating corrupt as "everything already
+    compiled") would silently stop compiling that board forever.
+
+    WHY A DIGEST, NOT A HIGH-WATER `at` MARK (the shape this replaced): see
+    the module docstring's THE WATERMARK section -- a mark keyed on "newest
+    `at` seen" can never notice a row whose `at` sorts before it (a late
+    sync, clock skew, a backdated post), because such a row never crosses
+    the mark. A digest is recomputed from the CURRENT row set every pass, so
+    a late row changes the digest and forces a re-render no matter where its
+    `at` falls in the sort order.
+    """
     try:
         with open(_watermark_path(board)) as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return {"last_at": None, "thread_dates": {}}
+        return {"digests": {}}
     if not isinstance(data, dict):
-        return {"last_at": None, "thread_dates": {}}
-    return {
-        "last_at": data.get("last_at"),
-        "thread_dates": dict(data.get("thread_dates") or {}),
-    }
+        return {"digests": {}}
+    return {"digests": dict(data.get("digests") or {})}
 
 
 def _save_watermark(board, watermark):
     _atomic_write_json(_watermark_path(board), watermark)
+
+
+def _digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _note_path(board, date):
@@ -318,47 +342,38 @@ def compile_once():
     for board in sorted(by_board):
         board_rows = by_board[board]
         watermark = _load_watermark(board)
-        last_at = watermark["last_at"]
-        last_at_dt = swarm_threads.parsed_at({"at": last_at}) if last_at else None
+        old_digests = watermark["digests"]
 
-        fresh_dates = set()
+        by_date = {}
         for row in board_rows:
             at = _parsed_at(row)
             if at is None:
                 continue
-            if last_at_dt is None or at > last_at_dt:
-                date, _ = _local_date_and_time(at)
-                fresh_dates.add(date)
+            date, _ = _local_date_and_time(at)
+            by_date.setdefault(date, []).append(row)
 
-        if not fresh_dates:
-            continue
-
-        thread_dates = dict(watermark["thread_dates"])
-        newest_at = last_at_dt
-        newest_at_str = last_at
-        for date in sorted(fresh_dates):
-            rows_for_date = [
-                r for r in board_rows if _parsed_at(r) is not None
-                and _local_date_and_time(_parsed_at(r))[0] == date
-            ]
-            groups = swarm_threads.group_by_thread(rows_for_date)
+        # EVERY date this board has ever had activity on is walked every
+        # pass (not just ones touched by a naive "since last time" filter --
+        # see module docstring, THE WATERMARK): a late row's date must be
+        # re-considered even when that date is not the most recent one. The
+        # continuation map is rebuilt from scratch in this same ascending
+        # walk, so a late row on an OLD date can still shift a LATER date's
+        # "continues" pointer correctly if it changes which date a key was
+        # last seen on.
+        thread_dates = {}
+        new_digests = {}
+        for date in sorted(by_date):
+            groups = swarm_threads.group_by_thread(by_date[date])
             text, thread_dates = _render_note(
                 board, date, groups, window_s, min_seats, thread_dates
             )
-            _atomic_write_text(_note_path(board, date), text)
-            notes_written += 1
+            digest = _digest(text)
+            new_digests[date] = digest
+            if old_digests.get(date) != digest:
+                _atomic_write_text(_note_path(board, date), text)
+                notes_written += 1
 
-        for row in board_rows:
-            at = _parsed_at(row)
-            if at is None:
-                continue
-            if newest_at is None or at > newest_at:
-                newest_at = at
-                newest_at_str = row.get("at")
-
-        _save_watermark(
-            board, {"last_at": newest_at_str, "thread_dates": thread_dates}
-        )
+        _save_watermark(board, {"digests": new_digests})
 
     return rows_inspected, notes_written
 
