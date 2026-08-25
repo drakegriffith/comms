@@ -92,7 +92,7 @@ are upgrades from there, each behind its own probe.
 ```
 git clone https://github.com/drakegriffith/comms
 cd comms
-bin/comms status             # exits 0 and prints {"armed_runs": []}; you are installed
+bin/comms status             # exits 0 and prints an armed_runs JSON object; you are installed
 python3 -m pytest tests -q   # optional: prove it on your machine
 ```
 
@@ -134,7 +134,7 @@ above):
 ```
 git clone https://github.com/drakegriffith/comms
 cd comms
-bin/comms status             # exits 0, prints {"armed_runs": []}
+bin/comms status             # exits 0, prints an armed_runs JSON object
 ```
 
 **Block 2 of 4** -- the dispatcher arms the run once, before any seat starts:
