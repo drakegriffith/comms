@@ -99,6 +99,24 @@ anon_payload() {  # anon_payload [command]
         "${1:-ls}"
 }
 
+# Payload with non-string agent_id (integer) -- type mismatch treated as no identity.
+int_agent_id_payload() {  # int_agent_id_payload [command]
+    printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":12345,"tool_input":{"command":"%s"}}' \
+        "${1:-ls}"
+}
+
+# Payload with non-string agent_id (boolean) -- type mismatch treated as no identity.
+bool_agent_id_payload() {  # bool_agent_id_payload [command]
+    printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":true,"tool_input":{"command":"%s"}}' \
+        "${1:-ls}"
+}
+
+# Payload with non-string agent_id (array) -- type mismatch treated as no identity.
+list_agent_id_payload() {  # list_agent_id_payload [command]
+    printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","agent_id":["a","b"],"tool_input":{"command":"%s"}}' \
+        "${1:-ls}"
+}
+
 # Append a row directly to a seat's jsonl (deterministic `at`).
 post_row() {  # post_row <runid> <seat> <kind> <text> <at> [topic]
     local dir="$ROOT/comms-$1"
@@ -369,6 +387,40 @@ run_suite() {  # one fully-isolated pass
     post_row "$RL2" seatL2 finding "L2-ROW-DELIVERED" "2026-06-02T00:00:01+00:00"
     run_hook agentL; ctx="$(addl_ctx "$HOOK_OUT")"
     ck_contains "(l) identified agent still receives rows" "L2-ROW-DELIVERED" "$ctx"
+
+    #     Type guard for identity values: non-string agent_id is treated as no identity.
+    #     Integer agent_id should exit 0 with no output and no cursor files.
+    RL3="hbtestl3$$x$RANDOM"
+    arm_run "$RL3"
+    lines_before="$(log_lines)"
+    cursors_before="$(cursor_files)"
+    run_hook_raw "$(int_agent_id_payload "python3 lib/swarm_mailbox.py read $RL3 seatZ")"
+    ck "(m) int agent_id exits 0" "0" "$HOOK_RC"
+    ck "(m) int agent_id emits ZERO stdout" "" "$HOOK_OUT"
+    ck "(m) int agent_id writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
+    ck "(m) int agent_id writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
+
+    #     Boolean agent_id should exit 0 with no output and no cursor files.
+    RL4="hbtestl4$$x$RANDOM"
+    arm_run "$RL4"
+    lines_before="$(log_lines)"
+    cursors_before="$(cursor_files)"
+    run_hook_raw "$(bool_agent_id_payload "python3 lib/swarm_mailbox.py read $RL4 seatZ")"
+    ck "(n) bool agent_id exits 0" "0" "$HOOK_RC"
+    ck "(n) bool agent_id emits ZERO stdout" "" "$HOOK_OUT"
+    ck "(n) bool agent_id writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
+    ck "(n) bool agent_id writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
+
+    #     Array agent_id should exit 0 with no output and no cursor files.
+    RL5="hbtestl5$$x$RANDOM"
+    arm_run "$RL5"
+    lines_before="$(log_lines)"
+    cursors_before="$(cursor_files)"
+    run_hook_raw "$(list_agent_id_payload "python3 lib/swarm_mailbox.py read $RL5 seatZ")"
+    ck "(o) array agent_id exits 0" "0" "$HOOK_RC"
+    ck "(o) array agent_id emits ZERO stdout" "" "$HOOK_OUT"
+    ck "(o) array agent_id writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
+    ck "(o) array agent_id writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
 
     rm -rf "$STATE" "$ROOT"
 }
