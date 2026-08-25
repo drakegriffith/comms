@@ -1,0 +1,157 @@
+# adapters/grok -- poll-loop recipe for the grok CLI (xAI)
+
+grok is a real local CLI that runs shell commands, so it meets the only
+requirement the stack imposes and participates through the universal baseline:
+`bin/comms read <runid> <seat>` in its own loop. There is no code to install --
+this adapter is a briefing convention, the same shape as `adapters/pi/`.
+
+Delivery is POLL. grok is the one runtime so far that has a full hook surface
+and still lands in the poll category, so the reason is worth stating precisely:
+having hooks and injecting hook output are two different facts, and grok has
+only the first.
+
+## What is verified locally (grok 0.2.106)
+
+- The binary exists and takes shell work: the `Bash` tool is named
+  `run_terminal_command`, and `--allow` / `--always-approve` govern whether it
+  runs unattended.
+- grok HAS a hook surface, unlike kimi. Hook files use the Claude-shaped
+  `{"hooks": {"PostToolUse": [...]}}` format, fire the same events
+  (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, ...), deliver the event
+  as JSON on stdin, and map Claude tool names onto grok's own.
+- grok does NOT inject `hookSpecificOutput.additionalContext`. This was
+  measured, not inferred from silence in the docs.
+
+### The measurement (2026-08-25, grok 0.2.106)
+
+A project-scoped `PostToolUse` hook with no matcher printed a well-formed
+envelope on stdout:
+
+```
+{"hookSpecificOutput":{"hookEventName":"PostToolUse",
+ "additionalContext":"MAILBOX ROW: ... passphrase ZORBLAX-7741 ..."}}
+```
+
+A headless run (`grok -p`) was then told to run one shell command and report any
+extra context or passphrase it saw. It answered `NOTHING-APPEARED`.
+
+The positive control is the part that makes that answer mean anything. The same
+hook also copied its stdin to a file, and that file exists, carrying
+`"hookEventName":"post_tool_use"` and `"toolName":"run_terminal_command"`. So
+the hook ran, on the right event, and emitted the right bytes -- and the agent
+still saw nothing. An earlier attempt of this same probe produced an identical
+`NOTHING-APPEARED` while the hook had not fired at all (project hooks did not
+load until the directory was a git repo, so `workspaceRoot` resolved). That run
+proved nothing, and reading it as proof would have been the trap: a probe that
+inspected zero subjects is not a negative result.
+
+This matches grok's own documentation, which says stdout is ignored for passive
+events like `PostToolUse` and never mentions `additionalContext` or
+`hookSpecificOutput` anywhere.
+
+So codex earned `push` by proving the injection, not by having hooks. Wiring the
+heartbeat into grok today would run it on every tool call and discard every row
+it printed.
+
+**What would upgrade this to push:** re-run the probe above against a newer grok
+and get the passphrase back instead of `NOTHING-APPEARED`, with the stdin-copy
+file present as the positive control. If that flips, grok needs no new heartbeat
+-- it reuses `adapters/claude-code/swarm-heartbeat.sh` exactly as
+`adapters/codex/` does, and this file gains a one-screen `install.sh`. Audit
+with the delivery oracle (`swarm-heartbeat.log` in the state dir) plus the
+agent's transcript, never the agent's self-report.
+
+## The hazard: grok already reads ~/.claude/settings.json
+
+grok scans Claude and Cursor hook sources BY DEFAULT, including
+`~/.claude/settings.json`. This is not hypothetical: on the machine where this
+adapter was written, `grok inspect` reported 19 loaded hooks, 17 of them tagged
+`user [claude]`. So on any machine where `adapters/claude-code/install.sh` has
+run, grok is already loading the comms heartbeat -- firing it on every tool call
+while discarding the rows it prints. The heartbeat advances its read cursor
+after emitting, so rows can be marked delivered to a reader that never saw them.
+
+Two details make this less likely to bite than it reads, and both are worth
+knowing before debugging a quiet mailbox:
+
+- A grok session that never runs an enroll command naming an armed run is a
+  bystander: it emits zero rows and zero telemetry and exits early. The hazard
+  needs an enrolled seat, not merely an installed hook.
+- The heartbeat keys its cursor on `agent_id`, falling back to the payload's
+  `session_id`. grok's captured payload spells it `sessionId` in camelCase,
+  which that exact-key lookup misses, so grok sessions collapse onto the shared
+  `unknown` cursor key rather than taking a real seat's cursor.
+
+If a grok session on this machine is enrolled in a run, close the hole rather
+than reasoning about it: set `[compat.claude] hooks = false` in
+`~/.grok/config.toml` so grok stops scanning the Claude hook source, and let
+the poll loop below be the only delivery path.
+
+## The recipe
+
+1. **Enroll on line one of the brief.** The first command grok runs names the
+   run id and declares its subscription; enrollment is write-once, so it must
+   happen before any other `comms` command naming that run.
+2. **Read after every work step.** `bin/comms read <runid> <seat>` prints only
+   NEW rows in the seat's subscribed slice plus its unicast channel `@<seat>`.
+   Empty output means nothing new -- carry on.
+3. **Reply before finishing.** A row addressed `@<seat>` is a peer commenting
+   into this agent's live run; answer it with `--to <peer>` before moving on.
+4. **Post findings as they land**, not at the end. Mid-run visibility is the
+   point of the mailbox.
+
+## Brief block a dispatcher can paste
+
+Replace `RUNID`, `SEAT`, `TOPIC`, and the repo path, then paste into the grok
+agent's prompt verbatim:
+
+```
+## Mailbox protocol (comms)
+COMMS=$HOME/code/comms/bin/comms
+
+Run this FIRST, before any other comms command:
+  $COMMS enroll RUNID --agent-id SEAT-grok --topics TOPIC --seat SEAT
+
+After EVERY work step (a file edited, a test run, a conclusion reached):
+  $COMMS read RUNID SEAT
+Empty output = nothing new. A row on topic @SEAT is a peer commenting on
+your live work: answer it BEFORE your next work step:
+  $COMMS post RUNID SEAT claim "<your answer>" --to <their-seat>
+
+When you land a result worth a peer's attention:
+  $COMMS post RUNID SEAT finding "<one-line result>" --topic TOPIC
+If you are blocked:
+  $COMMS post RUNID SEAT blocker "<what and who owns it>" --topic TOPIC
+```
+
+The dispatcher arms the run once, before any seat starts:
+
+```
+bin/comms arm RUNID --topic TOPIC
+```
+
+For an unattended seat, launch grok so the poll commands do not stop for
+approval:
+
+```
+grok --allow "Bash(*/bin/comms *)" "<brief>"
+```
+
+## Notes
+
+- The resume-driver route is available but not taken. grok has `-r/--resume
+  [SESSION_ID]`, `-p/--single`, and `--output-format plain|json`, so the kimi
+  pattern (an outside loop delivering rows as resume turns) would work. It is
+  not the default here because it buys nothing a poll loop lacks while adding a
+  second process to supervise, and because kimi needed it only for having no
+  in-session way to check the mailbox at all. grok can just run the command.
+- `kind` is a closed vocabulary: `finding|claim|blocker|comment|reply|status`.
+  An unlisted kind fails loudly -- relabel, never retry blind.
+- The read cursor is per `(runid, seat)` and lives in `COMMS_STATE_DIR`
+  (default `~/.comms/state`), so repeated reads never replay old rows and a
+  restarted grok session resumes where it left off.
+- grok sets `GROK_SESSION_ID` on every hook process and accepts `--session-id`
+  for new conversations, so a stable seat identity is available if this adapter
+  ever grows push delivery.
+- Delivery auditing: read the telemetry/mailbox files, not the seat's
+  self-report (see "The delivery oracle" in the top-level README).

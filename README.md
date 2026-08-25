@@ -71,6 +71,7 @@ sugar on top.
 | Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`) |
 | Kimi        | resume-driver | no hook surface; `adapters/kimi/poll-driver.sh` polls and delivers rows as resume turns |
 | pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
+| Grok (xAI)  | poll     | runs Claude-shaped hooks but was measured NOT to inject `additionalContext`, so a hook would drop every row; briefed poll loop instead (`adapters/grok/` -- carries the probe that would upgrade it to push) |
 | Discord     | mirror   | `adapters/discord/` mirrors mailbox rows to a channel (in flight, issue #2) |
 | Claude Code (ambient) | push + mirror | `adapters/claude-code/ambient/` -- SessionStart + SendMessage-bridge hooks enroll every session into standing run `machine-ops` (topic `ops`; only message SUMMARIES are bridged), mirrored to Discord as the machine dashboard |
 | GitHub (landings) | poll + mirror | `adapters/github/` polls `gh api` for merged/closed PRs and closed issues, posts each to Discord with attribution ("who merged/closed what") -- source is GitHub itself, not the comms mailbox |
@@ -181,6 +182,7 @@ adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
 adapters/kimi/               resume-driver for a runtime with no hook surface
 adapters/pi/                 poll-loop recipe for pi and any hook-less runtime
+adapters/grok/               poll-loop recipe for the grok CLI; records why its hooks cannot push
 adapters/discord/            mirrors mailbox rows to a Discord channel
 adapters/github/             polls gh api for merged/closed PRs and issues, posts landings to Discord
 adapters/remote/             carries rows between two machines over ssh, hub-and-spoke
