@@ -235,3 +235,104 @@ def test_seat_identities_skips_a_non_dict_participant_file_without_crashing():
     with open(os.path.join(pdir, "agent-bad"), "w") as fh:
         fh.write(json.dumps(["not", "a", "dict"]))
     assert swarm_arm.seat_identities("r1") == {"alpha": {"model": "M1"}}
+
+
+# ---- seat_collisions(): detect, do not reject (issue #40 D5, issue #42) ----
+#
+# Two agents enrolled on ONE seat name is a real failure -- "@alpha" fans out
+# to both, and both render under one identity. enroll() deliberately does NOT
+# reject it: enroll runs at SessionStart and returns a bool, so a raise there
+# kills session start, and a legitimate re-enroll after a crash (same seat,
+# new agent_id) would then run unenrolled, i.e. invisible. So this is a
+# detector: it makes the condition visible instead of silent.
+
+
+def test_seat_collisions_is_empty_when_every_seat_is_unique():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="bravo")
+    assert swarm_arm.seat_collisions("r1") == {}
+
+
+def test_seat_collisions_names_the_seat_and_every_agent_id_on_it():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="alpha")
+    assert swarm_arm.seat_collisions("r1") == {"alpha": ["agent-a", "agent-b"]}
+
+
+def test_seat_collisions_lists_agent_ids_in_the_resolution_order():
+    # Sorted filename order, which is exactly the order seat_identities()
+    # resolves in -- so the FIRST id in the list is the one whose identity
+    # wins the render. A detector reporting a different order than the
+    # resolver uses would name the wrong winner.
+    swarm_arm.arm("r1")
+    for aid in ("agent-c", "agent-a", "agent-b"):
+        swarm_arm.enroll("r1", aid, seat="alpha")
+    assert swarm_arm.seat_collisions("r1")["alpha"] == [
+        "agent-a",
+        "agent-b",
+        "agent-c",
+    ]
+
+
+def test_seat_collisions_reports_only_the_colliding_seats():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="alpha")
+    swarm_arm.enroll("r1", "agent-c", seat="bravo")
+    assert list(swarm_arm.seat_collisions("r1")) == ["alpha"]
+
+
+def test_seat_collisions_ignores_participants_with_no_seat():
+    # Enrolling without a seat is normal (a reader that only receives).
+    # Two seatless agents are not a collision on the seat named None.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a")
+    swarm_arm.enroll("r1", "agent-b")
+    assert swarm_arm.seat_collisions("r1") == {}
+
+
+def test_seat_collisions_counts_a_seat_with_no_identity_fields():
+    # seat_identities() skips a participant that declared no model/project/
+    # area; a collision is about the SEAT, so this detector must not inherit
+    # that filter -- two unidentified agents on one seat is the same bug.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="alpha", model="M1")
+    assert swarm_arm.seat_collisions("r1") == {"alpha": ["agent-a", "agent-b"]}
+
+
+def test_seat_collisions_on_an_unarmed_run_is_empty_not_an_error():
+    assert swarm_arm.seat_collisions("never-armed-run") == {}
+
+
+def test_seat_collisions_skips_a_malformed_participant_file():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="alpha")
+    pdir = swarm_arm._participants_dir("r1")
+    with open(os.path.join(pdir, "agent-bad"), "w") as fh:
+        fh.write("{not json")
+    with open(os.path.join(pdir, "agent-worse"), "w") as fh:
+        fh.write(json.dumps(["not", "a", "dict"]))
+    assert swarm_arm.seat_collisions("r1") == {"alpha": ["agent-a", "agent-b"]}
+
+
+def test_seat_collisions_does_not_write_anything():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    pdir = swarm_arm._participants_dir("r1")
+    before = sorted(os.listdir(pdir))
+    swarm_arm.seat_collisions("r1")
+    assert sorted(os.listdir(pdir)) == before
+
+
+def test_enroll_still_accepts_a_duplicate_seat():
+    # The contract this detector exists BECAUSE OF: enroll must keep
+    # returning True. A re-enroll after a crash (same seat, new agent_id)
+    # rejected here would run unenrolled -- invisible, which is worse than
+    # the duplication the collision causes.
+    swarm_arm.arm("r1")
+    assert swarm_arm.enroll("r1", "agent-a", seat="alpha") is True
+    assert swarm_arm.enroll("r1", "agent-b", seat="alpha") is True
