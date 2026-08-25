@@ -334,6 +334,66 @@ def test_bridge_optout_skips(env, tmp_path):
     assert mailbox_rows(env) == before  # no new comment row posted
 
 
+# ---- sendmessage-bridge: to-resolution (issue #41) -------------------------
+
+def enroll_peer(env, tmp_path, project, session_id):
+    """Enroll a SECOND real seat, distinct from enroll_first's, and return
+    the seat name session-start.sh actually assigned it (deterministic:
+    "<project>-<first 4 alnum chars of session_id>", see session-start.sh)."""
+    work = tmp_path / project
+    work.mkdir(exist_ok=True)
+    assert run(SESSION_START, env, start_payload(str(work), session_id=session_id)).returncode == 0
+    pdir = os.path.join(env["COMMS_STATE_DIR"], "swarm-arm", "machine-ops", "participants")
+    for name in os.listdir(pdir):
+        with open(os.path.join(pdir, name)) as fh:
+            data = json.load(fh)
+        if data.get("area") == str(work):
+            return data["seat"], name  # (seat, agent_id filename)
+    raise AssertionError("peer never enrolled")
+
+
+def test_bridge_resolves_exact_seat_to_unicast(env, tmp_path):
+    enroll_first(env, tmp_path)
+    peer_seat, _ = enroll_peer(env, tmp_path, "projB", "peer-xyz999")
+    r = run(BRIDGE, env, bridge_payload(to=peer_seat))
+    assert r.returncode == 0
+    rows = [x for x in mailbox_rows(env) if x["kind"] == "comment"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["to"] == peer_seat
+    assert row["topic"] == "@" + peer_seat
+    assert "topic" in row and row.get("to")  # never both a fan-out topic AND to
+    assert row["text"] == "-> %s: landed the fix" % peer_seat
+    assert r.stderr == ""  # a resolved target logs nothing
+
+
+def test_bridge_resolves_agent_id_prefix_to_unicast(env, tmp_path):
+    enroll_first(env, tmp_path)
+    peer_seat, agent_id = enroll_peer(env, tmp_path, "projB", "peer-xyz999")
+    prefix = agent_id[:8]
+    assert prefix != peer_seat  # proves this is the prefix path, not the exact-seat one
+    r = run(BRIDGE, env, bridge_payload(to=prefix))
+    assert r.returncode == 0
+    rows = [x for x in mailbox_rows(env) if x["kind"] == "comment"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["to"] == peer_seat
+    assert row["topic"] == "@" + peer_seat
+
+
+def test_bridge_unresolved_target_keeps_free_text_and_logs_stderr(env, tmp_path):
+    enroll_first(env, tmp_path)
+    r = run(BRIDGE, env, bridge_payload(to="nobody-by-this-name"))
+    assert r.returncode == 0
+    rows = [x for x in mailbox_rows(env) if x["kind"] == "comment"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert "to" not in row
+    assert row["topic"] == "ops"
+    assert row["text"] == "-> nobody-by-this-name: landed the fix"
+    assert "unresolved target nobody-by-this-name" in r.stderr
+
+
 # ---- installer ------------------------------------------------------------
 
 FIXTURE_SETTINGS = {

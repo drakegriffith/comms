@@ -11,11 +11,30 @@
 # conversation; check whether the peer has the hook installed.
 #
 # WHAT IT DOES: reads the PostToolUse hook JSON from stdin (tool_input carries
-# to/summary/message), and posts one row into the standing run `machine-ops`:
-#   kind  comment
-#   topic ops
-#   seat  this session's enrolled seat (from the machine-ops roster)
-#   text  "-> <to>: <summary, else first 200 chars of message>"
+# to/summary/message), and posts one row into the standing run `machine-ops`.
+#
+# TO-RESOLUTION (issue #41): the SendMessage `to` value is free text a human
+# or agent typed -- not guaranteed to spell a real seat. This bridge tries to
+# resolve it to one, in order:
+#   1. EXACT SEAT MATCH: `to` is itself a key of swarm_arm.seat_identities(runid)
+#      (every enrolled seat that declared identity -- session-start.sh always
+#      declares one, so this covers the normal roster).
+#   2. AGENT_ID PREFIX MATCH: `to` is a prefix of an enrolled participant's
+#      agent_id (the roster's on-disk filename). seat_identities has no
+#      agent_id -> seat mapping (lib/swarm_arm.py is a different slice's write
+#      set), so this reads swarm_arm's documented participant-file layout
+#      directly, once, as a fallback only; seat_identities stays the single
+#      source of truth for the exact-seat path above.
+#   RESOLVED -> posts UNICAST: to=<seat> (never topic= at the same time --
+#     post()'s own guard forbids both; topic "@<seat>" is its side effect).
+#       kind comment; seat this session's seat; to the resolved seat
+#       text "-> <to>: <summary, else first 200 chars of message>"
+#   UNRESOLVED -> today's free-text fan-out row, UNCHANGED, plus one stderr
+#     line "unresolved target <to>" (telemetry only -- `to` is already written
+#     into the row text below, so stderr carries no more privacy risk than the
+#     mailbox does).
+#       kind comment; topic ops; seat this session's seat
+#       text "-> <to>: <summary, else first 200 chars of message>"
 #
 # PRIVACY: only the summary field (or a 200-char truncation of the message) is
 # posted -- and therefore only that reaches the Discord mirror. Full message
@@ -148,8 +167,38 @@ try:
     if not body:
         sys.exit(0)  # nothing worth a row
 
+    def resolve_seat(candidate):
+        """`candidate` -> a real seat in RUNID, or None. Exact seat match
+        first (against seat_identities' keys); then agent_id prefix match
+        (see the file header for why this reads the participant dir
+        directly instead of calling into lib/swarm_arm.py)."""
+        roster = swarm_arm.seat_identities(RUNID, state_dir=state_dir)
+        if candidate in roster:
+            return candidate
+        pdir = os.path.join(state_dir, "swarm-arm", RUNID, "participants")
+        try:
+            names = sorted(os.listdir(pdir))
+        except OSError:
+            return None
+        for name in names:
+            if not name.startswith(candidate):
+                continue
+            try:
+                with open(os.path.join(pdir, name)) as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and data.get("seat"):
+                return data["seat"]
+        return None
+
     text = "-> %s: %s" % (to, body)
-    swarm_mailbox.post(RUNID, seat, "comment", text, topic=TOPIC)
+    resolved = resolve_seat(to)
+    if resolved:
+        swarm_mailbox.post(RUNID, seat, "comment", text, to=resolved)
+    else:
+        swarm_mailbox.post(RUNID, seat, "comment", text, topic=TOPIC)
+        sys.stderr.write("unresolved target %s\n" % to)
 except SystemExit:
     raise
 except Exception as exc:
