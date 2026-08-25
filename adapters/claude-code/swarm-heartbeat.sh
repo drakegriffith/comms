@@ -43,8 +43,75 @@
 #   SUBSCRIPTION FILTER: each participant enrolls with a subscription -- a topic
 #   SET (empty => every topic) and an optional seat. A row surfaces to an agent
 #   iff the agent subscribes-to-all, OR row.topic is in its set, OR row.topic is
-#   its unicast "@<seat>". A single topic is the one-element case, so the old
-#   single-topic behavior is preserved.
+#   its unicast "@<seat>", OR row.THREAD is in its set (see DOC-ENROL below). A
+#   single topic is the one-element case, so the old single-topic behavior is
+#   preserved.
+#
+#   The `thread` arm is why the filter is a two-field test rather than a
+#   one-field one. `topic` and `thread` answer different questions -- topic is
+#   "who receives this", thread is "what document is this about" -- and a
+#   poster writing about a file has no way to know which seats care, so it
+#   stamps the document, not an audience. Matching is EXACT STRING EQUALITY
+#   against the same subscription set: no prefix rule, no second set. A thread
+#   value is always a "doc:<repo>/<relpath>" key produced by
+#   swarm_mailbox.thread_key, and a subscribed doc topic is the identical
+#   string produced by the same function on the same path, so equality is the
+#   whole rule. A row whose topic is unsubscribed AND whose thread is
+#   unsubscribed is still filtered out -- this widens delivery by exactly one
+#   field, not by a category. A subscribe-all agent is unaffected (it has no
+#   filter to widen), and a row with no `thread` behaves exactly as before.
+#
+# DOC-ENROL LEG -- WRITING A FILE SUBSCRIBES YOU TO IT (issue #42)
+#   On a beat whose tool_name is Write/Edit/MultiEdit/NotebookEdit, this hook
+#   maps tool_input.file_path through swarm_mailbox.thread_key (IMPORTED, one
+#   implementation, never re-derived here) and unions the resulting
+#   "doc:<repo>/<relpath>" key into the acting agent's subscription in every
+#   run it participates in (swarm_arm.add_topics). Combined with the `thread`
+#   arm above, the effect is: TOUCH A FILE, AND SIBLING ROWS ABOUT THAT FILE
+#   START REACHING YOU -- no seat has to guess a topic name, and the two seats
+#   editing one file never coordinate. A path outside any repo keys to None
+#   and enrols nothing; a fabricated key would be an invisible mis-grouping.
+#
+#   Four properties this leg does NOT have, each load-bearing:
+#     * It NEVER ENROLLS. add_topics on a non-participant returns [] and
+#       creates no roster row, so a bystander writing a file stays a bystander.
+#       Enrol-by-side-effect would be the machine-global contamination the ARM
+#       GATE above exists to prevent, re-entering through a back door.
+#     * It never NARROWS a subscribe-all agent. An empty topic set means "every
+#       topic"; adding one doc key to it would collapse that agent to a single
+#       document. add_topics refuses, so such an agent keeps the whole board.
+#     * It never BLOCKS THE BEAT. The whole leg is wrapped: any failure (an
+#       unimportable module, a path that makes realpath raise) writes ONE
+#       stderr line and falls through to the normal row rendering.
+#     * It is SILENT WHEN NOTHING CHANGED. Re-writing the same file adds no
+#       topic, writes no file (add_topics no-ops without touching the roster
+#       row) and appends no telemetry line, so the log records enrolments, not
+#       keystrokes.
+#   It runs BEFORE the per-run row pass, so a key learned on this beat filters
+#   this beat's rows -- and a run whose subscription grew this beat BYPASSES
+#   the mtime short-circuit below, for this beat only. That short-circuit asks
+#   "did the mailbox change", but the subscription is the other half of the
+#   same query: a new doc key can make an ALREADY-PRESENT row match, and
+#   skipping the scan would defer the first delivery on that subscription
+#   until some unrelated seat happened to post.
+#
+#   DELIVERY IS FORWARD-ONLY (v1 ruling; replay design is issue #57). A row
+#   about the doc that is ALREADY BEHIND this seat's cursor is not replayed
+#   after the subscription grows. The rescan above genuinely inspects it -- it
+#   now matches the filter -- and the cursor test then drops it, deliberately.
+#   The cursor is ONE position over the whole board, not one per topic, so
+#   rewinding it to reach a newly-interesting row would re-deliver every other
+#   row past that point as well. The cost, named: a doc discussed for an hour
+#   before you opened it shows you only what is said from now on; `comms read
+#   <runid> <seat> --replay` is the manual way to see the rest.
+#
+#   TWO TELEMETRY LINES ON AN ENROL BEAT is expected and accepted: one
+#   "doc-enrol <key>" line from this leg (rows_inspected 0, delta_emitted 0)
+#   and one ordinary scan line from process_run. They answer different
+#   questions -- what did this agent subscribe to, and what did it receive --
+#   and merging them would make an enrolment invisible on a beat that
+#   delivered nothing. Readers keyed on delta_emitted > 0 (the Discord ingest
+#   mirror) ignore the enrol line by construction.
 #
 #   Env vars do NOT work as a knob: a hook's environment is fixed at host
 #   launch, so a swarm dispatched INSIDE a live session could never set one.
@@ -272,6 +339,7 @@ def append_telemetry(runid, topic_label, rows_inspected, delta_emitted, short_ci
 row_lines = []                 # emitted rows across every participating run
 deferred_cursor = []           # (cursor_dir, cursor_file, new_cursor)
 deferred_mtime = []            # (cursor_dir, mtime_file, "set"|"clear", val)
+enrolled_this_beat = set()     # runids whose subscription GREW on this beat
 
 
 def process_run(runid):
@@ -327,7 +395,14 @@ def process_run(runid):
     except (OSError, ValueError):
         last_mtime = -1.0
 
-    if files and newest <= last_mtime:
+    # The short-circuit asks "did the MAILBOX change", but the mailbox is only
+    # half the query -- the SUBSCRIPTION is the other half, and a doc key
+    # enrolled on this beat can make an already-present row match. Skipping the
+    # scan then would defer the first delivery on a new subscription until some
+    # unrelated seat happened to post. Bypass is for THIS beat only (the set is
+    # per-process): the deferred_mtime write below still records `newest`, so
+    # the next quiet beat short-circuits normally and the speed path survives.
+    if files and newest <= last_mtime and runid not in enrolled_this_beat:
         append_telemetry(runid, topic_label, 0, 0, short_circuit=True)
         return
 
@@ -351,9 +426,18 @@ def process_run(runid):
     rows_inspected = len(rows)
 
     # Subscription filter: a row with no topic key is "default", matching how
-    # swarm_mailbox.py stamps pre-topic rows.
+    # swarm_mailbox.py stamps pre-topic rows. A row also passes on its THREAD
+    # (issue #42): a subscribed "doc:<repo>/<relpath>" key delivers rows ABOUT
+    # that document whatever audience the poster addressed them to. Exact
+    # equality, one shared set -- see SUBSCRIPTION FILTER in the header. A row
+    # with no thread contributes "" here, which is never a subscribed topic
+    # (_as_topics strips empties), so the old behavior is untouched.
     if subs is not None:
-        rows = [r for r in rows if (r.get("topic") or "default") in subs]
+        rows = [
+            r
+            for r in rows
+            if (r.get("topic") or "default") in subs or (r.get("thread") or "") in subs
+        ]
 
     # ECHO SUPPRESSION: never inject a seat's own rows back at it. Measured
     # live (wave swarmw-0821a, 2026-08-21): 30 of 52 delivered rows were the
@@ -421,6 +505,53 @@ def process_run(runid):
     )
     append_telemetry(runid, topic_label, rows_inspected, len(emitted))
 
+
+# ---- DOC-ENROL LEG (issue #42) --------------------------------------------
+# See DOC-ENROL LEG in the header for the contract and the four things this
+# deliberately does not do. Runs BEFORE the row pass so a key learned on this
+# beat filters this beat's rows, and inside THIS interpreter -- a second
+# python3 invocation would double interpreter startup on every file edit,
+# which is the one cost this hook's whole fast-path design exists to avoid.
+FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+
+def doc_enrol():
+    if payload.get("tool_name") not in FILE_TOOLS:
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
+    file_path = tool_input.get("file_path")
+    # Type guard, same reasoning as the identity gate: a non-string path is no
+    # path. MultiEdit/NotebookEdit take this leg only when they carry one.
+    if not isinstance(file_path, str) or not file_path:
+        return
+    # Imported HERE, not at the top: a failure to import swarm_mailbox must
+    # cost this leg only. At the top it would exit the whole beat, trading a
+    # missing subscription for a missing delivery.
+    import swarm_mailbox
+
+    key = swarm_mailbox.thread_key(file_path)
+    if not key:
+        return  # outside any repo -- no thread, never a fabricated key
+    for runid in my_runs:
+        # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
+        # -- read the topics, compare after the call -- would race: two beats
+        # adding the same key both see it absent beforehand and both report an
+        # enrolment that happened once. The lock is the only place with one
+        # answer, so the answer is returned from there.
+        _topics, changed = swarm_arm.add_topics(
+            runid, agent_id, [key], state_dir=state_dir
+        )
+        if changed:
+            enrolled_this_beat.add(runid)
+            append_telemetry(runid, "doc-enrol " + key, 0, 0)
+
+
+try:
+    doc_enrol()
+except Exception as exc:  # never block the beat -- one line, then carry on
+    sys.stderr.write("swarm-heartbeat: doc-enrol leg failed: %s\n" % exc)
 
 for runid in my_runs:
     process_run(runid)

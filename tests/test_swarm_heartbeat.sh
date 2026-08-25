@@ -135,6 +135,23 @@ post_row() {  # post_row <runid> <seat> <kind> <text> <at> [topic] [thread]
     fi
 }
 
+# A PostToolUse payload for a FILE-TOUCHING tool (issue #42's doc-enrol leg).
+# tool_input carries file_path, not command.
+write_payload() {  # write_payload <agent_id> <tool_name> <file_path>
+    printf '{"hook_event_name":"PostToolUse","tool_name":"%s","session_id":"sess-1","agent_id":"%s","tool_input":{"file_path":"%s"}}' \
+        "$2" "$1" "$3"
+}
+
+# This agent's current subscription, comma-joined (empty => subscribe-all).
+part_topics() {  # part_topics <runid> <agent_id>
+    COMMS_STATE_DIR="$STATE" python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import swarm_arm
+print(",".join(swarm_arm.participant_sub(sys.argv[2], sys.argv[3])[0]), end="")' \
+        "$SELF_DIR/../lib" "$1" "$2"
+}
+
 HOOK_OUT=""
 HOOK_RC=0
 run_hook() {  # run_hook <agent_id> [command] ; sets globals HOOK_OUT + HOOK_RC (no
@@ -162,6 +179,30 @@ run_hook_raw() {  # run_hook_raw <payload-json> ; same globals as run_hook
 }
 
 log_lines() { wc -l < "$LOG" 2>/dev/null | tr -d ' '; }
+
+# One field of the LAST process_run telemetry row for a run. doc-enrol rows
+# are skipped: they carry the enrolment, not the mailbox scan.
+last_scan_field() {  # last_scan_field <runid> <field>
+    python3 -c '
+import json, sys
+runid, field = sys.argv[2], sys.argv[3]
+val = ""
+try:
+    fh = open(sys.argv[1])
+except OSError:
+    fh = []
+for line in fh:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if ev.get("runid") == runid and not str(ev.get("topic") or "").startswith("doc-enrol"):
+        val = ev.get(field)
+sys.stdout.write(json.dumps(val))' "$LOG" "$1" "$2"
+}
 
 # Every cursor/mtime file the hook has written, across all runs.
 cursor_files() { find "$STATE/swarm-cursor" -type f 2>/dev/null | wc -l | tr -d ' '; }
@@ -486,6 +527,209 @@ run_suite() {  # one fully-isolated pass
     ck_contains "(r) unicast + threaded row carries both markers" \
         "[FOR YOU from seatS] [seatS | finding | @seatR2 | 2026-07-03T00:00:01+00:00] REPLY-TARGET (thread doc:comms/lib/x.py)" \
         "$ctx"
+
+    # -----------------------------------------------------------------------
+    # (s) DOC-ENROL LEG (issue #42): a Write/Edit adds the edited file's thread
+    #     key (swarm_mailbox.thread_key) to the acting agent's subscription, so
+    #     sibling rows ABOUT that document reach the agent working on it.
+    RS="hbtests$$x$RANDOM"
+    arm_run "$RS"
+    enroll_agent "$RS" agentS "projS" seatS
+    enroll_agent "$RS" agentT "projS" seatT     # same run, does not touch the doc
+    REPO="$(mktemp -d)" || exit 1
+    REPONAME="$(basename "$REPO")"
+    mkdir -p "$REPO/.git" "$REPO/sub"
+    : > "$REPO/sub/a.py"; : > "$REPO/sub/b.py"; : > "$REPO/sub/c.py"
+
+    run_hook_raw "$(write_payload agentS Write "$REPO/sub/a.py")"
+    ck "(s) a Write beat exits 0" "0" "$HOOK_RC"
+    ck_contains "(s) Write enrols the file's doc key" \
+        "doc:$REPONAME/sub/a.py" "$(part_topics "$RS" agentS)"
+    ck_contains "(s) the pre-existing subscription survives the merge" \
+        "projS" "$(part_topics "$RS" agentS)"
+
+    run_hook_raw "$(write_payload agentS Edit "$REPO/sub/b.py")"
+    ck_contains "(s) Edit enrols the file's doc key too" \
+        "doc:$REPONAME/sub/b.py" "$(part_topics "$RS" agentS)"
+
+    #     A Bash beat carries no file_path and must enrol nothing.
+    before_t="$(part_topics "$RS" agentT)"
+    run_hook agentT "ls -la /tmp"
+    ck "(s) a Bash beat enrols no doc topic" "$before_t" "$(part_topics "$RS" agentT)"
+
+    #     TELEMETRY: an ADDED topic writes one extra line; a re-Write of the
+    #     same file writes none (the add_topics no-op does not touch the file).
+    lines_before="$(log_lines)"
+    run_hook_raw "$(write_payload agentS Write "$REPO/sub/c.py")"
+    added_delta=$(( $(log_lines) - lines_before ))
+    ck_contains "(s) telemetry names the enrolled doc key" \
+        "doc-enrol doc:$REPONAME/sub/c.py" "$(tail -4 "$LOG")"
+    lines_before="$(log_lines)"
+    run_hook_raw "$(write_payload agentS Write "$REPO/sub/c.py")"
+    same_delta=$(( $(log_lines) - lines_before ))
+    ck "(s) an added topic writes exactly one MORE telemetry line than a no-op" \
+        "1" "$(( added_delta - same_delta ))"
+
+    #     DELIVERY: a row whose `thread` is a subscribed doc key reaches the
+    #     subscriber even though its `topic` is not subscribed. This is the
+    #     filter extension the leg is worthless without.
+    post_row "$RS" seatU finding "THREAD-ROW-FOR-S" "2026-08-01T00:00:01+00:00" \
+        "otherproj" "doc:$REPONAME/sub/a.py"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(s) a subscribed doc key delivers a row by its thread field" \
+        "THREAD-ROW-FOR-S" "$ctx"
+    ck_contains "(s) the delivered row still renders its thread suffix" \
+        "THREAD-ROW-FOR-S (thread doc:$REPONAME/sub/a.py)" "$ctx"
+    run_hook agentT; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(s) a seat that never touched the doc does NOT get the row" \
+        "THREAD-ROW-FOR-S" "$ctx"
+
+    #     A row whose topic is unsubscribed AND whose thread is unsubscribed
+    #     is still filtered out -- the extension widens by exactly one field.
+    post_row "$RS" seatU finding "UNRELATED-THREAD-ROW" "2026-08-01T00:00:02+00:00" \
+        "otherproj" "doc:$REPONAME/sub/zz.py"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(s) an unsubscribed thread is still filtered out" \
+        "UNRELATED-THREAD-ROW" "$ctx"
+
+    #     SUBSCRIBE-ALL IS NOT NARROWED. An agent enrolled with an empty topic
+    #     set sees the whole board; adding a doc topic would flip it to a
+    #     FILTERED subscription and silently hide every other row from it.
+    enroll_agent "$RS" agentAll
+    run_hook_raw "$(write_payload agentAll Write "$REPO/sub/a.py")"
+    ck "(s) a subscribe-all agent is not narrowed by a doc topic" \
+        "" "$(part_topics "$RS" agentAll)"
+    #     Assert on THIS beat's own output: the doc-enrol leg runs before the
+    #     row pass, so if it had narrowed agentAll the narrowing would show up
+    #     in the very rows this beat emits.
+    ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(s) the subscribe-all agent still receives the threaded row" \
+        "THREAD-ROW-FOR-S" "$ctx"
+    ck_contains "(s) the subscribe-all agent still receives every OTHER row" \
+        "UNRELATED-THREAD-ROW" "$ctx"
+
+    #     A Write OUTSIDE any repo keys to None and enrols nothing -- never a
+    #     fabricated key.
+    OUTSIDE="$(mktemp -d)" || exit 1
+    : > "$OUTSIDE/loose.md"
+    before_t="$(part_topics "$RS" agentT)"
+    run_hook_raw "$(write_payload agentT Write "$OUTSIDE/loose.md")"
+    ck "(s) a Write outside any repo enrols nothing" \
+        "$before_t" "$(part_topics "$RS" agentT)"
+
+    #     A NON-participant is not enrolled, and gains no topics, by writing a
+    #     file inside a repo.
+    run_hook_raw "$(write_payload docbystander Write "$REPO/sub/a.py")"
+    ck "(s) a doc-writing bystander gets ZERO output" "" "$HOOK_OUT"
+    if is_part "$RS" docbystander; then
+        fail=$((fail + 1)); echo "  FAIL (s) a Write enrolled a bystander" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    #     MultiEdit / NotebookEdit carry file_path too and take the same leg.
+    run_hook_raw "$(write_payload agentS MultiEdit "$REPO/sub/m.py")"
+    ck_contains "(s) MultiEdit enrols the doc key" \
+        "doc:$REPONAME/sub/m.py" "$(part_topics "$RS" agentS)"
+    run_hook_raw "$(write_payload agentS NotebookEdit "$REPO/sub/n.ipynb")"
+    ck_contains "(s) NotebookEdit enrols the doc key" \
+        "doc:$REPONAME/sub/n.ipynb" "$(part_topics "$RS" agentS)"
+
+    #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
+    #     file_path makes os.path.realpath raise ValueError -- the leg is
+    #     wrapped, so the beat still emits its rows and exits 0.
+    post_row "$RS" seatU finding "BEAT-SURVIVES" "2026-08-02T00:00:01+00:00" "projS"
+    ERRF="$STATE/doc-enrol.err"
+    HOOK_OUT="$(printf '%s' "$(write_payload agentT Write '/tmp/nul\u0000path.md')" \
+        | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$ERRF")"
+    HOOK_RC=$?
+    ck "(s) a raising thread_key still exits 0" "0" "$HOOK_RC"
+    ck "(s) a raising thread_key writes exactly one stderr line" \
+        "1" "$(wc -l < "$ERRF" | tr -d ' ')"
+    ck_contains "(s) the stderr line names the leg" "swarm-heartbeat: doc-enrol" \
+        "$(cat "$ERRF")"
+    ck_contains "(s) the beat's own rows are still delivered" "BEAT-SURVIVES" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    rm -rf "$REPO" "$OUTSIDE"
+
+    # -----------------------------------------------------------------------
+    # (t) AN ENROL INVALIDATES THE MTIME SHORT-CIRCUIT (issue #42 review).
+    #     The short-circuit skips the mailbox scan when no .jsonl is newer than
+    #     the last scan. That treats the mailbox as the only input to "is there
+    #     anything for me" -- but the SUBSCRIPTION is the other half of that
+    #     query, and growing it can make an ALREADY-PRESENT row match. A beat
+    #     that enrols a doc key must therefore rescan even though no file moved.
+    RV="hbtestv$$x$RANDOM"
+    arm_run "$RV"
+    enroll_agent "$RV" agentV "projV" seatV
+    REPOV="$(mktemp -d)" || exit 1
+    REPOVNAME="$(basename "$REPOV")"
+    mkdir -p "$REPOV/.git"
+    : > "$REPOV/v.py"
+    post_row "$RV" seatW finding "V-SEED-ROW" "2026-09-01T00:00:01+00:00" "projV"
+    run_hook agentV                       # delivers the seed, records the mtime
+    run_hook agentV                       # nothing new -> short-circuits
+    ck "(t) a quiet beat short-circuits the scan" "true" "$(last_scan_field "$RV" short_circuit)"
+    ck "(t) a short-circuited beat inspects zero rows" "0" "$(last_scan_field "$RV" rows_inspected)"
+
+    #     Same mailbox, not one byte changed -- but this beat enrols a doc key.
+    run_hook_raw "$(write_payload agentV Write "$REPOV/v.py")"
+    ck "(t) an enrol beat does NOT short-circuit" "false" "$(last_scan_field "$RV" short_circuit)"
+    if [ "$(last_scan_field "$RV" rows_inspected)" -gt 0 ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "  FAIL (t) enrol beat inspected no rows" >&2
+    fi
+
+    #     The bypass is for THIS beat only: the next quiet beat short-circuits
+    #     again, so the speed path is not permanently disabled.
+    run_hook agentV
+    ck "(t) the beat after an enrol short-circuits again" "true" \
+        "$(last_scan_field "$RV" short_circuit)"
+
+    # -----------------------------------------------------------------------
+    # (u) FORWARD-ONLY DELIVERY -- the convener's v1 ruling, pinned here.
+    #     Subscribing to a doc does NOT replay rows about that doc that are
+    #     already behind this seat's cursor. The seat's cursor is one position
+    #     over the whole board, so replaying them would mean rewinding it and
+    #     re-delivering every other row too. Replay design is issue #57.
+    RW="hbtestw$$x$RANDOM"
+    arm_run "$RW"
+    enroll_agent "$RW" agentW "projW" seatW2
+    REPOW="$(mktemp -d)" || exit 1
+    REPOWNAME="$(basename "$REPOW")"
+    mkdir -p "$REPOW/.git"
+    : > "$REPOW/w.py"
+
+    #     A threaded row nobody is subscribed to yet, then a plain subscribed
+    #     row with a LATER `at` that drags the cursor past it.
+    post_row "$RW" seatX finding "ROW-BEFORE-ENROL" "2026-09-02T00:00:01+00:00" \
+        "otherproj" "doc:$REPOWNAME/w.py"
+    post_row "$RW" seatX finding "CURSOR-MOVER" "2026-09-02T00:00:09+00:00" "projW"
+    run_hook agentW; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(u) the cursor-moving row is delivered" "CURSOR-MOVER" "$ctx"
+    ck_absent "(u) the pre-enrol threaded row is not delivered yet" \
+        "ROW-BEFORE-ENROL" "$ctx"
+
+    #     Now enrol the doc key. The pre-enrol row NOW matches the filter, and
+    #     the scan DOES run (no short-circuit, see (t)) -- so it is inspected
+    #     and deliberately not delivered, because it sits behind the cursor.
+    run_hook_raw "$(write_payload agentW Write "$REPOW/w.py")"
+    ck_contains "(u) the enrol landed" "doc:$REPOWNAME/w.py" "$(part_topics "$RW" agentW)"
+    ck_absent "(u) FORWARD-ONLY: a row already behind the cursor is NOT replayed" \
+        "ROW-BEFORE-ENROL" "$(addl_ctx "$HOOK_OUT")"
+
+    #     A row about the same doc posted AFTER the enrol is delivered.
+    post_row "$RW" seatX finding "ROW-AFTER-ENROL" "2026-09-02T00:00:20+00:00" \
+        "otherproj" "doc:$REPOWNAME/w.py"
+    run_hook agentW; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(u) FORWARD-ONLY: a row posted after the enrol IS delivered" \
+        "ROW-AFTER-ENROL" "$ctx"
+    ck_absent "(u) FORWARD-ONLY: the pre-enrol row stays undelivered forever" \
+        "ROW-BEFORE-ENROL" "$ctx"
+
+    rm -rf "$REPOV" "$REPOW"
 
     rm -rf "$STATE" "$ROOT"
 }

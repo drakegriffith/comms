@@ -170,6 +170,204 @@ def enroll(runid, agent_id, topics=None, seat=None, state_dir=None,
     return True
 
 
+def _locks_dir(runid, state_dir=None):
+    """Sidecar lock dir for a run, a SIBLING of participants/ rather than a
+    file inside it.
+
+    participants/ has exactly one invariant that three readers depend on --
+    every entry is one enrolled agent_id (is_participant does a bare
+    os.path.exists on a name there; seat_identities, seat_collisions and
+    `status` all iterate the dir). Dropping "<agent>.lock" beside the roster
+    row would put a non-participant into that listing: the JSON readers would
+    skip it silently, but `status` would print it as a participant. A separate
+    dir keeps the roster single-purpose, which is the cheaper of the two costs
+    (one extra mkdir per add vs. a lie in the operator-facing listing).
+    """
+    return os.path.join(_run_dir(runid, state_dir), "locks")
+
+
+def add_topics(runid, agent_id, topics, state_dir=None):
+    """Union `topics` into an ALREADY-ENROLLED agent's subscription. Returns
+    (topics_list, changed): the resulting list (existing order preserved, new
+    topics appended) and whether THIS call is the one that wrote it.
+
+    `changed` IS DECIDED UNDER THE LOCK, and that is the whole point of
+    returning it. A caller cannot compute it by reading the list before and
+    after its own call: between those two reads another beat can add the same
+    key, so both callers see it absent beforehand, both see it present
+    afterwards, and both report an enrolment that happened once. The only
+    place that question has a single answer is inside the critical section, so
+    the answer is returned from there rather than reconstructed outside it.
+
+    WHY THIS IS NOT A FLAG ON enroll(). enroll() is write-once by design (the
+    `if not os.path.exists(path)` gate above), so a second enroll carrying an
+    empty subscription cannot clobber a real one. Growing a subscription is
+    the opposite operation -- read, merge, write -- and folding it into enroll
+    would delete the write-once property that gate exists to provide. Two
+    operations, two functions.
+
+    THE CALLER THIS EXISTS FOR is the heartbeat's doc-enrol leg: when an agent
+    Writes or Edits a file, that file's thread key (swarm_mailbox.thread_key)
+    becomes one of its subscribed topics, so sibling rows ABOUT that document
+    reach the agent that is working on it. See swarm-heartbeat.sh's header.
+
+    NOT ENROLLING IS THE POINT. A missing participant file returns ([], False)
+    and creates NOTHING. An agent that never opted in must not become a
+    participant by the side effect of writing a file -- that would re-create,
+    through the back door, exactly the machine-global contamination this
+    module's per-participant roster removed. Same for an unarmed run, an
+    unreadable file, or a malformed one: ([], False) and no write.
+
+    A SUBSCRIBE-ALL PARTICIPANT IS NEVER NARROWED, and this is the subtlest
+    rule here. An EMPTY topics list means "every topic" everywhere in this
+    module (see enroll and participant_sub). So adding one topic to an empty
+    list would not widen that agent's reach by one document -- it would COLLAPSE
+    it from the whole board down to that single document, hiding every other
+    row from an agent that was receiving all of them. The guard lives here,
+    not in the caller, because this module is where "empty means all" is
+    DEFINED; a caller that had to remember it would eventually not. Such a
+    participant gets ([], False) and no write, the same shape as "nothing to
+    add to" -- both mean the subscription is unchanged and there is nothing to
+    do about it.
+
+    NO-OP MEANS NO WRITE. When every topic is already present the file is not
+    touched at all -- not rewritten with identical bytes. This runs on every
+    Write/Edit beat of every participant, and an agent editing one file in a
+    loop would otherwise churn its roster row (and its mtime) forever.
+
+    CONCURRENCY. An exclusive fcntl.flock on a sidecar lock file (see
+    _locks_dir) is held across the whole read-modify-write, so two beats
+    racing on one roster row cannot lose an update -- without it each reads
+    the pre-write list and os.replace's its own single-topic result over the
+    other's. The write itself is tmp + flush + fsync + os.replace, so a READER
+    (the heartbeat's own participant_sub, mid-beat) sees either the whole old
+    file or the whole new one, never a partial one; readers therefore need no
+    lock of their own.
+
+    A LOCK WE CANNOT TAKE MEANS WE DO NOT WRITE. Failure to create the lock
+    dir, open the lock file, or acquire the flock returns
+    (current_topics, False) plus ONE stderr line, and writes nothing. Falling
+    through to an unlocked read-modify-write is not a degraded write, it is a
+    lost-update generator -- exactly the failure the lock exists to prevent,
+    reintroduced at the moment the safeguard breaks. Refusing costs one
+    un-grown subscription and the next Write/Edit beat retries; proceeding
+    costs another writer's topics, silently and permanently.
+
+    UNBOUNDED BY DESIGN, FOR NOW: a long session subscribes one topic per file
+    it touches. Accepted for v1 (the list is read once per beat and holds
+    short strings); the revisit condition is a roster row large enough to show
+    up in beat latency, at which point this wants an LRU cap, not a smaller
+    key.
+
+    in: runid; agent_id (raw, sanitized here the same way enroll does);
+      topics (comma string or list, same normalization as everywhere else);
+      state_dir (default $COMMS_STATE_DIR chain).
+    out: (topics_list, changed). changed is True on exactly the calls that
+      rewrote the file. ([], False) whenever there is nothing to add to.
+    side effects: at most one atomic rewrite of the participant file, plus the
+      lock dir/file, plus one stderr line if the lock could not be taken.
+      Never creates a participant.
+    """
+    import fcntl
+
+    new = _as_topics(topics)
+    pdir = _participants_dir(runid, state_dir)
+    path = os.path.join(pdir, _safe(agent_id))
+    if not os.path.exists(path):
+        return ([], False)
+
+    lock_fh = None
+    try:
+        os.makedirs(_locks_dir(runid, state_dir), exist_ok=True)
+        lock_fh = open(
+            os.path.join(_locks_dir(runid, state_dir), _safe(agent_id) + ".lock"), "a"
+        )
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    except Exception as exc:
+        # Broad on purpose: however the lock failed, the answer is the same --
+        # do not write. See "A LOCK WE CANNOT TAKE" above.
+        if lock_fh is not None:
+            try:
+                lock_fh.close()
+            except OSError:
+                pass
+        sys.stderr.write(
+            "swarm_arm: add_topics could not lock %s (%s); subscription NOT grown\n"
+            % (path, exc)
+        )
+        return (own_topics(runid, agent_id, state_dir=state_dir), False)
+
+    try:
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return ([], False)
+        if not isinstance(data, dict):
+            return ([], False)
+        current = _as_topics(data.get("topics"))
+        if not current:
+            # subscribe-all: adding would NARROW it, see above
+            return ([], False)
+        merged = list(current)
+        for t in new:
+            if t not in merged:
+                merged.append(t)
+        if merged == current:
+            return (current, False)  # NO-OP MEANS NO WRITE
+
+        data["topics"] = merged
+        tmp = path + ".tmp." + str(os.getpid())
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return (current, False)  # the list on disk is still the old one
+        return (merged, True)
+    finally:
+        if lock_fh is not None:
+            try:
+                lock_fh.close()  # releases the flock
+            except OSError:
+                pass
+
+
+def own_topics(runid, agent_id, state_dir=None):
+    """The topics this participant DECLARED FOR ITSELF, with no run-level
+    fallback. [] means either "not enrolled" or "subscribe-all".
+
+    This is deliberately NOT participant_sub. participant_sub answers a
+    DELIVERY question -- "which topics should this agent receive" -- and to
+    answer it, it substitutes the run's default subscription from meta.json
+    when the agent declared none. A MUTATOR must not see that substitution:
+    add_topics would union the doc key into a borrowed default and write the
+    result back as the agent's own list, freezing a run-level default into a
+    per-agent one and losing every later change to meta. Two questions, two
+    functions.
+
+    The heartbeat's doc-enrol leg uses this to decide whether a topic is
+    genuinely new before calling add_topics, so a re-Write of the same file
+    emits no telemetry.
+    """
+    try:
+        with open(
+            os.path.join(_participants_dir(runid, state_dir), _safe(agent_id))
+        ) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return _as_topics(data.get("topics"))
+
+
 def seat_identities(runid, state_dir=None):
     """Map seat -> identity dict ({model, project, area}, declared keys only)
     for every enrolled participant that declared a seat and any identity field.
