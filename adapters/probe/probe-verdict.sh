@@ -71,12 +71,22 @@ evidence() {
 
 FIRES=""
 ANSWER_STATE="   (NOT READ -- positive control failed)"
+# Flipped the instant the control clears, so the could-not-determine text can
+# tell the two shapes apart. Claiming "the answer was NOT read" after we read it
+# is the same class of error as claiming a negative we did not measure.
+CONTROL_PASSED=0
 
 undetermined() {  # undetermined <why>
     printf 'COULD-NOT-DETERMINE\n'
     printf '  reason: %s\n' "$1"
-    printf '  The agent answer was NOT read. This is not a negative result:\n'
-    printf '  fix the wiring, re-run the probe, and record nothing.\n'
+    if [ "$CONTROL_PASSED" -eq 0 ]; then
+        printf '  The agent answer was NOT read. This is not a negative result:\n'
+        printf '  fix the wiring, re-run the probe, and record nothing.\n'
+    else
+        printf '  The control held but there is no answer to interpret, so this\n'
+        printf '  is not a negative result either: capture the answer, re-run,\n'
+        printf '  and record nothing.\n'
+    fi
     evidence
     exit 2
 }
@@ -115,16 +125,19 @@ case "$(cat "$HOOK_STDOUT")" in
 esac
 
 # ---- only now: the agent's answer -----------------------------------------
+CONTROL_PASSED=1
 if [ "$ANSWER_INLINE" -eq 1 ]; then
     answer="$ANSWER_TEXT"
     ANSWER_STATE="(inline, ${#answer} bytes)"
     [ -n "$answer" ] || undetermined "the agent answer given with --answer is empty -- nothing was captured to interpret"
 else
+    ANSWER_STATE="   (NOT CAPTURED)"
     [ -f "$ANSWER_FILE" ] \
         || undetermined "positive control PASSED but no agent answer was captured at $ANSWER_FILE -- run the runtime and tee its answer there"
+    ANSWER_STATE="   (EMPTY)"
     answer="$(cat "$ANSWER_FILE")"
-    ANSWER_STATE=""
     [ -n "$answer" ] || undetermined "positive control PASSED but $ANSWER_FILE is empty -- nothing was captured to interpret"
+    ANSWER_STATE=""
 fi
 
 printf 'positive control PASSED: the hook fired, was handed the event, and emitted the envelope.\n'

@@ -137,6 +137,16 @@ run_suite() {
     run_verdict "$D" --answer "the passphrase was $PP"
     ck "(b) inline answer -> exit 0" "0" "$V_RC"
 
+    #     INSTRUMENT CONTROL for the ordering test in (d). An unreadable answer
+    #     file has to produce a VISIBLE error when the script actually opens it,
+    #     or "no error appeared" in (d) would prove nothing -- silence is not
+    #     evidence. Path b is the case that definitely reads the file.
+    chmod 000 "$D/agent-answer.txt"
+    run_verdict "$D"
+    ck_contains "(b) chmod 000 IS detectable when the answer is read" \
+        "Permission denied" "$V_OUT"
+    chmod 644 "$D/agent-answer.txt"
+
     # ---- (c) known-answer NOT-PUSH: grok 0.2.106 --------------------------
     D="$SANDBOX/c"; C="$SANDBOX/c-hooks.json"
     arm_probe "$D" "$C"
@@ -168,6 +178,23 @@ run_suite() {
     ck_absent "(d) verdict never says NOT-PUSH" "NOT-PUSH" "$V_OUT"
     ck_absent "(d) verdict never quotes the unread answer" "NOTHING-APPEARED" "$V_OUT"
     ck_contains "(d) verdict flags the missing stdin copy" "(MISSING)" "$V_OUT"
+    ck_contains "(d) evidence carries the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
+
+    #     THE ORDERING ITSELF, tested rather than claimed. Make the answer file
+    #     UNREADABLE and re-run: the control still fails first, so the script
+    #     must never open the file. Any edit that hoists the answer read above
+    #     the control block turns that open into a visible "Permission denied"
+    #     -- while the output still asserts the answer was NOT read, which is
+    #     the lie this pair of assertions exists to catch. (b) proves the
+    #     instrument can see an open at all.
+    chmod 000 "$D/agent-answer.txt"
+    run_verdict "$D"
+    ck "(d) unreadable answer -> still exit 2" "2" "$V_RC"
+    ck_absent "(d) the answer file was never opened" "Permission denied" "$V_OUT"
+    ck_contains "(d) unreadable answer keeps the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
+    chmod 644 "$D/agent-answer.txt"
 
     # ---- (e) other ways the control fails, all exit 2 ----------------------
     #     Fired, but no envelope was emitted (probe dir had no passphrase).
@@ -180,6 +207,9 @@ run_suite() {
     run_verdict "$D" --answer "NOTHING-APPEARED"
     ck "(e1) no passphrase -> exit 2" "2" "$V_RC"
     ck_contains "(e1) verdict is COULD-NOT-DETERMINE" "COULD-NOT-DETERMINE" "$V_OUT"
+    ck_contains "(e1) evidence carries the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
+    ck_absent "(e1) verdict never quotes the unread answer" "NOTHING-APPEARED" "$V_OUT"
 
     #     Fired on the wrong event: the payload never names what we expected.
     D="$SANDBOX/e2"; C="$SANDBOX/e2-hooks.json"
@@ -188,9 +218,13 @@ run_suite() {
     run_verdict "$D" --answer "NOTHING-APPEARED" --expect-event session_start
     ck "(e2) wrong event -> exit 2" "2" "$V_RC"
     ck_contains "(e2) verdict names the wrong event" "wrong event wired" "$V_OUT"
+    ck_contains "(e2) wrong event keeps the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
     run_verdict "$D" --answer "NOTHING-APPEARED" --expect-tool Bash
     ck "(e2) wrong tool -> exit 2" "2" "$V_RC"
     ck_contains "(e2) verdict names the expected tool" "expected tool" "$V_OUT"
+    ck_contains "(e2) wrong tool keeps the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
 
     #     Control fine, but nobody captured an answer -- zero subjects again.
     D="$SANDBOX/e3"; C="$SANDBOX/e3-hooks.json"
@@ -200,9 +234,19 @@ run_suite() {
     ck "(e3) no answer captured -> exit 2" "2" "$V_RC"
     ck_contains "(e3) verdict says the control passed but nothing was captured" \
         "no agent answer was captured" "$V_OUT"
+    #     The ONE exit-2 shape where the control HELD. Claiming "the answer was
+    #     NOT read" here would be the same class of error the kit exists to stop
+    #     -- a sentence about evidence that does not match the evidence.
+    ck_absent "(e3) control-passed exit 2 does NOT claim the control failed" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
+    ck_contains "(e3) evidence says the answer was NOT CAPTURED" "(NOT CAPTURED)" "$V_OUT"
+    ck_contains "(e3) reason says the control held" "The control held" "$V_OUT"
     printf '' > "$D/agent-answer.txt"
     run_verdict "$D"
     ck "(e3) empty answer file -> exit 2" "2" "$V_RC"
+    ck_contains "(e3) empty answer is marked EMPTY, not NOT READ" "(EMPTY)" "$V_OUT"
+    ck_absent "(e3) empty answer does NOT claim the control failed" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
 
     #     Stale evidence from an earlier arm: the emitted envelope carries a
     #     passphrase that is not this run's.
@@ -213,11 +257,15 @@ run_suite() {
     run_verdict "$D" --answer "COMMS-PROBE-NEW-0002"
     ck "(e4) stale envelope -> exit 2" "2" "$V_RC"
     ck_contains "(e4) verdict names the stale evidence" "stale evidence" "$V_OUT"
+    ck_contains "(e4) evidence carries the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
 
     #     No probe dir at all.
     run_verdict "$SANDBOX/never-armed" --answer "NOTHING-APPEARED"
     ck "(e5) missing probe dir -> exit 2" "2" "$V_RC"
     ck_contains "(e5) verdict says nothing was armed" "nothing was ever armed" "$V_OUT"
+    ck_contains "(e5) evidence carries the NOT READ marker" \
+        "(NOT READ -- positive control failed)" "$V_OUT"
 
     #     Usage errors are their own code, so 2 keeps meaning could-not-inspect.
     run_verdict

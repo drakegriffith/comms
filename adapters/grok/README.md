@@ -60,7 +60,7 @@ it printed.
 (none)` while still loading 18 hooks from the user's own
 `~/.claude/settings.json`. grok answered `NOTHING-APPEARED` and the hook had
 never fired -- the same trap, sprung a second time, caught this time by the
-positive control. That run records nothing; the verdict below stands on the
+positive control. That run records nothing; the poll verdict above stands on the
 original probe.
 
 **What would upgrade this to push:** re-run the probe above against a newer grok
