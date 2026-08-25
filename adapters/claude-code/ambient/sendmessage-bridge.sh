@@ -25,14 +25,28 @@
 #      set), so this reads swarm_arm's documented participant-file layout
 #      directly, once, as a fallback only; seat_identities stays the single
 #      source of truth for the exact-seat path above.
+#
+#      AMBIGUITY: a prefix is NOT assumed unique. Every matching agent_id's
+#      seat is collected; resolution only succeeds when they all agree on
+#      ONE seat. More than one distinct seat is ambiguous and is treated as
+#      UNRESOLVED (below), never as "pick the first sorted match" -- on a
+#      live board dozens of participants can share a prefix (e.g. every
+#      inbox-cockpit-XXXX session), and silently narrowing a would-be
+#      fan-out to one arbitrary one of them is worse than not resolving at
+#      all. This is the same doctrine this repo already states for a
+#      colliding SEAT claimed by more than one agent -- see
+#      lib/swarm_arm.py:183-198 (seat_identities' docstring and the
+#      seat_collisions() detector it names): make the collision VISIBLE
+#      instead of picking a winner nobody chose.
 #   RESOLVED -> posts UNICAST: to=<seat> (never topic= at the same time --
 #     post()'s own guard forbids both; topic "@<seat>" is its side effect).
 #       kind comment; seat this session's seat; to the resolved seat
 #       text "-> <to>: <summary, else first 200 chars of message>"
-#   UNRESOLVED -> today's free-text fan-out row, UNCHANGED, plus one stderr
-#     line "unresolved target <to>" (telemetry only -- `to` is already written
-#     into the row text below, so stderr carries no more privacy risk than the
-#     mailbox does).
+#   UNRESOLVED (no match OR ambiguous) -> today's free-text fan-out row,
+#     UNCHANGED, plus one stderr line -- "unresolved target <to>" (no match)
+#     or "unresolved target <to>: ambiguous prefix match" (ambiguous).
+#     Telemetry only -- `to` is already written into the row text below, so
+#     stderr carries no more privacy risk than the mailbox does.
 #       kind comment; topic ops; seat this session's seat
 #       text "-> <to>: <summary, else first 200 chars of message>"
 #
@@ -168,18 +182,33 @@ try:
         sys.exit(0)  # nothing worth a row
 
     def resolve_seat(candidate):
-        """`candidate` -> a real seat in RUNID, or None. Exact seat match
-        first (against seat_identities' keys); then agent_id prefix match
-        (see the file header for why this reads the participant dir
-        directly instead of calling into lib/swarm_arm.py)."""
+        """`candidate` -> (seat, None) on a clean resolution, (None, reason)
+        otherwise ("no-match" or "ambiguous"). Exact seat match first
+        (against seat_identities' keys); then agent_id prefix match (see the
+        file header for why this reads the participant dir directly instead
+        of calling into lib/swarm_arm.py).
+
+        AMBIGUITY (issue #41 verifier finding on PR #52): a prefix is not
+        assumed unique -- on a live board dozens of participants can share
+        one prefix (e.g. every inbox-cockpit-XXXX session). The FIRST
+        sorted-filename hit used to win silently, which narrowed what should
+        have stayed a fan-out down to one arbitrary seat with no signal that
+        anything was lost. This collects every matching agent_id's seat and
+        only resolves when they all agree; more than one DISTINCT seat is
+        reported as ambiguous and falls through to the unresolved path below,
+        the same doctrine seat_identities' own docstring states for a
+        colliding SEAT (lib/swarm_arm.py:183-198, seat_collisions()) --
+        visibility over silent arbitrary choice.
+        """
         roster = swarm_arm.seat_identities(RUNID, state_dir=state_dir)
         if candidate in roster:
-            return candidate
+            return (candidate, None)
         pdir = os.path.join(state_dir, "swarm-arm", RUNID, "participants")
         try:
             names = sorted(os.listdir(pdir))
         except OSError:
-            return None
+            return (None, "no-match")
+        matched_seats = []
         for name in names:
             if not name.startswith(candidate):
                 continue
@@ -189,16 +218,24 @@ try:
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(data, dict) and data.get("seat"):
-                return data["seat"]
-        return None
+                if data["seat"] not in matched_seats:
+                    matched_seats.append(data["seat"])
+        if len(matched_seats) == 1:
+            return (matched_seats[0], None)
+        if len(matched_seats) > 1:
+            return (None, "ambiguous")
+        return (None, "no-match")
 
     text = "-> %s: %s" % (to, body)
-    resolved = resolve_seat(to)
+    resolved, reason = resolve_seat(to)
     if resolved:
         swarm_mailbox.post(RUNID, seat, "comment", text, to=resolved)
     else:
         swarm_mailbox.post(RUNID, seat, "comment", text, topic=TOPIC)
-        sys.stderr.write("unresolved target %s\n" % to)
+        if reason == "ambiguous":
+            sys.stderr.write("unresolved target %s: ambiguous prefix match\n" % to)
+        else:
+            sys.stderr.write("unresolved target %s\n" % to)
 except SystemExit:
     raise
 except Exception as exc:

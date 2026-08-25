@@ -381,6 +381,49 @@ def test_bridge_resolves_agent_id_prefix_to_unicast(env, tmp_path):
     assert row["topic"] == "@" + peer_seat
 
 
+def test_bridge_ambiguous_agent_id_prefix_falls_through_unresolved(env, tmp_path):
+    # Verifier finding on PR #52: the fallback returned the FIRST sorted
+    # prefix hit, so a prefix shared by many enrolled agents (e.g. dozens of
+    # inbox-cockpit-XXXX ids on the real machine-ops board) silently narrowed
+    # a would-be fan-out to one arbitrary seat instead of staying a fan-out.
+    enroll_first(env, tmp_path)
+    alpha_seat, alpha_id = enroll_peer(env, tmp_path, "projC", "agent-aaa-111")
+    bravo_seat, bravo_id = enroll_peer(env, tmp_path, "projD", "agent-aab-222")
+    assert alpha_seat != bravo_seat  # two DISTINCT seats share this prefix
+    shared_prefix = "agent-a"
+    assert alpha_id.startswith(shared_prefix) and bravo_id.startswith(shared_prefix)
+
+    r = run(BRIDGE, env, bridge_payload(to=shared_prefix))
+    assert r.returncode == 0
+    rows = [x for x in mailbox_rows(env) if x["kind"] == "comment"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert "to" not in row  # never narrowed to either seat
+    assert row["topic"] == "ops"
+    assert row["text"] == "-> %s: landed the fix" % shared_prefix
+    assert "unresolved target %s" % shared_prefix in r.stderr
+    assert "ambiguous" in r.stderr
+
+
+def test_bridge_unique_prefix_still_resolves_despite_other_participants(env, tmp_path):
+    # Positive control for the fix above: a prefix that matches exactly ONE
+    # participant still resolves, even with OTHER, differently-prefixed
+    # participants enrolled in the same run.
+    enroll_first(env, tmp_path)
+    peer_seat, peer_id = enroll_peer(env, tmp_path, "projB", "peer-xyz999")
+    other_seat, other_id = enroll_peer(env, tmp_path, "projE", "zulu-000111")
+    assert not other_id.startswith(peer_id[:8])
+
+    r = run(BRIDGE, env, bridge_payload(to=peer_id[:8]))
+    assert r.returncode == 0
+    rows = [x for x in mailbox_rows(env) if x["kind"] == "comment"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["to"] == peer_seat
+    assert row["topic"] == "@" + peer_seat
+    assert row["to"] != other_seat
+
+
 def test_bridge_unresolved_target_keeps_free_text_and_logs_stderr(env, tmp_path):
     enroll_first(env, tmp_path)
     r = run(BRIDGE, env, bridge_payload(to="nobody-by-this-name"))
