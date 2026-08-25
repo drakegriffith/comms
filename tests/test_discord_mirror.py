@@ -11,6 +11,7 @@ mirror writes or reads through.
 import json
 import os
 import sys
+import builtins
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1991,44 +1992,89 @@ def test_board_one_seat_repeating_itself_later_keeps_both_rows(board):
 
 
 class _SyncSpy:
-    """Records the ORDER of os.fsync and os.replace calls, delegating to the
-    real ones so the writes still happen."""
+    """Records writable opens, fsyncs and renames PER FILE, delegating to the
+    real calls so the writes still happen.
+
+    PER FILE IS THE WHOLE POINT (delta-verify on PR #51). The first version of
+    this spy asked "did any fsync happen before this replace", which three
+    separate files satisfy with ONE fsync between them: a pass writes held,
+    then the cursor, then the thread map, so the held file's fsync sat before
+    every later rename and the two later assertions were vacuous. Mutation
+    proved it -- deleting the fsync from threads._save_map left all six of
+    these tests green. A gate that inspects the wrong subject passes for
+    reasons that have nothing to do with the thing it names.
+
+    The question is now: for the temp file THIS rename is promoting, was there
+    an fsync on THAT file's own descriptor, after it was opened and before it
+    was renamed? Descriptor numbers are reused after a close, which is why the
+    match walks the events in order and pairs a rename with the LAST open of
+    its source path.
+    """
 
     def __init__(self, monkeypatch):
-        self.calls = []
+        self.events = []  # ("open", path, fd) | ("fsync", fd) | ("replace", src, dst)
+        real_open = builtins.open
         real_fsync, real_replace = os.fsync, os.replace
 
-        def fsync(fd):
-            self.calls.append("fsync")
+        def spy_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if any(c in mode for c in "wax+"):
+                try:
+                    self.events.append(("open", os.fspath(file), fh.fileno()))
+                except (TypeError, ValueError, OSError):
+                    pass  # opened on an fd, or not a real file
+            return fh
+
+        def spy_fsync(fd):
+            self.events.append(("fsync", fd))
             return real_fsync(fd)
 
-        def replace(src, dst):
-            self.calls.append("replace:" + os.path.basename(dst))
+        def spy_replace(src, dst):
+            self.events.append(("replace", os.fspath(src), os.fspath(dst)))
             return real_replace(src, dst)
 
-        monkeypatch.setattr(os, "fsync", fsync)
-        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(builtins, "open", spy_open)
+        monkeypatch.setattr(os, "fsync", spy_fsync)
+        monkeypatch.setattr(os, "replace", spy_replace)
 
-    def fsynced_before(self, name):
-        """True if at least one fsync happened before the replace of `name`."""
-        idx = next(
-            i for i, c in enumerate(self.calls) if c.startswith("replace:") and name in c
+    def _replace_index(self, name):
+        for i, ev in enumerate(self.events):
+            if ev[0] == "replace" and name in os.path.basename(ev[2]):
+                return i
+        raise AssertionError(
+            "no os.replace of a file named %r happened at all, so this test "
+            "proved nothing about durability. Events: %r" % (name, self.events)
         )
-        return "fsync" in self.calls[:idx]
+
+    def durably_renamed(self, name):
+        """True if the temp file promoted into `name` was fsynced on ITS OWN
+        descriptor, between its own open and its rename."""
+        idx = self._replace_index(name)
+        src = self.events[idx][1]
+        opened_at, fd = None, None
+        for i, ev in enumerate(self.events[:idx]):
+            if ev[0] == "open" and ev[1] == src:
+                opened_at, fd = i, ev[2]  # last open of this path wins
+        if opened_at is None:
+            return False
+        return any(
+            ev[0] == "fsync" and ev[1] == fd
+            for ev in self.events[opened_at + 1: idx]
+        )
 
 
-def test_held_file_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+def test_held_file_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
     spy = _SyncSpy(monkeypatch)
     _append_thread_row("alpha", "held row", at=_at(0))
     mirror.run_once(RUNID, lane=BOARD)
-    assert spy.fsynced_before(".held.json")
+    assert spy.durably_renamed(".held.json")
 
 
-def test_cursor_file_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+def test_cursor_file_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
     spy = _SyncSpy(monkeypatch)
     _append_thread_row("alpha", "held row", at=_at(0))
     mirror.run_once(RUNID, lane=BOARD)
-    assert spy.fsynced_before(".cursor.json")
+    assert spy.durably_renamed(".cursor.json")
 
 
 def test_the_default_lanes_cursor_is_fsynced_too(webhook, monkeypatch):
@@ -2040,15 +2086,15 @@ def test_the_default_lanes_cursor_is_fsynced_too(webhook, monkeypatch):
     spy = _SyncSpy(monkeypatch)
     swarm_mailbox.post(RUNID, "alpha", "finding", "a row")
     mirror.run_once(RUNID)
-    assert spy.fsynced_before(".cursor.json")
+    assert spy.durably_renamed(".cursor.json")
 
 
-def test_thread_map_is_fsynced_before_it_is_renamed_into_place(board, monkeypatch):
+def test_thread_map_is_fsynced_on_its_own_fd_before_its_rename(board, monkeypatch):
     spy = _SyncSpy(monkeypatch)
     _append_thread_row("alpha", "a", at=_at(0))
     _append_thread_row("bravo", "b", at=_at(30))
     mirror.run_once(RUNID, lane=BOARD)
-    assert spy.fsynced_before("threads.json")
+    assert spy.durably_renamed("threads.json")
 
 
 def test_held_write_survives_a_directory_that_cannot_be_fsynced(board, monkeypatch):
