@@ -58,7 +58,7 @@ mirror is that hub's, so "skip any seat with a ~" would silence exactly the
 rows that most need posting.
 
 CURSOR: per-run JSON file in $COMMS_STATE_DIR/discord-mirror/ mapping
-"<seat>@<source file>#<inode>" -> count of that seat's rows already mirrored
+"<seat>/<source file>#<inode>" -> count of that seat's rows already mirrored
 FROM THAT FILE. Seat files are append-only with one writer, so a per-file row
 count is a stable cursor: restarts never repost, new rows are exactly
 rows[count:]. Keying on the seat ALONE was issue #23 -- one seat can own rows

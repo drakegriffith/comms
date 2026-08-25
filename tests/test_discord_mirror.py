@@ -93,7 +93,7 @@ def _append_raw(seat, kind, text, topic=None, at=None):
 
 def _cursor_count(cursor, seat):
     """How many of `seat`'s rows this cursor has counted, across every source
-    file it holds a key for. Cursor keys are "<seat>@<file>#<inode>" (see
+    file it holds a key for. Cursor keys are "<seat>/<file>#<inode>" (see
     swarm_mailbox.cursor_key) and an inode is not knowable in advance, so a
     test asks this question instead of spelling a literal key."""
     prefix = seat + swarm_mailbox.CURSOR_KEY_SEP
