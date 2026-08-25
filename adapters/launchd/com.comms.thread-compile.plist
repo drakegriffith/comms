@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.comms.thread-compile.plist -- TEMPLATE, not a ready-to-load plist.
+
+  launchd cannot expand $HOME or resolve a checkout's own path, so the four
+  double-underscore placeholders in the ProgramArguments/StandardOutPath/
+  StandardErrorPath strings below are filled in by adapters/launchd/
+  install.sh at copy time (same shape as adapters/discord/install.sh
+  resolving $MIRROR from its own location before printing it): an absolute
+  interpreter path (from `command -v python3`), this checkout's absolute
+  path to scripts/comms_compile_threads.py, and two absolute log paths
+  under ~/Library/Logs/comms. Do not `launchctl bootstrap` this file
+  directly from the repo -- install.sh writes the filled-in copy to
+  ~/Library/LaunchAgents first. NOTE: install.sh's substitution is a blind
+  file-wide sed, so if you are reading this comment IN THE INSTALLED COPY
+  rather than the checkout, these words have already been replaced by the
+  real values below -- read the checked-out template for the placeholder
+  names themselves.
+
+  StartCalendarInterval, not an interval timer: this is "run at these two
+  wall-clock times", not "run every N seconds" -- 18:00 is a mid-evening
+  check-in compile (see scripts/comms_compile_threads.py's docstring, WHY
+  THIS MAKES 18:00 AND 01:00 THE SAME CODE PATH: both invocations run the
+  identical watermark-driven pass), 01:00 is the close. Two dict entries in
+  one array run the job at BOTH times, not just the last one listed.
+
+  No KeepAlive: unlike the Discord mirror's --follow loops, this job is a
+  one-shot compile that exits when done. KeepAlive would restart it in a
+  crash loop instead of waiting for the next scheduled minute.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.comms.thread-compile</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON3__</string>
+    <string>__SCRIPT__</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>18</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>1</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__STDOUT_LOG__</string>
+  <key>StandardErrorPath</key>
+  <string>__STDERR_LOG__</string>
+</dict>
+</plist>

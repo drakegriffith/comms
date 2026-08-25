@@ -91,7 +91,7 @@ def group_by_thread(rows):
     return groups
 
 
-def _parsed_at(row):
+def parsed_at(row):
     """This row's `at` as an AWARE datetime, or None if it has none or it does
     not parse.
 
@@ -125,7 +125,7 @@ def _speaking_rows(rows):
     renders."""
     dated = [
         (at, row)
-        for at, row in ((_parsed_at(r), r) for r in rows)
+        for at, row in ((parsed_at(r), r) for r in rows)
         if at is not None and row.get("kind") != STATUS_KIND
     ]
     dated.sort(key=lambda pair: pair[0])
@@ -234,7 +234,7 @@ def last_gap_s(rows):
     return (at_b - at_a).total_seconds()
 
 
-def _env_int(var, default):
+def env_int(var, default):
     """This knob's value from the environment, or `default` if unset or
     unparseable. A typo in a launchd plist or a shell profile must degrade to
     the documented default, never take the command down -- see
@@ -370,12 +370,12 @@ def _run_threads(swarm_mailbox, args):
     window_s = (
         flags["alive"]
         if flags["alive"] is not None
-        else _env_int(ALIVE_SECONDS_VAR, DEFAULT_WINDOW_S)
+        else env_int(ALIVE_SECONDS_VAR, DEFAULT_WINDOW_S)
     )
     min_seats = (
         flags["seats"]
         if flags["seats"] is not None
-        else _env_int(ALIVE_SEATS_VAR, DEFAULT_MIN_SEATS)
+        else env_int(ALIVE_SEATS_VAR, DEFAULT_MIN_SEATS)
     )
 
     threads_inspected, threads_alive, results = _inspect_threads(
