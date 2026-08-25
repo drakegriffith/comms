@@ -45,6 +45,15 @@ mailbox (lib/swarm_mailbox.py; exit 0 ok, 1 bad args, 2 usage):
              it advances over every row the view selected, so rows you cut
              off come back only via --replay. Consume a read whole.)
   subs      <runid> <seat>          (this seat's subscribed slice; = read --subs)
+  cursor take    <path>             (rows as JSONL on stdin; prints a receipt
+                                     line then the fresh rows, writes NOTHING)
+  cursor confirm <path> <receipt>   (commits that receipt)
+            (the confirmed-delivery cursor for shell drivers: deliver the rows
+             first, confirm only if the delivery exited 0, and a failed
+             delivery re-delivers instead of dropping. Feed it from
+             `comms read ... --replay` -- read's own cursor commits at print
+             time, and two cursors over one stream is one too many.
+             See bin/comms-poll-driver.)
 
 arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):
   arm       <runid> [--topic <set>]
@@ -70,7 +79,7 @@ sub="$1"
 shift
 
 case "$sub" in
-  init|subscribe|post|read)
+  init|subscribe|post|read|cursor)
     exec python3 "$LIB/swarm_mailbox.py" "$sub" "$@"
     ;;
   subs)

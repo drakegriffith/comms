@@ -23,6 +23,33 @@ Constraints worth knowing before debugging:
   to have worked, so letting it advance would convert a failed kimi invocation
   into a silent drop. One cursor owns delivery, and it is the driver's.
 
+## The driver is now three parameters, not a loop
+
+`poll-driver.sh` used to contain the read/format/invoke/remember loop. That
+loop had nothing kimi-specific in it except the invocation, so it lives once in
+`bin/comms-poll-driver` (issue #29) and this script is the kimi-shaped part:
+the resume command, the directory-bound cwd, and the cursor key. It expands to
+
+```
+bin/comms-poll-driver <runid> <seat> --cursor <cursor> --cwd <cwd> \
+    -- kimi -r <session-id> -p '{}' --output-format text
+```
+
+where the generic driver substitutes the formatted rows for `{}` on the argv
+array (never through a shell) and confirms the cursor only when `kimi` exits 0
+-- the same rule as before, now enforced by the shared `comms cursor
+take`/`confirm` pair rather than by a private copy of it here (issue #30).
+
+**Cursor format changed, once.** The old cursor was the `at` of the last row
+delivered, at `$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>`; the shared helper
+counts rows per seat, at `<runid>-<seat>.json` beside it. Both mean "everything
+up to here is delivered", so the driver TRANSLATES an existing timestamp cursor
+on its first run -- a seat's count is how many of its rows are at or before
+that timestamp -- and leaves the old file as `<runid>-<seat>.pre-counts`. A
+live session therefore does not replay its whole board on upgrade. If the
+translation cannot be done the driver says so on stderr and starts from zero,
+which costs one replay and loses nothing.
+
 ## Usage
 
 ```
@@ -31,3 +58,6 @@ bash adapters/kimi/poll-driver.sh <runid> <seat> <kimi-session-id> <cwd> [--inte
 
 `--once` polls a single time and prints what would be delivered (no kimi
 invocation, cursor untouched) -- use it to test wiring without a live session.
+The preview banner now names the delivery command rather than the session id
+(`comms-poll-driver: would deliver 2 row(s) (cwd ...): kimi -r ...`); the
+delivered text itself is unchanged, header included.

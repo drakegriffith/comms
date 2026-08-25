@@ -100,15 +100,25 @@ it -- its flags (`-r/--resume`, `-p`) say part (b) would pass, but the probe has
 not been run, so `adapters/grok/README.md` records that as an expectation, not
 as a measurement, and the adapter stays poll.
 
-**Template.** `adapters/kimi/` -- README plus a driver script. The driver's one
-hard rule: it owns the delivery cursor, and that cursor advances only after an
-invocation that SUCCEEDED, so a failed delivery re-delivers instead of dropping
-rows. Which is why it reads with `bin/comms read ... --replay`: the CLI's own
-cursor advances at print time, before delivery is known to have worked, and two
-cursors over one delivery is how rows go missing quietly. A driver written in
-Python gets that rule for free from `swarm_mailbox.DeliveryCursor` -- see the
-delivery-cursor bullet under "What every adapter owes" -- and should use it
-rather than re-deriving the arithmetic.
+**Template.** `bin/comms-poll-driver` -- do not write the loop again. It is the
+generic form of this category: it reads a seat's rows, hands them to an
+ARBITRARY command, and advances its cursor only when that command exits 0. The
+runtime-specific part is the command, which is a parameter, so the driver
+carries no runtime name in its control flow. An adapter here is then a README
+plus, at most, a few lines naming the invocation -- `adapters/kimi/` is the
+worked example, and it is now 3 parameters (resume command, cwd, cursor key)
+around one `exec`.
+
+The driver's one hard rule, which you inherit by using it: the cursor advances
+only after an invocation that SUCCEEDED, so a failed delivery re-delivers
+instead of dropping rows. Which is why it reads with `bin/comms read ...
+--replay`: the CLI's own cursor advances at print time, before delivery is
+known to have worked, and two cursors over one delivery is how rows go missing
+quietly. In Python that rule comes from `swarm_mailbox.DeliveryCursor`; in bash
+it comes from `comms cursor take` / `comms cursor confirm`, the same helper
+split across the two processes a shell delivery needs -- see the
+delivery-cursor bullet under "What every adapter owes". Do not re-derive the
+arithmetic in either language.
 
 ### push -- proven injection
 
@@ -257,10 +267,15 @@ not promote them from a changelog.
     `--replay` when you keep one of these: your cursor plus the CLI's over one
     stream is one too many. Worked example: `adapters/remote/sync.py`, whose
     "delivery" is the local mirror write, with `confirm()` on the line after
-    it. `adapters/kimi/poll-driver.sh` keeps the same DISCIPLINE in bash
-    (a last-`at` file, advanced only after a successful `kimi` invocation) but
-    not yet this helper -- it has no Python entry point to hold one from, and
-    that gap is what keeps #30 open.
+    it. **From bash, the same helper, split across two processes** (issue #29):
+    one invocation cannot wait for a delivery that happens after it exits, so
+    `comms cursor take <path>` reads rows as JSONL on stdin and prints a
+    RECEIPT line then the fresh rows, writing NOTHING, and `comms cursor
+    confirm <path> <receipt>` commits that receipt. Run confirm only when the
+    delivery exited 0. `bin/comms-poll-driver` and, through it,
+    `adapters/kimi/poll-driver.sh` are the worked examples, so an adapter that
+    uses the driver never touches these two commands directly; reach for them
+    only when driving something the driver cannot express.
 - **The delivery oracle.** When auditing whether rows landed, read
   `swarm-heartbeat.log` in the state dir and the mailbox files. Seat
   self-reports UNDERCOUNT: an agent that received an injection does not
@@ -279,7 +294,7 @@ Copy the nearest one and edit; do not start from a blank file.
 | Category | Files | Copy from |
 | --- | --- | --- |
 | poll | `adapters/<name>/README.md` | `adapters/pi/README.md` |
-| resume-driver | `README.md` + `<name>-driver.sh` | `adapters/kimi/` |
+| resume-driver | `README.md`, and `bin/comms-poll-driver` with your invocation | `adapters/kimi/` |
 | push | `README.md` + `install.sh` | `adapters/codex/` |
 
 ```

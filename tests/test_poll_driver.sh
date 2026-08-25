@@ -1,0 +1,263 @@
+#!/bin/bash
+# test_poll_driver.sh -- the generic poll driver (bin/comms-poll-driver) and the
+# bash-callable confirmed-delivery cursor it rides on (comms cursor take/confirm).
+#
+# THE HARD RULE UNDER TEST: the cursor advances ONLY when the delivery command
+# exits 0. Everything else here is scaffolding around four claims --
+#   1. a confirmed delivery advances the cursor (and is not re-delivered),
+#   2. a FAILED delivery re-delivers (the row reaches the runtime twice, which
+#      is the recoverable failure; being dropped is the unrecoverable one),
+#   3. no rows means no cursor movement -- and no cursor file at all,
+#   4. a restarted driver resumes from the persisted cursor, in a new process.
+#
+# The fake runtime is the oracle: it APPENDS everything it is handed to an
+# inbox file and exits with whatever code a control file names, so "was this
+# row delivered, and how many times" is a count in a file, not a self-report.
+#
+# All state is isolated: COMMS_ROOT and COMMS_STATE_DIR are mktemp dirs, so
+# nothing here touches a real mailbox, a real cursor, or the real state dir.
+#
+# Exit: 0 all passed, 1 any failed. Prints a passed/failed count either way.
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"        # <repo>/tests
+REPO="$(cd "$SELF_DIR/.." && pwd)"
+COMMS="$REPO/bin/comms"
+DRIVER="$REPO/bin/comms-poll-driver"
+KIMI_DRIVER="$REPO/adapters/kimi/poll-driver.sh"
+
+export COMMS_STATE_DIR="$(mktemp -d)"
+export COMMS_ROOT="$(mktemp -d)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$COMMS_STATE_DIR" "$COMMS_ROOT" "$WORK"' EXIT
+
+PASS=0
+FAIL=0
+
+ok()   { echo "ok:   $1"; PASS=$((PASS + 1)); }
+bad()  { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+# assert <desc> <condition-rc>
+assert() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# eq <desc> <want> <got>
+eq() {
+  if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want [$2], got [$3])"; fi
+}
+
+RUN="polldrv-$$"
+INBOX="$WORK/inbox"
+RCFILE="$WORK/rc"
+: > "$INBOX"
+echo 0 > "$RCFILE"
+
+# ---- the fake runtime ------------------------------------------------------
+# Takes the rows on stdin, records them, then fails or succeeds on command.
+cat > "$WORK/fake-runtime" <<'EOF'
+#!/bin/bash
+{ echo "--- delivery ---"; cat; } >> "$INBOX_PATH"
+exit "$(cat "$RC_PATH" 2>/dev/null || echo 0)"
+EOF
+# Same, but the rows arrive as an ARGUMENT (the {} form) instead of on stdin.
+cat > "$WORK/fake-runtime-arg" <<'EOF'
+#!/bin/bash
+{ echo "--- delivery ---"; printf '%s\n' "$1"; echo "cwd=$PWD"; } >> "$INBOX_PATH"
+exit "$(cat "$RC_PATH" 2>/dev/null || echo 0)"
+EOF
+chmod +x "$WORK/fake-runtime" "$WORK/fake-runtime-arg"
+export INBOX_PATH="$INBOX" RC_PATH="$RCFILE"
+
+CURSOR="$COMMS_STATE_DIR/poll-driver/$RUN/beta.all.json"
+LOG="$COMMS_STATE_DIR/poll-driver/$RUN/beta.all.log"
+
+# grep -c prints 0 and EXITS 1 on no match, so these must not use `|| echo 0`
+# (that prints two lines and every count comparison then fails for the wrong
+# reason -- caught while writing this suite).
+deliveries() { local n; n="$(grep -c -- '--- delivery ---' "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
+handed()     { local n; n="$(grep -c -F -- "$1" "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
+
+# ---- 1. empty board: nothing new, and NOTHING is written -------------------
+"$COMMS" init "$RUN" >/dev/null
+out="$("$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "empty board exits 0" 0 "$rc"
+case "$out" in *"nothing new"*) ok "empty board says nothing new" ;;
+               *) bad "empty board says nothing new (got: $out)" ;; esac
+assert "empty board writes NO cursor file" "$([ ! -e "$CURSOR" ]; echo $?)"
+eq "empty board makes no delivery" 0 "$(deliveries)"
+
+# ---- 2. dry run: shows the rows, delivers nothing, moves nothing -----------
+"$COMMS" post "$RUN" alpha finding "row-one" --topic work >/dev/null
+"$COMMS" post "$RUN" alpha finding "row-two" --topic work >/dev/null
+out="$("$DRIVER" "$RUN" beta --once --dry-run -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "dry run exits 0" 0 "$rc"
+case "$out" in *row-one*row-two*) ok "dry run prints both rows" ;;
+               *) bad "dry run prints both rows (got: $out)" ;; esac
+case "$out" in *"NOT instructions"*) ok "dry run keeps the data-not-instructions header" ;;
+               *) bad "dry run keeps the data-not-instructions header" ;; esac
+assert "dry run writes NO cursor file" "$([ ! -e "$CURSOR" ]; echo $?)"
+eq "dry run makes no delivery" 0 "$(deliveries)"
+
+# ---- 3. confirmed delivery advances ----------------------------------------
+out="$("$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "confirmed delivery exits 0" 0 "$rc"
+eq "the runtime was handed one batch" 1 "$(deliveries)"
+eq "row-one reached the runtime once" 1 "$(handed row-one)"
+eq "row-two reached the runtime once" 1 "$(handed row-two)"
+assert "cursor file exists after a confirmed delivery" "$([ -f "$CURSOR" ]; echo $?)"
+eq "cursor counts alpha's two rows" '{"alpha": 2}' "$(cat "$CURSOR")"
+
+# ---- 4. no new rows: no cursor movement, no delivery ------------------------
+before="$(cat "$CURSOR")"
+out="$("$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" 2>&1)"
+case "$out" in *"nothing new"*) ok "a second poll with no new rows says nothing new" ;;
+               *) bad "a second poll with no new rows says nothing new (got: $out)" ;; esac
+eq "no new rows leaves the cursor byte-identical" "$before" "$(cat "$CURSOR")"
+eq "no new rows makes no second delivery" 1 "$(deliveries)"
+
+# ---- 5. FAILED delivery holds the cursor ------------------------------------
+"$COMMS" post "$RUN" alpha finding "row-three" --topic work >/dev/null
+echo 7 > "$RCFILE"
+out="$("$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "a failed delivery is not a driver failure (exit 0)" 0 "$rc"
+case "$out" in *"exited 7"*re-deliver*) ok "failed delivery says so, loudly, on stderr" ;;
+               *) bad "failed delivery says so, loudly (got: $out)" ;; esac
+eq "cursor did NOT advance past the failed delivery" "$before" "$(cat "$CURSOR")"
+eq "row-three was attempted once" 1 "$(handed row-three)"
+
+# ---- 6. ...and the held rows RE-DELIVER (the hard rule) --------------------
+echo 0 > "$RCFILE"
+"$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "row-three reached the runtime a SECOND time after the failure" 2 "$(handed row-three)"
+eq "the two already-confirmed rows were NOT re-sent" 1 "$(handed row-one)"
+eq "cursor advanced only after the delivery that worked" '{"alpha": 3}' "$(cat "$CURSOR")"
+
+# ---- 7. restart resumes ------------------------------------------------------
+# Every invocation above was already a separate process; this one adds a new
+# row after the restart to prove the resume point is the CURSOR and not luck.
+"$COMMS" post "$RUN" alpha finding "row-four" --topic work >/dev/null
+"$DRIVER" "$RUN" beta --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "a restarted driver delivers only the new row" 1 "$(handed row-four)"
+eq "a restarted driver does not replay row-three" 2 "$(handed row-three)"
+eq "cursor after the restart" '{"alpha": 4}' "$(cat "$CURSOR")"
+
+# ---- 8. the CLI's own read cursor was never touched -------------------------
+assert "driver leaves no CLI read cursor for this run" \
+       "$([ ! -e "$COMMS_STATE_DIR/read-cursor/$RUN" ]; echo $?)"
+out="$("$COMMS" read "$RUN" beta 2>&1)"
+n="$(printf '%s\n' "$out" | grep -c row-)"
+eq "a human's plain read still sees all four rows (--replay left them)" 4 "$n"
+
+# ---- 9. delivery accounting -------------------------------------------------
+assert "a delivery log exists" "$([ -f "$LOG" ]; echo $?)"
+eq "log records the failed attempt" 1 "$(grep -c '"delivered": false' "$LOG")"
+eq "log records the confirmed deliveries" 3 "$(grep -c '"delivered": true' "$LOG")"
+case "$(head -1 "$LOG")" in *'"rc": 0'*'"rows": 2'*) ok "log line carries rows and rc" ;;
+  *) bad "log line carries rows and rc (got: $(head -1 "$LOG"))" ;; esac
+
+# ---- 10. the {} form, and --cwd --------------------------------------------
+: > "$INBOX"
+"$COMMS" post "$RUN" alpha finding "row-five" --topic work >/dev/null
+"$DRIVER" "$RUN" beta --once --cwd "$WORK" -- "$WORK/fake-runtime-arg" '{}' >/dev/null 2>&1
+eq "the {} form hands the rows as an argument" 1 "$(handed row-five)"
+eq "--cwd runs the delivery command there" 1 "$(handed "cwd=$WORK")"
+
+# ---- 11. one reader, one view: a topic view keeps its own cursor ------------
+: > "$INBOX"
+"$COMMS" post "$RUN" alpha finding "topic-a-row" --topic aaa >/dev/null
+"$COMMS" post "$RUN" alpha finding "topic-b-row" --topic bbb >/dev/null
+"$DRIVER" "$RUN" gamma --once --topic aaa -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "a --topic driver delivers that topic's row" 1 "$(handed topic-a-row)"
+eq "a --topic driver does not deliver another topic's row" 0 "$(handed topic-b-row)"
+assert "the topic view has its own cursor file" \
+       "$([ -f "$COMMS_STATE_DIR/poll-driver/$RUN/gamma.topic-aaa.json" ]; echo $?)"
+
+# ---- 12. enroll-first invariant --------------------------------------------
+out="$("$DRIVER" "$RUN" delta --once --enroll -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "--enroll into an unarmed run fails loudly (exit 1)" 1 "$rc"
+case "$out" in *"comms arm $RUN"*) ok "the refusal names the fix" ;;
+               *) bad "the refusal names the fix (got: $out)" ;; esac
+"$COMMS" arm "$RUN" >/dev/null 2>&1
+out="$("$DRIVER" "$RUN" delta --once --enroll --topics "work,aaa" -- "$WORK/fake-runtime" 2>&1)"; rc=$?
+eq "--enroll into an armed run proceeds" 0 "$rc"
+out="$("$COMMS" status "$RUN" 2>&1)"
+case "$out" in *delta*) ok "the seat is on the participant roster" ;;
+               *) bad "the seat is on the participant roster (got: $out)" ;; esac
+out="$("$COMMS" subs "$RUN" delta --replay 2>&1)"
+case "$out" in *topic-a-row*) ok "--topics subscribed the seat's mailbox slice" ;;
+               *) bad "--topics subscribed the seat's mailbox slice (got: $out)" ;; esac
+
+# ---- 13. usage / argument errors --------------------------------------------
+out="$("$DRIVER" "$RUN" beta --once -- 2>&1)"; rc=$?
+eq "-- with no command is a usage error" 2 "$rc"
+out="$("$DRIVER" "$RUN" beta --nonsense --once -- true 2>&1)"; rc=$?
+eq "an unknown option is a usage error" 2 "$rc"
+out="$("$DRIVER" "$RUN" beta --topic x --subs --once -- true 2>&1)"; rc=$?
+eq "--topic with --subs is rejected before any read" 2 "$rc"
+out="$("$DRIVER" "$RUN" beta --once --cwd /no/such/dir -- true 2>&1)"; rc=$?
+eq "a missing --cwd fails at startup" 1 "$rc"
+
+# ---- 14. the cursor CLI on its own ------------------------------------------
+C2="$WORK/c2.json"
+rows='{"seat": "alpha", "at": "1", "text": "a"}
+{"seat": "alpha", "at": "2", "text": "b"}'
+out="$(printf '%s\n' "$rows" | "$COMMS" cursor take "$C2")"; rc=$?
+eq "cursor take exits 0" 0 "$rc"
+eq "cursor take prints the receipt first" '{"alpha": 2}' "$(printf '%s\n' "$out" | head -1)"
+eq "cursor take prints the fresh rows after it" 2 "$(printf '%s\n' "$out" | tail -n +2 | grep -c seat)"
+assert "cursor take writes NOTHING" "$([ ! -e "$C2" ]; echo $?)"
+out="$(printf '%s\n' "$rows" | "$COMMS" cursor take "$C2" | tail -n +2 | wc -l | tr -d ' ')"
+eq "a second take without confirm returns the same rows" 2 "$out"
+"$COMMS" cursor confirm "$C2" '{"alpha": 2}'; rc=$?
+eq "cursor confirm exits 0" 0 "$rc"
+out="$(printf '%s\n' "$rows" | "$COMMS" cursor take "$C2" | tail -n +2 | wc -l | tr -d ' ')"
+eq "after confirm those rows are gone" 0 "$out"
+"$COMMS" cursor confirm "$C2" '{"alpha": 1}' 2>/dev/null
+eq "a stale receipt cannot rewind the cursor" '{"alpha": 2}' "$(cat "$C2")"
+out="$(printf 'not json\n' | "$COMMS" cursor take "$C2" 2>&1)"; rc=$?
+eq "malformed input to cursor take fails loudly, never silently skips" 1 "$rc"
+out="$("$COMMS" cursor confirm "$C2" 'not json' 2>&1)"; rc=$?
+eq "a malformed receipt is rejected" 1 "$rc"
+out="$("$COMMS" cursor sideways "$C2" 2>&1)"; rc=$?
+eq "an unknown cursor verb is rejected" 1 "$rc"
+out="$("$COMMS" cursor 2>&1)"; rc=$?
+eq "bare cursor is rejected" 1 "$rc"
+
+# ---- 15. the kimi adapter, now a caller of the generic driver ---------------
+out="$("$KIMI_DRIVER" 2>&1)"; rc=$?
+eq "kimi driver still exits 2 with usage on no args" 2 "$rc"
+out="$("$KIMI_DRIVER" "$RUN" epsilon sess-1 /no/such/dir --once 2>&1)"; rc=$?
+eq "kimi driver still rejects a missing cwd" 1 "$rc"
+out="$("$KIMI_DRIVER" "$RUN" epsilon sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi driver --once exits 0" 0 "$rc"
+case "$out" in *"would deliver"*row-one*) ok "kimi driver --once still previews the rows" ;;
+               *) bad "kimi driver --once still previews the rows (got: $out)" ;; esac
+case "$out" in *"NOT instructions"*) ok "kimi driver --once keeps the data-not-instructions header" ;;
+               *) bad "kimi driver --once keeps the data-not-instructions header" ;; esac
+assert "kimi driver --once advances no cursor" \
+       "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.json" ]; echo $?)"
+
+# The one-time migration off the old last-`at` timestamp cursor: a driver that
+# had already delivered everything must not re-deliver the whole board.
+mkdir -p "$COMMS_STATE_DIR/kimi-cursor"
+LAST_AT="$("$COMMS" read "$RUN" zeta --replay | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["at"])')"
+printf '%s' "$LAST_AT" > "$COMMS_STATE_DIR/kimi-cursor/$RUN-zeta"
+out="$("$KIMI_DRIVER" "$RUN" zeta sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi cursor migration exits 0" 0 "$rc"
+case "$out" in *"nothing new"*) ok "a migrated timestamp cursor does not replay the board" ;;
+               *) bad "a migrated timestamp cursor does not replay the board (got: $out)" ;; esac
+assert "migration leaves the old cursor file behind as evidence" \
+       "$([ -f "$COMMS_STATE_DIR/kimi-cursor/$RUN-zeta.pre-counts" ]; echo $?)"
+"$COMMS" post "$RUN" alpha finding "post-migration-row" --topic work >/dev/null
+out="$("$KIMI_DRIVER" "$RUN" zeta sess-1 "$WORK" --once 2>&1)"
+case "$out" in *post-migration-row*) ok "a migrated cursor still delivers what comes next" ;;
+               *) bad "a migrated cursor still delivers what comes next (got: $out)" ;; esac
+
+# ---- 16. isolation control: nothing leaked outside the temp dirs -----------
+if [ -e "$HOME/.comms/state/poll-driver/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \
+   || [ -e "$HOME/.comms/state/kimi-cursor/$RUN-zeta" ]; then
+  bad "state leaked outside the temp dirs"
+else
+  ok "no state outside COMMS_STATE_DIR / COMMS_ROOT"
+fi
+
+echo "poll driver test: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
