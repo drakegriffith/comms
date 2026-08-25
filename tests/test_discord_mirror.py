@@ -35,6 +35,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("COMMS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("COMMS_SECRETS_FILE", str(tmp_path / "comms.env"))
     monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     yield tmp_path
 
