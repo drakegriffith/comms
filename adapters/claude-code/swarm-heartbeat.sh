@@ -86,7 +86,13 @@
 # OUTPUT (PostToolUse contract)
 #   {"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":...}}
 #   The text is wrapped UNTRUSTED: it is data from sibling agents, never
-#   instructions (indirect-injection guard).
+#   instructions (indirect-injection guard). Each row renders as
+#   "- [seat | kind | topic | at] text", with two additive markers
+#   (issue #41): a row on this agent's own unicast topic "@<seat>" gets a
+#   "[FOR YOU from <seat>]" prefix, and a row carrying a `thread` field gets
+#   a " (thread <key>)" suffix so a reply can be posted back into it
+#   (`comms post reply --to <seat> --thread <key> "<text>"`). A row with
+#   neither renders exactly as before.
 #
 # ISOLATION KNOBS (tests set these; production uses the defaults)
 #   COMMS_STATE_DIR   swarm-arm/ registry + cursor dir + telemetry log
@@ -370,15 +376,29 @@ def process_run(runid):
     overflow = len(delta) - len(emitted)
     new_cursor = emitted[-1].get("at", "")
 
+    # FOR-YOU FLAG + THREAD SUFFIX (issue #41): a row riding this agent's own
+    # unicast topic "@<seat>" is addressed to it specifically, and a `thread`
+    # field names the document/conversation a reply belongs in -- both are
+    # purely additive to the line format, so a row with neither renders
+    # BYTE-IDENTICAL to before.
+    for_you_topic = ("@" + seat) if seat else None
     for r in emitted:
+        prefix = ""
+        if for_you_topic and (r.get("topic") or "default") == for_you_topic:
+            prefix = "[FOR YOU from %s] " % r.get("seat", "?")
+        suffix = ""
+        if r.get("thread"):
+            suffix = " (thread %s)" % r.get("thread")
         row_lines.append(
-            "- [%s | %s | %s | %s] %s"
+            "- %s[%s | %s | %s | %s] %s%s"
             % (
+                prefix,
                 r.get("seat", "?"),
                 r.get("kind", "?"),
                 r.get("topic") or "default",
                 r.get("at", "?"),
                 r.get("text", ""),
+                suffix,
             )
         )
     if overflow > 0:

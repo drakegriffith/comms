@@ -26,7 +26,11 @@
 # participant enrolled with a topic set + seat sees only its topics and its own
 # "@<seat>" unicast; (j) ECHO SUPPRESSION; (k) parent admin verbs do not opt in;
 # (l) IDENTITY GATE -- a payload carrying no recognized identity key writes no
-# cursor, no telemetry and no stdout, and cannot enroll (issue #27).
+# cursor, no telemetry and no stdout, and cannot enroll (issue #27); (p) FOR
+# YOU FLAG -- a row on this agent's own unicast topic renders with a
+# "[FOR YOU from <seat>]" prefix, a bystander row does not (issue #41);
+# (q) THREAD SUFFIX -- a row carrying `thread` renders with " (thread <key>)",
+# a row without one does not; (r) the two compose on one row.
 
 set -uo pipefail
 
@@ -118,12 +122,17 @@ list_agent_id_payload() {  # list_agent_id_payload [command]
 }
 
 # Append a row directly to a seat's jsonl (deterministic `at`).
-post_row() {  # post_row <runid> <seat> <kind> <text> <at> [topic]
+post_row() {  # post_row <runid> <seat> <kind> <text> <at> [topic] [thread]
     local dir="$ROOT/comms-$1"
     mkdir -p "$dir"
     local topic="${6:-default}"
-    printf '{"seat":"%s","at":"%s","kind":"%s","text":"%s","topic":"%s"}\n' \
-        "$2" "$5" "$3" "$4" "$topic" >> "$dir/$2.jsonl"
+    if [ -n "${7:-}" ]; then
+        printf '{"seat":"%s","at":"%s","kind":"%s","text":"%s","topic":"%s","thread":"%s"}\n' \
+            "$2" "$5" "$3" "$4" "$topic" "$7" >> "$dir/$2.jsonl"
+    else
+        printf '{"seat":"%s","at":"%s","kind":"%s","text":"%s","topic":"%s"}\n' \
+            "$2" "$5" "$3" "$4" "$topic" >> "$dir/$2.jsonl"
+    fi
 }
 
 HOOK_OUT=""
@@ -426,6 +435,57 @@ run_suite() {  # one fully-isolated pass
     ck "(o) array agent_id emits ZERO stdout" "" "$HOOK_OUT"
     ck "(o) array agent_id writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
     ck "(o) array agent_id writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
+
+    # -----------------------------------------------------------------------
+    # (p) FOR-YOU FLAG (issue #41): a row riding this agent's own unicast
+    #     topic "@<seat>" renders with a "[FOR YOU from <row seat>]" prefix.
+    #     A bystander row on a plain topic in the same beat renders with the
+    #     pre-#41 line format, unchanged.
+    RP="hbtestp$$x$RANDOM"
+    arm_run "$RP"
+    enroll_agent "$RP" agentP "projP" seatP
+    post_row "$RP" seatQ finding "DIRECT-TO-ME" "2026-07-01T00:00:01+00:00" "@seatP"
+    post_row "$RP" seatQ finding "JUST-A-PROJP-ROW" "2026-07-01T00:00:02+00:00" "projP"
+    run_hook agentP; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(p) unicast row carries the FOR YOU prefix" \
+        "[FOR YOU from seatQ] [seatQ | finding | @seatP |" "$ctx"
+    ck_contains "(p) FOR YOU row still carries its own text" "DIRECT-TO-ME" "$ctx"
+    if printf '%s\n' "$ctx" | grep -qF -- '- [seatQ | finding | projP |'; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "  FAIL (p) bystander row format changed: $ctx" >&2
+    fi
+    ck_absent "(p) bystander row is not tagged FOR YOU" \
+        "FOR YOU from seatQ] [seatQ | finding | projP" "$ctx"
+
+    # -----------------------------------------------------------------------
+    # (q) THREAD SUFFIX (issue #41): a row carrying a `thread` field renders
+    #     with a " (thread <key>)" suffix so a reply can target it; a row
+    #     with no thread carries no suffix.
+    RQ="hbtestq$$x$RANDOM"
+    arm_run "$RQ"
+    enroll_agent "$RQ" agentQ
+    post_row "$RQ" seatR finding "ABOUT-A-DOC" "2026-07-02T00:00:01+00:00" "default" "doc:comms/README.md"
+    post_row "$RQ" seatR finding "NO-THREAD-HERE" "2026-07-02T00:00:02+00:00"
+    run_hook agentQ; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(q) threaded row carries the thread suffix" \
+        "ABOUT-A-DOC (thread doc:comms/README.md)" "$ctx"
+    ck_contains "(q) unthreaded row keeps the pre-#41 line format" \
+        "- [seatR | finding | default | 2026-07-02T00:00:02+00:00] NO-THREAD-HERE" "$ctx"
+    ck_absent "(q) unthreaded row carries no thread suffix" \
+        "NO-THREAD-HERE (thread" "$ctx"
+
+    # -----------------------------------------------------------------------
+    # (r) FOR YOU + THREAD COMPOSE: a unicast reply-target row carries both
+    #     markers at once.
+    RR="hbtestr$$x$RANDOM"
+    arm_run "$RR"
+    enroll_agent "$RR" agentR "projR" seatR2
+    post_row "$RR" seatS finding "REPLY-TARGET" "2026-07-03T00:00:01+00:00" "@seatR2" "doc:comms/lib/x.py"
+    run_hook agentR; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(r) unicast + threaded row carries both markers" \
+        "[FOR YOU from seatS] [seatS | finding | @seatR2 | 2026-07-03T00:00:01+00:00] REPLY-TARGET (thread doc:comms/lib/x.py)" \
+        "$ctx"
 
     rm -rf "$STATE" "$ROOT"
 }

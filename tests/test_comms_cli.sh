@@ -35,7 +35,7 @@ check() {
     FAIL=$((FAIL + 1))
     return
   fi
-  if [ -n "$need" ] && ! printf '%s' "$out" | grep -qF "$need"; then
+  if [ -n "$need" ] && ! printf '%s' "$out" | grep -qF -- "$need"; then
     echo "FAIL: $desc (rc ok, output missing: $need)"
     FAIL=$((FAIL + 1))
     return
@@ -147,6 +147,26 @@ else
   echo "FAIL: a --topic read never consumes another topic's rows (rc=$rc)"
   FAIL=$((FAIL + 1))
 fi
+
+# ---- post short form / env defaults (issue #41) ----------------------------
+# COMMS_RUN / COMMS_SEAT let `comms post <kind> <text> --to ...` work without
+# spelling out <runid> <seat>. Isolated to its own runid/seat so it cannot be
+# confused with the explicit-form rows already posted on $RUN above.
+out="$("$COMMS" 2>&1)"
+check "usage text documents --thread" 2 "$?" "$out" "--thread"
+RS="commstest-short-$$"
+out="$(COMMS_RUN="$RS" COMMS_SEAT=shortseat "$COMMS" post reply "short-form reply" --to othr 2>&1)"; rc=$?
+check "post short form (2 positionals) exits 0, env defaults fill runid/seat" 0 "$rc" "$out" "short-form reply"
+out="$(cat "$COMMS_ROOT/comms-$RS/shortseat.jsonl" 2>&1)"
+check "short form wrote to COMMS_RUN's mailbox under COMMS_SEAT's own file" 0 0 "$out" '"seat": "shortseat"'
+check "short form row carries --to" 0 0 "$out" '"to": "othr"'
+out="$(COMMS_RUN="$RS" COMMS_SEAT=shortseat "$COMMS" post reply "threaded reply" --to othr --thread doc:x 2>&1)"; rc=$?
+check "post short form with --thread exits 0" 0 "$rc" "$out" "threaded reply"
+check "short form row carries --thread's key" 0 0 "$(cat "$COMMS_ROOT/comms-$RS/shortseat.jsonl")" '"thread": "doc:x"'
+out="$(env -u CLAUDE_SESSION_ID COMMS_RUN="$RS" "$COMMS" post reply "no seat available" --to othr 2>&1)"; rc=$?
+check "post short form with no COMMS_SEAT and no session id fails loud" 1 "$rc" "$out" "COMMS_SEAT"
+out="$("$COMMS" post "$RUN" alpha reply "explicit form unaffected" --topic t0 2>&1)"; rc=$?
+check "post explicit 4-positional form still works unchanged" 0 "$rc" "$out" "explicit form unaffected"
 
 # ---- claims routing BEFORE arming (the not-armed edge) ---------------------
 out="$("$COMMS" claim "$RUN" alpha /tmp/x 2>&1)"; rc=$?
