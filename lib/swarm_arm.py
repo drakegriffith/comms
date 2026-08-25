@@ -209,6 +209,17 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     module's per-participant roster removed. Same for an unarmed run, an
     unreadable file, or a malformed one: [] and no write.
 
+    A SUBSCRIBE-ALL PARTICIPANT IS NEVER NARROWED, and this is the subtlest
+    rule here. An EMPTY topics list means "every topic" everywhere in this
+    module (see enroll and participant_sub). So adding one topic to an empty
+    list would not widen that agent's reach by one document -- it would COLLAPSE
+    it from the whole board down to that single document, hiding every other
+    row from an agent that was receiving all of them. The guard lives here,
+    not in the caller, because this module is where "empty means all" is
+    DEFINED; a caller that had to remember it would eventually not. Such a
+    participant gets [] and no write, the same shape as "nothing to add to" --
+    both mean the subscription is unchanged and the caller has nothing to do.
+
     NO-OP MEANS NO WRITE. When every topic is already present the file is not
     touched at all -- not rewritten with identical bytes. This runs on every
     Write/Edit beat of every participant, and an agent editing one file in a
@@ -265,6 +276,8 @@ def add_topics(runid, agent_id, topics, state_dir=None):
         if not isinstance(data, dict):
             return []
         current = _as_topics(data.get("topics"))
+        if not current:
+            return []  # subscribe-all: adding would NARROW it, see above
         merged = list(current)
         for t in new:
             if t not in merged:
@@ -293,6 +306,35 @@ def add_topics(runid, agent_id, topics, state_dir=None):
                 lock_fh.close()  # releases the flock
             except OSError:
                 pass
+
+
+def own_topics(runid, agent_id, state_dir=None):
+    """The topics this participant DECLARED FOR ITSELF, with no run-level
+    fallback. [] means either "not enrolled" or "subscribe-all".
+
+    This is deliberately NOT participant_sub. participant_sub answers a
+    DELIVERY question -- "which topics should this agent receive" -- and to
+    answer it, it substitutes the run's default subscription from meta.json
+    when the agent declared none. A MUTATOR must not see that substitution:
+    add_topics would union the doc key into a borrowed default and write the
+    result back as the agent's own list, freezing a run-level default into a
+    per-agent one and losing every later change to meta. Two questions, two
+    functions.
+
+    The heartbeat's doc-enrol leg uses this to decide whether a topic is
+    genuinely new before calling add_topics, so a re-Write of the same file
+    emits no telemetry.
+    """
+    try:
+        with open(
+            os.path.join(_participants_dir(runid, state_dir), _safe(agent_id))
+        ) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return _as_topics(data.get("topics"))
 
 
 def seat_identities(runid, state_dir=None):

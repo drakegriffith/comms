@@ -495,3 +495,67 @@ def test_add_topics_concurrent_writers_lose_no_update(isolated_state):
     topics, _ = swarm_arm.participant_sub("r1", "agent-a")
     assert topics[0] == "projA"
     assert sorted(topics[1:]) == sorted("doc:d%d" % i for i in range(8))
+
+
+def test_add_topics_refuses_to_narrow_a_subscribe_all_participant():
+    # An EMPTY topics list means "every topic" (see enroll/participant_sub).
+    # Adding one topic to it would not widen the agent's reach by a document,
+    # it would COLLAPSE it to that one document and hide the rest of the
+    # board. The guard lives in this module because this module is where
+    # "empty means all" is defined.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a")
+    path = _participant_path("r1", "agent-a")
+    st = os.stat(path)
+    os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
+    before = os.stat(path)
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == []
+    assert os.stat(path).st_ino == before.st_ino
+    assert swarm_arm.participant_sub("r1", "agent-a")[0] == []
+
+
+def test_add_topics_does_not_freeze_the_run_default_into_a_per_agent_list():
+    # participant_sub reports the RUN-level default for an agent that declared
+    # no topics of its own. add_topics must not union into that borrowed
+    # default and write it back -- the agent would stop tracking meta.json.
+    swarm_arm.arm("r1", topic="projDefault")
+    swarm_arm.enroll("r1", "agent-a")
+    assert swarm_arm.participant_sub("r1", "agent-a")[0] == ["projDefault"]
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == []
+    with open(_participant_path("r1", "agent-a")) as fh:
+        assert json.load(fh)["topics"] == []
+    assert swarm_arm.participant_sub("r1", "agent-a")[0] == ["projDefault"]
+
+
+# ---- own_topics -- the read side a MUTATOR needs ---------------------------
+
+
+def test_own_topics_returns_only_what_the_participant_declared():
+    swarm_arm.arm("r1", topic="projDefault")
+    swarm_arm.enroll("r1", "agent-a", topics="projA,projB")
+    assert swarm_arm.own_topics("r1", "agent-a") == ["projA", "projB"]
+
+
+def test_own_topics_does_not_fall_back_to_the_run_default():
+    # The one behavior that distinguishes it from participant_sub.
+    swarm_arm.arm("r1", topic="projDefault")
+    swarm_arm.enroll("r1", "agent-a")
+    assert swarm_arm.participant_sub("r1", "agent-a")[0] == ["projDefault"]
+    assert swarm_arm.own_topics("r1", "agent-a") == []
+
+
+def test_own_topics_on_a_missing_or_malformed_participant_is_empty():
+    swarm_arm.arm("r1")
+    assert swarm_arm.own_topics("r1", "ghost") == []
+    assert swarm_arm.own_topics("never-armed-run", "agent-a") == []
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    with open(_participant_path("r1", "agent-a"), "w") as fh:
+        fh.write("{not json")
+    assert swarm_arm.own_topics("r1", "agent-a") == []
+
+
+def test_own_topics_sees_what_add_topics_just_wrote():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"])
+    assert swarm_arm.own_topics("r1", "agent-a") == ["projA", "doc:comms/x.py"]
