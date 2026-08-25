@@ -202,6 +202,9 @@ def _field(obj, *keys):
 # unidentified caller leaves as a bystander by construction: it cannot enroll,
 # cannot reach process_run, and writes no cursor, no mtime and no telemetry.
 agent_id = _field(payload, "agent_id", "session_id")
+# Type guard: non-string identity values are treated as no identity (bystander exit).
+if not isinstance(agent_id, str):
+    agent_id = None
 safe_agent = "".join(c for c in (agent_id or "") if c.isalnum() or c in "-_.")
 if not safe_agent:
     sys.exit(0)
