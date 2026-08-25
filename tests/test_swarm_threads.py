@@ -37,6 +37,17 @@ def row(seat, offset_s, kind="comment", thread="doc:comms/a.md", text="t"):
     }
 
 
+# ---- closed vocabulary: STATUS_KIND is a real swarm_mailbox kind ----------
+#
+# swarm_mailbox.VALID_KINDS is the CLOSED vocabulary post() enforces; a kind
+# spelled here that is not in it would make the "status rows never count"
+# rule silently vacuous the moment a status row could never legally exist.
+
+
+def test_status_kind_is_a_valid_mailbox_kind():
+    assert st.STATUS_KIND in mb.VALID_KINDS
+
+
 # ---- group_by_thread -------------------------------------------------------
 
 

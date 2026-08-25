@@ -21,6 +21,11 @@ without a human remembering to run it by hand.
 
 ## Install
 
+Run this from the MAIN checkout, not a worktree: `install.sh` resolves
+`$SCRIPT` from its own location on disk and bakes that absolute path into the
+plist, so a plist installed from a worktree points at a directory that
+`git worktree remove` can delete out from under an already-scheduled job.
+
 ```
 bash adapters/launchd/install.sh
 ```
