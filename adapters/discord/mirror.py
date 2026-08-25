@@ -544,11 +544,21 @@ def post_content(url, content, username=None):
 
 def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
     """The never-drop-silently channel: skipped rows go to stderr AND a
-    durable state-dir file, then the cursor may advance past them."""
+    durable state-dir file, then the cursor may advance past them.
+
+    A row here reached this function because it WAS in `fresh` (delivery
+    failed after retries), which means it still carries
+    swarm_mailbox.SRC_FILE_KEY -- the in-memory-only source-file tag (see
+    collect_new). Strip it before this, the one place a sibling row gets
+    written back to disk in this module, or the "never persisted" guarantee
+    that key's docstring makes would be false the first time a delivery
+    failed."""
     os.makedirs(_mirror_dir(lane), exist_ok=True)
     path = _skipped_path(runid, lane)
     with open(path, "a") as fh:
         for row in rows:
+            if isinstance(row, dict) and swarm_mailbox.SRC_FILE_KEY in row:
+                row = {k: v for k, v in row.items() if k != swarm_mailbox.SRC_FILE_KEY}
             fh.write(json.dumps({"reason": reason, "row": row}) + "\n")
     sys.stderr.write(
         "discord mirror: SKIPPED %d row(s) (%s); recorded in %s\n"
