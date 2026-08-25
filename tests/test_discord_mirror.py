@@ -91,6 +91,15 @@ def _append_raw(seat, kind, text, topic=None, at=None):
         fh.write(json.dumps(row) + "\n")
 
 
+def _cursor_count(cursor, seat):
+    """How many of `seat`'s rows this cursor has counted, across every source
+    file it holds a key for. Cursor keys are "<seat>@<file>#<inode>" (see
+    swarm_mailbox.cursor_key) and an inode is not knowable in advance, so a
+    test asks this question instead of spelling a literal key."""
+    prefix = seat + swarm_mailbox.CURSOR_KEY_SEP
+    return sum(v for k, v in cursor.items() if k == seat or k.startswith(prefix))
+
+
 def _fake_post(monkeypatch, posted):
     """Install a post_content stand-in that records (url, content, username)
     without touching the network. `posted` accumulates 3-tuples."""
@@ -659,8 +668,8 @@ def test_convo_lane_cursor_independent_of_default_lane_cursor(monkeypatch):
     assert mirror.run_once(RUNID, lane="convo") == 0
     all_cursor = mirror._load_cursor(RUNID, "all")
     convo_cursor = mirror._load_cursor(RUNID, "convo")
-    assert all_cursor == {"alpha": 1}
-    assert convo_cursor == {"alpha": 1}
+    assert _cursor_count(all_cursor, "alpha") == 1
+    assert _cursor_count(convo_cursor, "alpha") == 1
     # Two separate files on disk, not one shared cursor.
     assert mirror._cursor_path(RUNID, "all") != mirror._cursor_path(RUNID, "convo")
 
@@ -704,10 +713,10 @@ def test_convo_lane_filtered_rows_still_advance_cursor(monkeypatch):
     swarm_mailbox.post(RUNID, "alpha", "finding", "not conversation")
     assert mirror.run_once(RUNID, lane="convo") == 0
     cursor = mirror._load_cursor(RUNID, "convo")
-    assert cursor.get("alpha") == 1  # cursor moved even though nothing posted
+    assert _cursor_count(cursor, "alpha") == 1  # moved even though nothing posted
     # A second pass with no new rows still posts nothing and cursor unchanged.
     assert mirror.run_once(RUNID, lane="convo") == 0
-    assert mirror._load_cursor(RUNID, "convo").get("alpha") == 1
+    assert _cursor_count(mirror._load_cursor(RUNID, "convo"), "alpha") == 1
 
 
 def test_convo_lane_mixed_batch_only_posts_convo_rows(monkeypatch):
@@ -723,7 +732,7 @@ def test_convo_lane_mixed_batch_only_posts_convo_rows(monkeypatch):
     assert "skip me" not in joined
     assert "skip me too" not in joined
     # cursor advanced past ALL three rows for alpha, not just the posted one
-    assert mirror._load_cursor(RUNID, "convo") == {"alpha": 3}
+    assert _cursor_count(mirror._load_cursor(RUNID, "convo"), "alpha") == 3
 
 
 def test_all_lane_is_unfiltered_mirrors_everything(monkeypatch):
@@ -1009,7 +1018,7 @@ def test_follow_all_survives_one_run_failing(webhook, capsys, monkeypatch):
     assert "boom" in joined  # run-bad's row still POSTed; only its cursor save failed
     # the good run's cursor was actually persisted through to the real
     # _save_cursor (flaky_save must delegate, not swallow the good case)
-    assert mirror._load_cursor("run-ok") == {"alpha": 1}
+    assert _cursor_count(mirror._load_cursor("run-ok"), "alpha") == 1
     # the bad run's cursor never landed: its save raised
     assert mirror._load_cursor("run-bad") == {}
 
@@ -1147,3 +1156,227 @@ def test_main_interval_flag_bad_value_returns_2(capsys):
 def test_main_lane_flag_missing_value_returns_2(capsys):
     assert mirror.main(["mirror.py", "--once", RUNID, "--lane"]) == 2
     assert "--lane needs a value" in capsys.readouterr().err
+
+
+# ---- source-file cursor identity (#20, #23) --------------------------------
+#
+# The mirror reads EVERY .jsonl in the run dir, including the pull mirror
+# `remote~<hub>.jsonl` that adapters/remote writes. Those rows are COPIES of
+# hub rows the hub's own mirror already posted to this same channel, and one
+# seat can own rows in both files at once -- the two facts behind #20 (double
+# post) and #23 (an older-`at` pulled row shifting a per-seat count cursor).
+
+
+def _append_to_file(filename, seat, text, at, kind="finding", runid=RUNID):
+    """Write one row straight into a NAMED file, which is what tells a pulled
+    copy from a first-class row -- _append_raw always writes <seat>.jsonl."""
+    d = os.path.join(os.environ["COMMS_ROOT"], "comms-%s" % runid)
+    os.makedirs(d, exist_ok=True)
+    row = {"seat": seat, "at": at, "kind": kind, "text": text, "topic": "default"}
+    with open(os.path.join(d, filename), "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def test_pulled_rows_are_never_posted_a_second_time(webhook):
+    """#20: rows in remote~<hub>.jsonl were already posted to this channel by
+    the hub's own mirror. Posting them here is the cross-machine double
+    mirror that moved 167 rows on the first live pull."""
+    _append_to_file("remote~studio.jsonl", "beta~studio", "pulled row",
+                    "2026-08-24T10:00:00+00:00")
+    assert mirror.run_once(RUNID) == 0
+    assert webhook.requests == []
+
+
+def test_first_class_pushed_seat_file_is_still_posted(webhook):
+    """The direction control for the test above. A pushed row lands on the
+    HUB as a first-class `alpha~macbook.jsonl`, whose only mirror is this
+    one -- so "skip any seat containing ~" would silence exactly the rows
+    that most need posting. The discriminator is the FILE."""
+    _append_to_file("alpha~macbook.jsonl", "alpha~macbook", "pushed row",
+                    "2026-08-24T10:00:00+00:00")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+    assert "pushed row" in webhook.requests[0]["content"]
+
+
+def test_pulled_rows_still_advance_the_cursor(webhook):
+    """Count-but-skip, the same shape the lane filter already uses: a
+    filtered row that did not advance the cursor would be re-scanned on
+    every poll forever."""
+    _append_to_file("remote~studio.jsonl", "beta~studio", "pulled row",
+                    "2026-08-24T10:00:00+00:00")
+    assert mirror.run_once(RUNID) == 0
+    cursor = mirror._load_cursor(RUNID)
+    assert [v for v in cursor.values()] == [1]
+    assert [k for k in cursor if "remote~studio.jsonl" in k]
+
+
+def test_pulled_row_with_an_older_at_never_reposts_a_delivered_row(webhook):
+    """#23, the verifier's repro: seat X~studio owns rows in its own file AND
+    in the pull mirror. A pull lands a row whose `at` sorts BETWEEN two rows
+    already posted from the first-class file; under a per-seat count that
+    shifts the merged index sequence and 'pushed-B' posts twice."""
+    _append_to_file("x~studio.jsonl", "x~studio", "pushed-A",
+                    "2026-08-24T10:00:00+00:00")
+    _append_to_file("x~studio.jsonl", "x~studio", "pushed-B",
+                    "2026-08-24T12:00:00+00:00")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+    assert "pushed-A" in webhook.requests[0]["content"]
+    assert "pushed-B" in webhook.requests[0]["content"]
+    # The pull brings home an OLDER row for the same seat, other file.
+    _append_to_file("remote~laptop.jsonl", "x~studio", "pulled-older",
+                    "2026-08-24T11:00:00+00:00")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1  # nothing new: no repost, no duplicate
+
+
+def test_normal_poll_still_advances_the_new_shape_cursor(webhook):
+    """Positive control: the cursor a plain local run writes is keyed by
+    seat AND source file, and it still moves."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "one")
+    assert mirror.run_once(RUNID) == 0
+    cursor = mirror._load_cursor(RUNID)
+    assert list(cursor.values()) == [1]
+    key = list(cursor)[0]
+    assert key.startswith("alpha@alpha.jsonl#")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "two")
+    assert mirror.run_once(RUNID) == 0
+    assert mirror._load_cursor(RUNID)[key] == 2
+    assert len(webhook.requests) == 2
+
+
+def test_old_shape_cursor_migrates_in_place_on_the_next_poll(webhook):
+    """Back-compat on deploy: the old {seat: count} file is read, honored,
+    and rewritten in the new key space -- the bare seat key retired, so the
+    same budget is never spent twice."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "delivered before upgrade")
+    swarm_mailbox.post(RUNID, "alpha", "finding", "posted after upgrade")
+    os.makedirs(os.path.dirname(mirror._cursor_path(RUNID)), exist_ok=True)
+    with open(mirror._cursor_path(RUNID), "w") as fh:
+        json.dump({"alpha": 1}, fh)  # pre-#39 shape: row 0 already seen
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+    assert "posted after upgrade" in webhook.requests[0]["content"]
+    cursor = mirror._load_cursor(RUNID)
+    assert "alpha" not in cursor
+    assert list(cursor.values()) == [2]
+    # ...and the migrated cursor is stable: a third poll posts nothing.
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+
+
+def test_skipped_log_records_the_row_as_authored_not_the_read_time_tag(webhook, capsys):
+    """The skipped file is the durable replay record, so it must hold the
+    row its author wrote -- the source tag is a fact about THIS machine's
+    disk, never part of the row."""
+    webhook.script[:] = [429] * (mirror.MAX_RETRIES + 1)
+    swarm_mailbox.post(RUNID, "alpha", "finding", "undeliverable")
+    assert mirror.run_once(RUNID) == 1
+    with open(mirror._skipped_path(RUNID)) as fh:
+        recorded = [json.loads(l) for l in fh]
+    assert swarm_mailbox.SOURCE_KEY not in recorded[0]["row"]
+
+
+# ---- one poller per (run, lane): fcntl.flock -------------------------------
+
+
+def _hold_lock(path):
+    """Take the same exclusive flock a running poller holds, from a second
+    open file description -- flock is per-description, so this contends with
+    this very process exactly as a second process would."""
+    import fcntl
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_second_poller_on_the_same_run_and_lane_no_ops(webhook, capsys):
+    """Two pollers on one (run, lane) both read the cursor, both post, and
+    both advance it -- double-posted rows, not an error. The lock makes the
+    loser a no-op instead of a duplicate."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "only once")
+    held = _hold_lock(mirror._lock_path(RUNID))
+    try:
+        assert mirror.run_once(RUNID) == 0
+        assert webhook.requests == []
+        assert mirror._load_cursor(RUNID) == {}  # cursor untouched, not advanced
+        err = capsys.readouterr().err
+        assert "another poller" in err
+        assert RUNID in err
+    finally:
+        os.close(held)
+
+
+def test_the_rows_are_still_posted_once_the_lock_frees(webhook, capsys):
+    """The other half: a skipped pass loses nothing, because the next poll
+    delivers exactly what the locked-out one would have."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "delayed, not dropped")
+    held = _hold_lock(mirror._lock_path(RUNID))
+    assert mirror.run_once(RUNID) == 0
+    os.close(held)
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 1
+    assert "delayed, not dropped" in webhook.requests[0]["content"]
+
+
+def test_a_different_run_never_contends(webhook):
+    """Per (runid, lane), not per process: --follow-all walks every run in
+    one pass, so a lock that spanned runs would serialize the whole fleet
+    behind one busy run (and slice 2's fleet-wide thread map needs its own
+    lock precisely because this one does not span runs)."""
+    other = "test-other-run"
+    swarm_mailbox.post(other, "alpha", "finding", "other run's row")
+    held = _hold_lock(mirror._lock_path(RUNID))
+    try:
+        assert mirror.run_once(other) == 0
+        assert len(webhook.requests) == 1
+    finally:
+        os.close(held)
+
+
+def test_a_different_lane_on_the_same_run_never_contends(monkeypatch):
+    """One lane's `all` job and another's `convo` job on the same runid are
+    a documented, supported pair -- separate state dirs, separate locks."""
+    posted = []
+    _fake_post(monkeypatch, posted)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "comment", "chatting")
+    held = _hold_lock(mirror._lock_path(RUNID, "all"))
+    try:
+        assert mirror.run_once(RUNID, lane="convo") == 0
+        assert posted and "chatting" in posted[0][1]
+    finally:
+        os.close(held)
+
+
+def test_lock_is_released_between_passes(webhook):
+    """Held for one pass, not for the process's life: back-to-back passes in
+    one process must not deadlock, and an ad-hoc --once must be able to run
+    between a follower's polls."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "one")
+    assert mirror.run_once(RUNID) == 0
+    swarm_mailbox.post(RUNID, "alpha", "finding", "two")
+    assert mirror.run_once(RUNID) == 0
+    assert len(webhook.requests) == 2
+
+
+def test_lock_file_lives_in_the_lane_state_dir(webhook):
+    assert mirror._lock_path(RUNID, "convo") != mirror._lock_path(RUNID, "all")
+    assert "discord-mirror-convo" in mirror._lock_path(RUNID, "convo")
+    assert mirror._lock_path(RUNID).endswith(".lock")
+
+
+def test_missing_secret_still_exits_2_when_another_poller_holds_the_lock(capsys):
+    """Order matters: the missing-secret exit is --once's contract and must
+    not be masked into a quiet 0 by a lock another poller happens to hold."""
+    held = _hold_lock(mirror._lock_path(RUNID))
+    try:
+        os.environ.pop("DISCORD_COMMS_WEBHOOK_URL", None)
+        with pytest.raises(SystemExit) as exc:
+            mirror.run_once(RUNID)
+        assert exc.value.code == 2
+    finally:
+        os.close(held)

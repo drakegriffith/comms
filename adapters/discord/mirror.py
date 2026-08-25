@@ -39,17 +39,44 @@ WHAT IS NOT MIRRORED: claims, arming, subscriptions, cursors -- machine-local
 state stays machine-local. Command direction (Discord -> machine) is out of
 scope; durable commands go through the GitHub board.
 
-READ PATH: reuses swarm_mailbox.read_siblings (never a second parser).
+READ PATH: reuses swarm_mailbox.read_siblings (never a second parser), with
+with_source=True so each row carries the identity of the file it came out of.
 read_siblings excludes the named seat's own file, so the mirror reads as a
 reserved observer seat ("discord-mirror") that never posts; it therefore sees
 every real seat's rows. Do not name a real seat "discord-mirror" -- its rows
 would be invisible to the mirror by construction.
 
-CURSOR: per-run JSON file in $COMMS_STATE_DIR/discord-mirror/ mapping seat ->
-count of rows already mirrored. Seat files are append-only with one writer, so
-a per-seat row count is a stable cursor: restarts never repost, new rows are
-exactly rows[count:]. Written via tmp + os.replace so a crash never leaves a
-half-written cursor.
+PULLED ROWS ARE NOT MIRRORED (issue #20): the run dir also holds
+`remote~<hub>.jsonl`, the file adapters/remote appends rows PULLED off another
+machine to. Those rows are copies of hub rows the hub's own mirror already
+posted to this same channel, so posting them here posts everything twice, once
+per machine. They are dropped by the keep-predicate and still counted against
+the cursor (count-but-skip, the same shape the lane filter uses). The
+discriminator is the SOURCE FILE, never the seat string: a row this machine
+PUSHED lands on the hub as a first-class `alpha~macbook.jsonl` whose only
+mirror is that hub's, so "skip any seat with a ~" would silence exactly the
+rows that most need posting.
+
+CURSOR: per-run JSON file in $COMMS_STATE_DIR/discord-mirror/ mapping
+"<seat>@<source file>#<inode>" -> count of that seat's rows already mirrored
+FROM THAT FILE. Seat files are append-only with one writer, so a per-file row
+count is a stable cursor: restarts never repost, new rows are exactly
+rows[count:]. Keying on the seat ALONE was issue #23 -- one seat can own rows
+in two files at once (its own and the pull mirror), and a pulled row with an
+older `at` then shifts the merged sequence and re-posts a delivered row. The
+inode makes the key an identity rather than a name, so a purged and re-created
+seat file starts a fresh count instead of skipping its rows. A cursor file in
+the old {seat: count} shape is read, honored, and migrated in place on the
+next poll (swarm_mailbox.fresh_rows_by_seat). Written via tmp + os.replace so
+a crash never leaves a half-written cursor.
+
+CONCURRENCY (enforced, not advisory): every pass takes an exclusive
+fcntl.flock on <runid>.lock in the lane's state dir, so exactly one poller
+owns a (runid, lane) at a time. A second poller does NOT block or double-post:
+it writes one stderr line and returns 0, and the next poll picks the rows up
+(delayed, never dropped). The lock is per (runid, lane) and held for one pass
+only -- unrelated runs never contend, --follow-all can walk the whole fleet
+serially, and an ad-hoc --once can slot between a follower's polls.
 
 FAILURE: a row that cannot be delivered after the retry budget is NEVER
 dropped silently -- it is written to <runid>.skipped.jsonl in the state dir
@@ -93,6 +120,7 @@ Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
       2 usage or missing webhook secret (--once only).
 """
 
+import fcntl
 import json
 import os
 import re
@@ -170,6 +198,70 @@ def _cursor_path(runid, lane=DEFAULT_LANE):
 
 def _skipped_path(runid, lane=DEFAULT_LANE):
     return os.path.join(_mirror_dir(lane), _safe(runid) + ".skipped.jsonl")
+
+
+# ---- one poller per (run, lane) -------------------------------------------
+#
+# WHAT THIS PREVENTS: two pollers on one (run, lane) both read the same
+# cursor, both post, and BOTH advance it -- the result is double-posted rows
+# in the channel, not a race that merely errors. The README used to forbid
+# that in prose; prose is not a mechanism, and the two shapes that trip it
+# (`--follow <runid>` twice, or `--follow <runid>` alongside a `--follow-all`
+# covering the same lane) are one launchd plist typo apart.
+#
+# WHY NON-BLOCKING, AND WHY 0: a poller that blocked would queue passes
+# behind each other and, under a launchd KeepAlive job, pile up processes
+# waiting for a lock the first one holds forever. Skipping is free instead:
+# the loser's rows are exactly what the winner is posting, and anything that
+# arrives after the winner's read is picked up by the loser's NEXT poll --
+# delayed, never dropped. Exit 0 for the same reason the missing-secret path
+# does not crash-loop: contention is a normal condition, not a failure.
+#
+# WHY PER PASS AND NOT PER PROCESS: --follow-all walks every run in one pass,
+# so a process-lifetime lock would have to be taken per run anyway, and a
+# human's ad-hoc `--once` would be locked out of a machine running a follower
+# for as long as it runs. (Slice 2's fleet-wide thread map needs its OWN
+# lock: its key spans runs, which this lock deliberately does not -- see
+# issue #40, D3.)
+def _lock_path(runid, lane=DEFAULT_LANE):
+    return os.path.join(_mirror_dir(lane), _safe(runid) + ".lock")
+
+
+def _acquire_pass_lock(runid, lane=DEFAULT_LANE):
+    """Take this (runid, lane)'s exclusive flock, or return None if another
+    poller holds it. Returns the open fd, which the caller must close (that
+    releases the lock, including if the process dies)."""
+    os.makedirs(_mirror_dir(lane), exist_ok=True)
+    fd = os.open(_lock_path(runid, lane), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _is_pulled_row(row):
+    """True if this row was read out of adapters/remote's pull mirror file --
+    a copy of a hub row the hub's own mirror already posted to this channel.
+    See module docstring, PULLED ROWS ARE NOT MIRRORED (issue #20)."""
+    return swarm_mailbox.is_mirror_source(row)
+
+
+def _lane_keep(lane):
+    """This lane's keep-predicate: which FRESH rows get posted. Two filters,
+    composed rather than merged, because they answer different questions --
+    "is this row conversation" (a lane's taste) and "did some other machine's
+    mirror already post this row" (a fleet-wide fact true in every lane).
+    Rows either one rejects are still counted against the cursor."""
+    lane_filter = _is_convo_row if lane == "convo" else None
+
+    def keep(row):
+        if _is_pulled_row(row):
+            return False
+        return True if lane_filter is None else lane_filter(row)
+
+    return keep
 
 
 def _is_convo_row(row):
@@ -421,27 +513,32 @@ def _save_cursor(runid, cursor, lane=DEFAULT_LANE):
 
 
 def collect_new(runid, lane=DEFAULT_LANE):
-    """Return (fresh_rows, new_cursor). Per-seat row counts are the cursor:
-    seat files are append-only single-writer, so row N of a seat is stable
-    forever and 'new' is exactly indices >= cursor[seat]. read_siblings sorts
-    by `at` with a stable sort, so per-seat file order is preserved.
+    """Return (fresh_rows, new_cursor). Per-(seat, source file) row counts are
+    the cursor: seat files are append-only single-writer, so row N of a seat
+    IN ONE FILE is stable forever and 'new' is exactly indices >= that key's
+    count. read_siblings sorts by `at` with a stable sort, so each file's own
+    order is preserved inside the merged stream.
 
-    LANE FILTER: the cursor always advances over EVERY row (seen[] counts
-    every row regardless of lane), but only rows matching this lane's filter
-    are returned in `fresh` for posting. The default lane's filter is a
-    no-op (every new row is fresh, exactly the pre-lane behavior); the convo
-    lane additionally requires _is_convo_row. A row a lane filters out still
-    counts against that lane's cursor -- see module docstring, LANES.
+    SOURCE-KEYED, NOT SEAT-KEYED (issues #20, #23): the read asks for
+    with_source=True, which stamps each row with the identity of the file it
+    was parsed out of. That is what makes the count stable when one seat owns
+    rows in two files at once, and what tells a pulled copy from a first-class
+    row -- see the module docstring's CURSOR and PULLED ROWS sections.
+
+    LANE FILTER: the cursor always advances over EVERY row (every row is
+    counted regardless of lane), but only rows this lane's keep-predicate
+    accepts are returned in `fresh` for posting -- pulled rows in every lane,
+    plus non-conversation rows in the convo lane. A row the predicate rejects
+    still counts against that lane's cursor -- see module docstring, LANES.
 
     The counting itself is swarm_mailbox.fresh_rows_by_seat (moved there when
     adapters/remote/sync.py needed the same arithmetic over another machine's
     rows -- one cursor rule, two adapters). This function keeps what is
     Discord-specific: which run to read, which lane's cursor, and which rows
     that lane wants."""
-    rows = swarm_mailbox.read_siblings(runid, OBSERVER_SEAT)
+    rows = swarm_mailbox.read_siblings(runid, OBSERVER_SEAT, with_source=True)
     cursor = _load_cursor(runid, lane)
-    keep = _is_convo_row if lane == "convo" else None
-    return swarm_mailbox.fresh_rows_by_seat(rows, cursor, keep=keep)
+    return swarm_mailbox.fresh_rows_by_seat(rows, cursor, keep=_lane_keep(lane))
 
 
 def chunk_rows(rows, machine, cap=CONTENT_CAP, identities=None):
@@ -535,12 +632,19 @@ def post_content(url, content, username=None):
 
 def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
     """The never-drop-silently channel: skipped rows go to stderr AND a
-    durable state-dir file, then the cursor may advance past them."""
+    durable state-dir file, then the cursor may advance past them.
+
+    Rows are recorded AS AUTHORED (swarm_mailbox.without_source): this file is
+    the replay record, and the source tag is a read-time fact about this
+    machine's disk, not part of the row its author wrote."""
     os.makedirs(_mirror_dir(lane), exist_ok=True)
     path = _skipped_path(runid, lane)
     with open(path, "a") as fh:
         for row in rows:
-            fh.write(json.dumps({"reason": reason, "row": row}) + "\n")
+            fh.write(
+                json.dumps({"reason": reason, "row": swarm_mailbox.without_source(row)})
+                + "\n"
+            )
     sys.stderr.write(
         "discord mirror: SKIPPED %d row(s) (%s); recorded in %s\n"
         % (len(rows), reason, path)
@@ -551,8 +655,37 @@ def run_once(runid, lane=DEFAULT_LANE):
     """Mirror everything new in one lane, exactly once. Exit-code semantics
     of main(). Raises SystemExit(2) via resolve_webhook_url if this lane's
     secret is missing -- callers that must not exit (--follow, --follow-all)
-    catch that themselves; see module docstring, LAUNCHD SAFETY."""
+    catch that themselves; see module docstring, LAUNCHD SAFETY.
+
+    ONE POLLER PER (RUN, LANE): the whole pass -- read cursor, post, save
+    cursor -- runs under this (runid, lane)'s exclusive flock. If another
+    poller holds it, this pass posts nothing, leaves the cursor alone, names
+    the condition on one stderr line and returns 0; the rows are the ones the
+    other poller is posting right now, and anything newer arrives on the next
+    poll. See the lock section above _lock_path for why not blocking.
+
+    The secret check stays FIRST, ahead of the lock: exit 2 on a missing
+    secret is --once's contract with a human, and a lock some other poller
+    happens to hold must not turn that into a quiet 0."""
     url = resolve_webhook_url(lane)  # before anything else: missing secret = 2 always
+    lock_fd = _acquire_pass_lock(runid, lane)
+    if lock_fd is None:
+        sys.stderr.write(
+            "discord mirror: another poller holds run %r lane %r; skipping "
+            "this pass (its rows are that poller's to post)\n" % (runid, lane)
+        )
+        return 0
+    try:
+        return _mirror_pass(runid, lane, url)
+    finally:
+        os.close(lock_fd)  # releases the flock, even on an exception
+
+
+def _mirror_pass(runid, lane, url):
+    """One pass's actual work, always under the (runid, lane) lock: read the
+    cursor, post what is fresh, advance. Split from run_once so the locking is
+    one unnested block that cannot be read past, and so the pass body has
+    exactly one exit path to the release in run_once's finally."""
     machine = machine_label()
     old_cursor = _load_cursor(runid, lane)
     fresh, new_cursor = collect_new(runid, lane)
