@@ -13,7 +13,9 @@ from the environment -- see _default_state_dir).
 
 import json
 import os
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -336,3 +338,160 @@ def test_enroll_still_accepts_a_duplicate_seat():
     swarm_arm.arm("r1")
     assert swarm_arm.enroll("r1", "agent-a", seat="alpha") is True
     assert swarm_arm.enroll("r1", "agent-b", seat="alpha") is True
+
+
+# ---- add_topics -- the SEPARATE read-modify-write on the participant file ---
+#
+# enroll() is write-once (the `if not os.path.exists(path)` gate) so a later
+# empty subscription can never clobber an earlier one. add_topics is the ONLY
+# way a roster row's subscription grows after enrollment, and it is a distinct
+# function rather than a flag on enroll precisely so that write-once property
+# stays readable at the enroll call site.
+
+
+def _participant_path(runid, agent_id):
+    return os.path.join(swarm_arm._participants_dir(runid), swarm_arm._safe(agent_id))
+
+
+def test_add_topics_adds_a_new_topic_and_returns_the_whole_list():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA", seat="alpha")
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == [
+        "projA",
+        "doc:comms/x.py",
+    ]
+    topics, seat = swarm_arm.participant_sub("r1", "agent-a")
+    assert topics == ["projA", "doc:comms/x.py"]
+    assert seat == "alpha"
+
+
+def test_add_topics_accepts_a_comma_string_like_every_other_topic_arg():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    assert swarm_arm.add_topics("r1", "agent-a", "doc:a,doc:b") == [
+        "projA",
+        "doc:a",
+        "doc:b",
+    ]
+
+
+def test_add_topics_dedupes_and_preserves_existing_order():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA,projB")
+    assert swarm_arm.add_topics(
+        "r1", "agent-a", ["projB", "doc:comms/x.py", "projA", "doc:comms/x.py"]
+    ) == ["projA", "projB", "doc:comms/x.py"]
+
+
+def test_add_topics_preserves_seat_and_identity_fields():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll(
+        "r1", "agent-a", topics="projA", seat="alpha",
+        model="Kimi K3", project="agent-os", area="hooks/",
+    )
+    swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"])
+    with open(_participant_path("r1", "agent-a")) as fh:
+        data = json.load(fh)
+    assert data["seat"] == "alpha"
+    assert data["model"] == "Kimi K3"
+    assert data["project"] == "agent-os"
+    assert data["area"] == "hooks/"
+
+
+def test_add_topics_with_nothing_new_does_not_write_the_file():
+    # The hot path: the heartbeat calls this on EVERY Write/Edit, and an agent
+    # editing one file repeatedly must not rewrite its roster row each beat.
+    # mtime AND inode: os.replace swaps the inode, so a same-mtime different-
+    # inode file would still be a write this test must catch.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA,projB")
+    path = _participant_path("r1", "agent-a")
+    st = os.stat(path)
+    os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
+    before = os.stat(path)
+    assert swarm_arm.add_topics("r1", "agent-a", ["projA", "projB"]) == [
+        "projA",
+        "projB",
+    ]
+    after = os.stat(path)
+    assert after.st_mtime == before.st_mtime
+    assert after.st_ino == before.st_ino
+
+
+def test_add_topics_with_an_empty_topic_list_is_a_no_op():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    path = _participant_path("r1", "agent-a")
+    st = os.stat(path)
+    os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
+    before = os.stat(path)
+    assert swarm_arm.add_topics("r1", "agent-a", []) == ["projA"]
+    assert os.stat(path).st_ino == before.st_ino
+
+
+def test_add_topics_on_an_unenrolled_agent_returns_empty_and_creates_no_file():
+    # LOAD-BEARING: an agent that never opted in must not be silently enrolled
+    # by the act of editing a file. Creating the row here would make every
+    # bystander on the machine a participant the first time it wrote to disk,
+    # which is the machine-global contamination this whole module removed.
+    swarm_arm.arm("r1")
+    assert swarm_arm.add_topics("r1", "ghost", ["doc:comms/x.py"]) == []
+    assert swarm_arm.is_participant("r1", "ghost") is False
+    assert os.listdir(swarm_arm._participants_dir("r1")) == []
+
+
+def test_add_topics_on_an_unarmed_run_returns_empty():
+    assert swarm_arm.add_topics("never-armed-run", "agent-a", ["doc:x"]) == []
+
+
+def test_add_topics_on_a_malformed_participant_file_returns_empty():
+    # A detector/mutator on the beat path must never raise: a corrupt roster
+    # row degrades to "no subscription grew", not to a dead heartbeat.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    with open(_participant_path("r1", "agent-a"), "w") as fh:
+        fh.write("{not json")
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"]) == []
+
+
+def test_add_topics_leaves_no_temp_file_behind():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    swarm_arm.add_topics("r1", "agent-a", ["doc:x"])
+    assert sorted(os.listdir(swarm_arm._participants_dir("r1"))) == ["agent-a"]
+
+
+_CONCURRENT_ADD = (
+    "import sys, time\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "import swarm_arm\n"
+    "time.sleep(max(0.0, float(sys.argv[2]) - time.time()))\n"
+    "swarm_arm.add_topics('r1', 'agent-a', [sys.argv[3]])\n"
+)
+
+
+def test_add_topics_concurrent_writers_lose_no_update(isolated_state):
+    # Eight processes read-modify-write ONE roster row at the same wall-clock
+    # instant. Without the flock this is a lost-update race: each reads the
+    # pre-write list and os.replace's its own single-topic result over the
+    # others. The barrier (a shared start deadline) is what makes the race
+    # reliable instead of accidentally serialized by interpreter startup.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    lib_dir = os.path.dirname(os.path.abspath(swarm_arm.__file__))
+    env = dict(os.environ)
+    env["COMMS_STATE_DIR"] = str(isolated_state)
+    env.pop("SWARM_ARM_STATE_DIR", None)
+    start = time.time() + 1.5
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CONCURRENT_ADD, lib_dir, repr(start), "doc:d%d" % i],
+            env=env,
+        )
+        for i in range(8)
+    ]
+    for p in procs:
+        assert p.wait(timeout=60) == 0
+    topics, _ = swarm_arm.participant_sub("r1", "agent-a")
+    assert topics[0] == "projA"
+    assert sorted(topics[1:]) == sorted("doc:d%d" % i for i in range(8))
