@@ -641,17 +641,18 @@ def post(runid, seat, kind, text, topic=None, to=None, host=None):
 # ---- pull ----------------------------------------------------------------
 
 
-def _load_cursor(host, runid):
-    try:
-        with open(_cursor_path(host, runid)) as fh:
-            cursor = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return cursor if isinstance(cursor, dict) else {}
+def _delivery_cursor(host, runid):
+    """This puller's cursor for one hub run, as the shared confirmed-delivery
+    helper (swarm_mailbox.DeliveryCursor, issue #30) rather than a private
+    load/save pair of the same arithmetic.
 
-
-def _save_cursor(host, runid, cursor):
-    _write_atomic(_cursor_path(host, runid), json.dumps(cursor))
+    THE KEY STAYS HERE, THE RULE DOES NOT: what counts as "one stream" is
+    per-(host, runid) and only this module knows that; the load, the per-seat
+    split, the atomic write, and above all "the cursor moves only when the
+    caller confirms" are the same in every consumer, and a second copy of them
+    is a second place for the confirm order to rot into commit-on-read. That
+    order is load-bearing here -- see pull()."""
+    return swarm_mailbox.DeliveryCursor(_cursor_path(host, runid))
 
 
 def fetch_remote_rows(runid, host=None):
@@ -714,6 +715,12 @@ def pull(runid, host=None):
       The mirror file is written BEFORE the cursor is saved: a crash between
       the two re-mirrors rows on the next pass (visible, duplicated), where the
       other order loses them (invisible). Duplicates are the survivable failure.
+      That order is now the shared confirmed-delivery contract rather than this
+      module's own habit: the cursor is a swarm_mailbox.DeliveryCursor, take()
+      writes nothing, and confirm() runs only after append_mirrored returned.
+      Anything that raises first -- an unreachable hub, a row append_mirrored
+      rejects -- leaves the cursor exactly where it was, so the next pull sees
+      those rows again instead of skipping them.
     in: runid; host.
     out: {"inspected", "mirrored", "echo", "skipped", "dupes"}. `inspected` is
       asserted, not implied, because a pull that reached a hub with nothing new
@@ -734,8 +741,7 @@ def pull(runid, host=None):
     label = remote_label(host)
     mine = machine_label()
     rows = fetch_remote_rows(runid, host=host)
-    cursor = _load_cursor(host, runid)
-    fresh, new_cursor = swarm_mailbox.fresh_rows_by_seat(rows, cursor)
+    fresh, confirm = _delivery_cursor(host, runid).take(rows)
     counts = {"mirror": 0, "echo": 0, "skipped": 0}
     qualified = []
     for row in fresh:
@@ -747,7 +753,9 @@ def pull(runid, host=None):
         row["seat"] = qualify(str(row.get("seat", "?")), label)
         qualified.append(row)
     swarm_mailbox.append_mirrored(runid, mirror_seat(label), qualified)
-    _save_cursor(host, runid, new_cursor)
+    # Delivery here IS the local mirror write; the cursor moves only now that
+    # it returned. Never move this line above append_mirrored.
+    confirm()
     return {
         "inspected": len(rows),
         "mirrored": counts["mirror"],

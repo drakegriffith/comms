@@ -85,6 +85,14 @@ board (which grows without bound and floods the reader's context). Pass --replay
 for the old whole-board behavior -- see the CLI READ CURSOR section below for
 what the cursor is keyed on and when it moves.
 
+A CONSUMER THAT CAN CONFIRM DELIVERY KEEPS ITS OWN CURSOR, not the CLI's: the
+CLI commits when the rows reach stdout, which for a driver that pushes rows
+into some other runtime is before the delivery is known to have worked, so a
+failed push would become a silent drop. Those consumers read with --replay and
+keep a DeliveryCursor (see CONFIRMED-DELIVERY CURSOR below), which advances
+only when they say the rows landed. One cursor owns a delivery; two cursors
+over one stream is how rows go missing quietly.
+
 CLI:
   swarm_mailbox.py init <runid>
   swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]      # register a seat's topic set
@@ -450,6 +458,112 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
     return fresh, new_cursor
 
 
+# ---- CONFIRMED-DELIVERY CURSOR ---------------------------------------------
+
+
+class DeliveryCursor:
+    """Per-seat row counts recording which rows a consumer has already gotten
+    OUT to its destination, moved ONLY when that consumer confirms the
+    delivery worked.
+
+    WHY THIS IS SHARED (issue #30): several readers in this repo keep a cursor
+    over the same board and each had to answer "which of these have I already
+    handed on?" -- the CLI read per (runid, seat, view), the Discord mirror per
+    (run, lane), the remote sync per (host, run), the kimi driver per
+    (run, seat). The COUNTING rule (fresh_rows_by_seat) already had exactly one
+    copy; the load/commit pair around it had three, and three copies is three
+    places for "commit after the delivery succeeded" to drift into "commit when
+    the rows were read". That drift is a silent drop, which is the one failure
+    this mailbox refuses.
+
+    DELIVER FIRST, COMMIT AFTER, and the interface makes the order the only
+    one available: take() writes nothing at all. It returns the fresh rows and
+    a `confirm` callable, and the cursor moves only when the caller runs it. A
+    caller whose delivery failed just does not call confirm, and the same rows
+    come back next pass -- re-delivery is visible and recoverable, a drop is
+    neither. This is exactly what separates a delivery cursor from
+    `comms read`'s own cursor, which commits at PRINT time because the CLI has
+    no acknowledgement to wait for (see CLI READ CURSOR below): a caller that
+    needs confirmed delivery reads with --replay and keeps one of these
+    instead. Two cursors over one stream is one too many.
+
+    behavior: load() returns the persisted {seat: count} map. take(rows)
+      splits rows into the ones past those counts (via fresh_rows_by_seat, so
+      the arithmetic and its "the cursor advances over filtered rows too" rule
+      stay in one place) and returns them with a confirm callable that
+      persists the advanced cursor. confirm() writes unconditionally and is
+      idempotent -- calling it twice writes the same counts twice; NOT calling
+      it leaves the file exactly as it was, including not creating it.
+    in: path, the file these counts persist to. The KEY is the caller's
+      business, because what makes two reads different views of one board is
+      caller-specific (a lane, a host, a topic filter), and only the caller can
+      name it; what is NOT the caller's business, and is why this class exists,
+      is the arithmetic, the atomic write, and the advance-only-on-confirm
+      order. The path belongs under COMMS_STATE_DIR: cursors are machine-local
+      state, never mailbox content, and are not mirrored across machines.
+      keep, an optional predicate passed straight through to
+      fresh_rows_by_seat, selecting which fresh rows are RETURNED while the
+      cursor still advances over the rest.
+    out: take() -> (fresh_rows, confirm). fresh_rows is a list in the order
+      given; confirm is a zero-argument callable that is safe to drop.
+    side effects: none until confirm(), which creates the path's parent
+      directory and writes one file (tmp + os.replace, tmp name PID-suffixed
+      so two consumers racing on one path never collide on the tmp file).
+    errors: load() never raises -- an absent, unreadable, or malformed cursor
+      file reads as {} and replays the stream from the start, because seeing a
+      row twice is recoverable and never seeing it is not. confirm() raises
+      OSError when the state dir cannot be written; the caller decides whether
+      that is fatal (for the CLI it is not -- the rows already reached stdout).
+    preconditions: ONE CONSUMER PER PATH. Two processes confirming one cursor
+      file is the same broken invariant as two seats sharing a mailbox file:
+      the atomic write keeps the file well-formed, it does not keep the two
+      consumers from each delivering the other's rows.
+    limitations: counts, not row ids -- a half-delivered batch cannot be
+      recorded as "rows 1 and 3 landed". Confirm a batch whole or not at all,
+      and re-deliver the rest. Also inherits fresh_rows_by_seat's requirement
+      that rows arrive in each seat's own file order (read_siblings sorts
+      stably by `at`, which preserves it).
+    """
+
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        """The persisted {seat: count} map, or {} when there is none yet.
+
+        An unreadable or malformed file reads as {} -- i.e. replay this stream
+        from the start. That direction is deliberate: the recoverable failure
+        is seeing a row twice, the unrecoverable one is never seeing it.
+        """
+        try:
+            with open(self.path) as fh:
+                cursor = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return cursor if isinstance(cursor, dict) else {}
+
+    def take(self, rows, keep=None):
+        """The rows past this cursor, plus the callable that records having
+        delivered them. Writes nothing; see the class docstring."""
+        fresh, new_cursor = fresh_rows_by_seat(rows, self.load(), keep=keep)
+
+        def confirm():
+            self._commit(new_cursor)
+
+        return fresh, confirm
+
+    def _commit(self, cursor):
+        """Persist atomically: tmp + os.replace, tmp name PID-suffixed so two
+        concurrent consumers of one path never collide on the tmp file."""
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = self.path + ".tmp." + str(os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump(cursor, fh)
+        os.replace(tmp, self.path)
+
+
 # ---- CLI READ CURSOR -------------------------------------------------------
 #
 # WHY THE CURSOR SITS AT THE CLI AND NOT INSIDE read_siblings/read_for:
@@ -479,8 +593,10 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
 #   the view selected, because the cursor commits once the rows are written to
 #   stdout and this process cannot know what the far end of the pipe kept.
 #   Making the cursor track consumption would need an acknowledgement the CLI
-#   does not have (that is issue #30's confirmed-delivery helper). Documented
-#   in README.md and bin/comms instead, with --replay as the recovery.
+#   does not have. A caller that HAS one -- it invoked a runtime and saw it
+#   succeed -- keeps its own DeliveryCursor (above) and reads with --replay,
+#   which is the whole point of that helper. For the CLI itself this stays
+#   documented in README.md and bin/comms, with --replay as the recovery.
 #
 # THE SUBS VIEW IS KEYED ON THE SUBSCRIPTION SET ITSELF (a digest of it), so
 #   re-subscribing a seat to a different topic set starts that set's own
@@ -529,43 +645,21 @@ def _read_cursor_path(runid, seat, view):
     )
 
 
-def _load_read_cursor(path):
-    """The persisted {seat: count} map, or {} when there is none yet.
-
-    An unreadable or malformed cursor file reads as {} -- i.e. replay the view
-    from the start. That direction is deliberate: the recoverable failure is
-    seeing a row twice, the unrecoverable one is never seeing it.
-    """
-    try:
-        with open(path) as fh:
-            cursor = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return cursor if isinstance(cursor, dict) else {}
-
-
-def _save_read_cursor(path, cursor):
-    """Persist the cursor atomically: tmp + os.replace, tmp name PID-suffixed
-    so two concurrent readers of one view never collide on the tmp file. Same
-    shape as the discord mirror's and the remote sync's cursor writes."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp." + str(os.getpid())
-    with open(tmp, "w") as fh:
-        json.dump(cursor, fh)
-    os.replace(tmp, path)
-
-
 def read_delta(runid, seat, topic=None, subs=False):
     """The rows this seat has NOT been handed yet in this view, plus the
     callable that records having handed them over.
 
     behavior: selects rows exactly as the equivalent whole-board read would
       (read_for when subs, else read_siblings with the optional topic filter),
-      then keeps only the ones past this view's persisted per-seat counts. The
-      returned `advance` writes the new cursor; nothing is written until it is
-      called, so a caller delivers the rows FIRST and commits after. A crash
-      between the two re-delivers on the next read (visible), where committing
-      first would lose the rows (invisible).
+      then hands them to this view's DeliveryCursor, which keeps only the ones
+      past its persisted per-seat counts. The returned `advance` is that
+      cursor's confirm: nothing is written until it is called, so a caller
+      delivers the rows FIRST and commits after. A crash between the two
+      re-delivers on the next read (visible), where committing first would lose
+      the rows (invisible). What is view-specific -- which rows the view
+      selects and where its counts live -- is here; the load/split/commit
+      arithmetic is DeliveryCursor's, shared with every other consumer that
+      keeps a cursor over this board.
     in: runid; seat, the reader; topic, an optional single-topic filter; subs,
       True to read the seat's subscribed slice instead.
     out: (rows, advance). rows is the fresh slice, sorted by `at`; advance is a
@@ -587,13 +681,7 @@ def read_delta(runid, seat, topic=None, subs=False):
     else:
         rows = read_siblings(runid, seat)
         view = "all"
-    path = _read_cursor_path(runid, seat, view)
-    fresh, new_cursor = fresh_rows_by_seat(rows, _load_read_cursor(path))
-
-    def advance():
-        _save_read_cursor(path, new_cursor)
-
-    return fresh, advance
+    return DeliveryCursor(_read_cursor_path(runid, seat, view)).take(rows)
 
 
 def _extract_flags(args):

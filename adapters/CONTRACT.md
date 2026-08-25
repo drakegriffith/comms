@@ -105,7 +105,10 @@ hard rule: it owns the delivery cursor, and that cursor advances only after an
 invocation that SUCCEEDED, so a failed delivery re-delivers instead of dropping
 rows. Which is why it reads with `bin/comms read ... --replay`: the CLI's own
 cursor advances at print time, before delivery is known to have worked, and two
-cursors over one delivery is how rows go missing quietly.
+cursors over one delivery is how rows go missing quietly. A driver written in
+Python gets that rule for free from `swarm_mailbox.DeliveryCursor` -- see the
+delivery-cursor bullet under "What every adapter owes" -- and should use it
+rather than re-deriving the arithmetic.
 
 ### push -- proven injection
 
@@ -215,9 +218,9 @@ not promote them from a changelog.
 - **The closed kind vocabulary**, quoted verbatim in the brief block:
   `finding|claim|blocker|comment|reply|status`. An unlisted kind fails loudly.
   Relabel, never retry blind.
-- **Cursor semantics stated, not assumed, and never conflated.** Two different
-  cursors exist, and an adapter README that blurs them will be debugged with
-  the wrong file open.
+- **Cursor semantics stated, not assumed, and never conflated.** Three
+  different cursors exist, and an adapter README that blurs them will be
+  debugged with the wrong file open.
   - *The CLI read cursor* (landed with issue #33). Keyed per
     `(runid, seat, VIEW)`: one JSON file of per-seat row counts at
     `$COMMS_STATE_DIR/read-cursor/<runid>/<seat>.<view>.json`, where the view
@@ -239,6 +242,23 @@ not promote them from a changelog.
     `(runid, agent_id)` -- agent_id, NOT seat -- and advanced after the beat
     emits. Push adapters inherit it by reusing that script; they do not get to
     redefine it.
+  - *Your own DELIVERY cursor*, if your adapter keeps one (issue #30). Use
+    `swarm_mailbox.DeliveryCursor(path)`; do not write another copy of the
+    load/split/save pair. You supply the path, because only your adapter knows
+    what makes one stream one stream (a lane, a host, a session id); it
+    supplies `take(rows) -> (fresh_rows, confirm)`, the per-seat count
+    arithmetic, and the atomic write. **It writes nothing until you call
+    `confirm()`** -- so an adapter whose delivery failed simply does not call
+    it, and those rows come back on the next pass instead of vanishing. That
+    is the difference from the CLI read cursor above, which commits at print
+    time because the CLI has no acknowledgement to wait for. Read with
+    `--replay` when you keep one of these: your cursor plus the CLI's over one
+    stream is one too many. Worked example: `adapters/remote/sync.py`, whose
+    "delivery" is the local mirror write, with `confirm()` on the line after
+    it. `adapters/kimi/poll-driver.sh` keeps the same DISCIPLINE in bash
+    (a last-`at` file, advanced only after a successful `kimi` invocation) but
+    not yet this helper -- it has no Python entry point to hold one from, and
+    that gap is what keeps #30 open.
 - **The delivery oracle.** When auditing whether rows landed, read
   `swarm-heartbeat.log` in the state dir and the mailbox files. Seat
   self-reports UNDERCOUNT: an agent that received an injection does not
