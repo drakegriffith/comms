@@ -136,11 +136,18 @@ def fake_ssh(tmp_path, monkeypatch):
 
 def remote_rows(handle, runid, seat="observer"):
     """Read the simulated remote mailbox directly, without going through the
-    adapter -- an independent oracle, not the code under test."""
+    adapter -- an independent oracle, not the code under test.
+
+    --replay because an ORACLE MUST NOT MUTATE WHAT IT INSPECTS: `comms read`
+    keeps a cursor now (issue #33), so a plain read would hand back the whole
+    board the first time this is called in a test and nothing the second time,
+    turning "what does the hub hold" into "what has this oracle not looked at
+    yet". Two tests that call it twice caught exactly that.
+    """
     env = dict(os.environ)
     env["COMMS_ROOT"] = str(handle.remote_root)
     out = subprocess.run(
-        [COMMS_BIN, "read", runid, seat],
+        [COMMS_BIN, "read", runid, seat, "--replay"],
         stdout=subprocess.PIPE, env=env,
     ).stdout.decode()
     return [json.loads(ln) for ln in out.splitlines() if ln.strip()]

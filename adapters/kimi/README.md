@@ -17,7 +17,11 @@ Constraints worth knowing before debugging:
 - `-p` combines with neither `-y` nor `--auto`. A resume delivery is a plain
   prompt turn; it cannot also grant autonomy flags.
 - The driver's cursor advances only after a successful `kimi` invocation, so a
-  failed delivery re-delivers on the next poll rather than dropping rows.
+  failed delivery re-delivers on the next poll rather than dropping rows. That
+  is why it reads with `bin/comms read ... --replay`: `comms read`'s own cursor
+  advances as soon as rows are printed, which here is before delivery is known
+  to have worked, so letting it advance would convert a failed kimi invocation
+  into a silent drop. One cursor owns delivery, and it is the driver's.
 
 ## Usage
 

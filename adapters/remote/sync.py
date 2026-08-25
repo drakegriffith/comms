@@ -657,18 +657,31 @@ def _save_cursor(host, runid, cursor):
 def fetch_remote_rows(runid, host=None):
     """Every row currently in the HUB's mailbox for this run, as dicts.
 
-    behavior: runs the hub's own `comms read` as OBSERVER_SEAT (a name no real
-      seat uses, so nothing is excluded) and parses its JSONL stdout. A
+    behavior: runs the hub's own `comms read --replay` as OBSERVER_SEAT (a name
+      no real seat uses, so nothing is excluded) and parses its JSONL stdout. A
       malformed line is skipped, never fatal -- the same tolerance
       _all_sibling_rows applies to a concurrently-written file, for the same
       reason.
+      --replay IS LOAD-BEARING: `comms read` keeps a per-(runid, seat, view)
+      cursor on the HUB, and this puller keeps its own per-(host, runid) cursor
+      HERE. Two cursors over one stream is one too many -- the hub's would trim
+      the batch to rows it had not printed before, and this side's per-seat
+      COUNT cursor, reading a trimmed batch as if it started at row 0, would
+      then discard those rows as already-seen. Silent loss, in the one place
+      this module exists to prevent it. The local cursor stays the only one.
+      VERSION FLOOR: the hub must be on the commit that added --replay or newer;
+      an older hub rejects the flag with rc=1, which surfaces here as
+      RemoteUnreachable naming the remote stderr. Loudly wrong beats quietly
+      wrong -- see the discarded fallback in adapters/remote/README.md.
     out: list of row dicts, in the hub's own `at` order.
     errors: RemoteUnreachable if ssh or the remote CLI returns nonzero. This
       is the channel that keeps "could not look" from being reported as
       "nothing there".
     """
     host = host or remote_host()
-    rc, out, err = _ssh([remote_bin(), "read", runid, OBSERVER_SEAT], host=host)
+    rc, out, err = _ssh(
+        [remote_bin(), "read", runid, OBSERVER_SEAT, "--replay"], host=host
+    )
     if rc != 0:
         raise RemoteUnreachable(
             "%s: `comms read %s` rc=%d: %s" % (host, runid, rc, err.strip())

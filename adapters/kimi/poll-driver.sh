@@ -13,6 +13,11 @@
 # so a row is delivered once. The cursor advances ONLY after a successful
 # delivery -- a failed kimi invocation re-delivers next poll (re-delivery is
 # recoverable, dropping is not).
+# That is why the read below passes --replay: `comms read` keeps a cursor of its
+# own that advances the moment rows are PRINTED, which for this driver is before
+# delivery is known to have worked. Letting it advance would turn a failed kimi
+# invocation into a silent drop -- exactly the case this driver's own cursor
+# exists to prevent. One cursor owns delivery here, and it is this one.
 #
 # usage: poll-driver.sh <runid> <seat> <kimi-session-id> <cwd>
 #                       [--interval <seconds>] [--once]
@@ -60,7 +65,7 @@ read_cursor() { cat "$CURSOR_FILE" 2>/dev/null || printf ''; }
 # One poll: read the seat's sibling rows, keep those newer than the cursor,
 # print "<new-cursor>\n<formatted rows...>" (empty output = nothing new).
 poll_delta() {
-  "$COMMS" read "$RUNID" "$SEAT" | python3 -c '
+  "$COMMS" read "$RUNID" "$SEAT" --replay | python3 -c '
 import json, sys
 cursor = sys.argv[1]
 rows = []

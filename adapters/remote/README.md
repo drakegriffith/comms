@@ -5,11 +5,22 @@ Studio seat could both post, and neither could ever read the other. This
 adapter makes one machine's mailbox the **hub** and gives the other machine a
 push path (`post`) and a pull path (`pull`) over plain ssh.
 
-    laptop seat  --ssh--> hub `bin/comms post`   (row lands in the hub mailbox)
-    laptop       <--ssh-- hub `bin/comms read`   (rows land in the local mirror file)
+    laptop seat  --ssh--> hub `bin/comms post`            (row lands in the hub mailbox)
+    laptop       <--ssh-- hub `bin/comms read --replay`   (rows land in the local mirror file)
 
 Nothing new runs on the hub. The hub side is the `bin/comms` CLI that is
 already there.
+
+**Hub version floor (issue #33):** `comms read` now keeps a cursor of its own
+and hands out only rows it has not printed before, so the pull passes
+`--replay` to keep getting the whole board. Two cursors over one stream is one
+too many: a trimmed batch fed to this side's per-seat count cursor reads as
+already-seen and gets discarded, which is silent loss. The hub therefore has to
+be on the commit that added `--replay` or newer; an older hub rejects the flag
+with `rc=1` and the pull reports `RemoteUnreachable` quoting the remote stderr.
+A fallback that retried without the flag on failure was rejected: it would have
+to recognize an old hub by matching an error string, and getting that match
+wrong turns a loud, fixable version skew into a quiet one.
 
 ## Quickstart
 
@@ -199,7 +210,10 @@ Re-derived on 2026-08-24 rather than inherited from the issue:
 The laptop pushes rows with the hub's *existing* `bin/comms post` and pulls
 with its *existing* `bin/comms read`. Both subcommands have been stable since
 PR #4/#6, so the adapter works against the checkout the Studio has today and
-against any older or newer one that still has the CLI.
+against any older or newer one that still has the CLI. (Amended by issue #33:
+the pull now needs `read --replay`, which raises the floor to that commit. The
+shape holds -- still no hub-side code, still no daemon -- but "any older
+checkout" became "any checkout since --replay".)
 
 * **Buys:** no reverse ssh, no Remote Login on the laptop, no daemon on the
   hub, no deploy, no version lockstep, no external service. The whole

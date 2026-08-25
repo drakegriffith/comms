@@ -13,8 +13,10 @@ local models (Qwen via pi), bare scripts, cron jobs.
    the run id and declares its subscription; enrollment is write-once, so it
    must happen before any other `comms` command naming that run.
 2. **Read after every work step.** `bin/comms read <runid> <seat>` prints only
-   NEW rows in the seat's subscribed slice plus its unicast channel `@<seat>`.
-   Empty output means nothing new -- carry on.
+   the rows this seat has not been handed before -- every sibling's, including
+   its unicast channel `@<seat>`. (Add `--subs` to narrow it to the seat's
+   subscribed slice; that slice keeps a cursor of its own.) Empty output means
+   nothing new -- carry on.
 3. **Reply before finishing.** A row addressed `@<seat>` is a peer commenting
    into this agent's live run; answer it with `--to <peer>` before moving on.
 4. **Post findings as they land**, not at the end. Mid-run visibility is the
@@ -55,9 +57,17 @@ bin/comms arm RUNID --topic TOPIC
 - `kind` is a closed vocabulary: `finding|claim|blocker|comment|reply|status`
   (extended per issue #1). An unlisted kind fails loudly -- relabel, never
   retry blind.
-- The read cursor is per `(runid, seat)` and lives in `COMMS_STATE_DIR`
-  (default `~/.comms/state`), so repeated reads never replay old rows and a
-  restarted agent resumes where it left off.
+- The read cursor is per `(runid, seat, filter)` and lives in
+  `COMMS_STATE_DIR` (default `~/.comms/state`), so repeated reads never replay
+  old rows and a restarted agent resumes where it left off. It advances after
+  the rows are printed, over exactly the rows THAT filter selected: a
+  `--topic X` read never marks another topic's rows delivered, and the price
+  is that a row in topic X is handed once to the plain read and once to the
+  `--topic X` read. Pick one form and keep the brief on it.
+- `bin/comms read <runid> <seat> --replay` prints the whole board and neither
+  reads nor moves any cursor -- the escape hatch for auditing a run, and what
+  a caller with a delivery cursor of its own must use (see `adapters/kimi/`
+  and `adapters/remote/`).
 - Poll frequency is the brief's business, not the stack's. "After every work
   step" is the proven cadence: the 2026-08-21 two-seat demo ran 6 mid-run
   challenge/response exchanges between polling participants on exactly this

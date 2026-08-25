@@ -76,6 +76,72 @@ fi
 out="$("$COMMS" read "$RUN" 2>&1)"; rc=$?
 check "read with missing seat preserves mailbox exit 1" 1 "$rc" "$out" "read needs"
 
+# ---- read cursor (issue #33) ------------------------------------------------
+# The defect: two consecutive reads for the same (runid, seat) replayed rows the
+# first read already returned, while adapters/pi/README.md promised they would
+# not. Fresh reader seats (gamma, delta) so the reads above cannot muddy these.
+# By now alpha has posted: 3 rows on t0, "hello-topic" on t1, "off-slice" on
+# other.
+out="$("$COMMS" read "$RUN" gamma 2>&1)"; rc=$?
+check "first read of a fresh seat sees the board" 0 "$rc" "$out" "hello-topic"
+out="$("$COMMS" read "$RUN" gamma 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -z "$out" ]; then
+  echo "ok:   second read of the same seat returns nothing new"; PASS=$((PASS + 1))
+else
+  echo "FAIL: second read of the same seat returns nothing new (rc=$rc, out=$out)"
+  FAIL=$((FAIL + 1))
+fi
+if [ -f "$COMMS_STATE_DIR/read-cursor/$RUN/gamma.all.json" ]; then
+  echo "ok:   read cursor lives under COMMS_STATE_DIR"; PASS=$((PASS + 1))
+else
+  echo "FAIL: read cursor lives under COMMS_STATE_DIR"; FAIL=$((FAIL + 1))
+fi
+"$COMMS" post "$RUN" alpha finding "after-cursor" --topic t1 >/dev/null 2>&1
+out="$("$COMMS" read "$RUN" gamma 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qF "after-cursor" \
+   && ! printf '%s' "$out" | grep -qF "hello-topic"; then
+  echo "ok:   a row posted after the cursor is the only thing the next read shows"
+  PASS=$((PASS + 1))
+else
+  echo "FAIL: a row posted after the cursor is the only thing the next read shows (rc=$rc)"
+  FAIL=$((FAIL + 1))
+fi
+out="$("$COMMS" read "$RUN" gamma --replay 2>&1)"; rc=$?
+check "--replay prints the whole board again" 0 "$rc" "$out" "hello-topic"
+out="$("$COMMS" read "$RUN" gamma 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -z "$out" ]; then
+  echo "ok:   --replay leaves the cursor where it was"; PASS=$((PASS + 1))
+else
+  echo "FAIL: --replay leaves the cursor where it was (rc=$rc, out=$out)"
+  FAIL=$((FAIL + 1))
+fi
+
+# Topic-filter interaction: a filtered read owns its OWN cursor, so it can
+# never mark a row on another topic delivered (that row would then be
+# unreachable from any later read -- silent loss).
+out="$("$COMMS" read "$RUN" delta --topic t1 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qF "hello-topic" \
+   && ! printf '%s' "$out" | grep -qF "off-slice"; then
+  echo "ok:   --topic read returns that topic only"; PASS=$((PASS + 1))
+else
+  echo "FAIL: --topic read returns that topic only (rc=$rc)"; FAIL=$((FAIL + 1))
+fi
+out="$("$COMMS" read "$RUN" delta --topic t1 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -z "$out" ]; then
+  echo "ok:   second --topic read returns nothing new"; PASS=$((PASS + 1))
+else
+  echo "FAIL: second --topic read returns nothing new (rc=$rc, out=$out)"
+  FAIL=$((FAIL + 1))
+fi
+out="$("$COMMS" read "$RUN" delta 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -qF "off-slice" \
+   && printf '%s' "$out" | grep -qF "progress note"; then
+  echo "ok:   a --topic read never consumes another topic's rows"; PASS=$((PASS + 1))
+else
+  echo "FAIL: a --topic read never consumes another topic's rows (rc=$rc)"
+  FAIL=$((FAIL + 1))
+fi
+
 # ---- claims routing BEFORE arming (the not-armed edge) ---------------------
 out="$("$COMMS" claim "$RUN" alpha /tmp/x 2>&1)"; rc=$?
 check "claim on unarmed run preserves claims exit 3" 3 "$rc" "$out" "not-armed"
@@ -140,7 +206,8 @@ check "symlinked invocation still finds lib/" 0 "$rc" "$out" '"armed": false'
 rm -rf "$LINKDIR"
 
 # ---- isolation control: nothing leaked outside the temp dirs ---------------
-if [ -e "$HOME/.comms/state/swarm-arm/$RUN" ] || [ -e "/tmp/comms-$RUN" ]; then
+if [ -e "$HOME/.comms/state/swarm-arm/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \
+   || [ -e "$HOME/.comms/state/read-cursor/$RUN" ]; then
   echo "FAIL: state leaked outside the temp dirs"; FAIL=$((FAIL + 1))
 else
   echo "ok:   no state outside COMMS_STATE_DIR / COMMS_ROOT"

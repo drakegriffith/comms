@@ -382,8 +382,15 @@ def process_run(runid):
             )
         )
     if overflow > 0:
+        # --replay, NOT a plain read (issue #33): this hint is aimed at an
+        # agent whose heartbeat cursor just advanced past the rows it is being
+        # told to go fetch. `comms read` keeps a cursor of its own now and
+        # would print only what THAT cursor has not seen -- for the overflow
+        # reader, usually nothing, which reads as "the rows are gone" instead
+        # of "here they are". The hint has to name the command that actually
+        # shows the full board.
         row_lines.append(
-            "... %d more, read the full board with comms read %s <seat>"
+            "... %d more, read the full board with comms read %s <seat> --replay"
             % (overflow, runid)
         )
 
