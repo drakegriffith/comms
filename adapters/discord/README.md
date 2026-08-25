@@ -365,6 +365,7 @@ re-posts the ENTIRE backlog on the next pass every time one POST fails.
 | map file corrupt | read as `{}`, one stderr line, the thread is recreated (at most one duplicate) |
 | post-into-thread fails after retries | that chunk goes to `<runid>.skipped.jsonl` and is dropped from held (one bad batch must not wedge every row behind it); that thread's remainder waits for the next pass |
 | held file corrupt or unreadable | read as `{}`, one LOUD stderr line. The un-posted backlog in it is genuinely lost -- the cursor is already past it. |
+| a crash (or a failed cursor save) between the held write and the cursor save | the next pass re-reads those rows against the old cursor; merging them into held is idempotent, so each row stays exactly once and posts once |
 | a document never goes alive | its rows sit in held until `COMMS_THREAD_HOLD_MAX`, then the oldest are dropped and recorded in the skipped log |
 | a document already has a thread | its rows post immediately, no predicate, no create call -- including a single row from a single seat |
 | two agents enrolled on one seat name | one stderr line per pass naming the seat and both agent ids; nothing is blocked (see `swarm_arm.seat_collisions`, issue #42) |

@@ -874,6 +874,30 @@ def _save_held(runid, lane, buckets):
     _atomic_write_json(path, buckets, path + ".tmp." + str(os.getpid()))
 
 
+def _row_identity(row):
+    """A stable identity for one row, over the fields its AUTHOR wrote.
+
+    Used to make the held merge idempotent (PR #51 review, Kimi). The held
+    file is written before the cursor is saved, so a crash -- or a
+    _save_cursor that raises -- in between means the next pass re-reads the
+    same fresh rows against the old cursor and would append a second copy of
+    each, compounding once per crash and double-posting all of them when the
+    document finally goes alive.
+
+    The read-time source tag is deliberately NOT part of this: held rows are
+    stored as their author wrote them (no tag), so including it would make
+    every comparison fail and the dedupe would inspect nothing while looking
+    like it worked.
+
+    What this cannot distinguish is two rows from one seat with identical
+    text, kind, topic and `at` -- to the microsecond. One seat's appends are
+    sequential and `at` comes from the clock, so that is a row no reader
+    could tell from a duplicate anyway; collapsing it costs nothing, where
+    the alternative costs a duplicate per crash forever.
+    """
+    return json.dumps(swarm_mailbox.without_source(row), sort_keys=True)
+
+
 def _bucket_rows(held, fresh):
     """{thread_key: [rows in `at` order]} from the held file plus this pass's
     fresh rows.
@@ -884,15 +908,25 @@ def _bucket_rows(held, fresh):
     has no business surviving into it -- the same rule the skipped log
     follows.
 
+    IDEMPOTENT: a fresh row already present in its bucket is skipped, so a
+    pass that re-reads rows it already held (the cursor never got saved) adds
+    nothing. See _row_identity.
+
     Sorted by `at`, stably, so held rows keep their place ahead of fresh rows
     written in the same instant. The sort is the drain's contract: the
     backlog posts oldest-first, which is the only order a human can read.
     """
     buckets = {k: list(v) for k, v in held.items()}
     for key, rows in swarm_threads.group_by_thread(fresh).items():
-        buckets.setdefault(key, []).extend(
-            swarm_mailbox.without_source(row) for row in rows
-        )
+        bucket = buckets.setdefault(key, [])
+        seen = {_row_identity(row) for row in bucket}
+        for row in rows:
+            row = swarm_mailbox.without_source(row)
+            identity = _row_identity(row)
+            if identity in seen:
+                continue  # already held -- see _row_identity
+            seen.add(identity)
+            bucket.append(row)
     for rows in buckets.values():
         rows.sort(key=lambda r: str(r.get("at", "")))
     return {k: v for k, v in buckets.items() if v}

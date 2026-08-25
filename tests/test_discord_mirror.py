@@ -1898,6 +1898,89 @@ def test_board_an_undeliverable_chunk_is_recorded_and_never_wedges(board):
     assert [r["text"] for r in _held()[DOC]] == ["row 1"]
 
 
+# ---- the held merge is idempotent ----------------------------------------
+#
+# Kimi's finding on PR #51, and the window nothing else covers: held is
+# written (step 4) BEFORE the cursor is saved (step 5). If the process dies
+# in between -- or _save_cursor itself raises -- the next pass loads the
+# already-held rows AND re-reads the same fresh rows against the OLD cursor,
+# appending a second copy of each. Nothing is lost, but the backlog grows a
+# duplicate per crash and every one of them posts when the document goes
+# alive. The fix is that merging the same row twice is a no-op.
+
+
+def _breakable_cursor_save(monkeypatch):
+    """Make _save_cursor raise while `flag["broken"]` is True, and work
+    normally otherwise. A toggle rather than monkeypatch.undo(): the `board`
+    fixture shares this same monkeypatch instance, so undo() would also rip
+    out the fake poster and let a test reach for the network."""
+    flag = {"broken": True}
+    real = mirror._save_cursor
+
+    def maybe(*args, **kwargs):
+        if flag["broken"]:
+            raise OSError("cursor save failed")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mirror, "_save_cursor", maybe)
+    return flag
+
+
+def test_board_a_cursor_save_failure_does_not_duplicate_held_rows(board, monkeypatch):
+    _append_thread_row("alpha", "one", at=_at(0))
+    flag = _breakable_cursor_save(monkeypatch)
+    with pytest.raises(OSError):
+        mirror.run_once(RUNID, lane=BOARD)
+    assert [r["text"] for r in _held()[DOC]] == ["one"]  # held survived
+
+    flag["broken"] = False
+    # The cursor never advanced, so this pass re-reads the very same row.
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert [r["text"] for r in _held()[DOC]] == ["one"]
+
+
+def test_board_a_row_re_read_after_a_cursor_failure_posts_ONCE(board, monkeypatch):
+    # The consequence a human would actually see: the duplicate is not just
+    # a bigger file, it is a doubled message in the thread.
+    _append_thread_row("alpha", "one", at=_at(0))
+    flag = _breakable_cursor_save(monkeypatch)
+    with pytest.raises(OSError):
+        mirror.run_once(RUNID, lane=BOARD)
+    flag["broken"] = False
+
+    _append_thread_row("bravo", "two", at=_at(30))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == [
+        "\U0001f4ec\U0001f4ac one",
+        "\U0001f4ec\U0001f4ac two",
+    ]
+
+
+def test_board_repeated_cursor_failures_do_not_compound(board, monkeypatch):
+    _append_thread_row("alpha", "one", at=_at(0))
+    _breakable_cursor_save(monkeypatch)
+    for _ in range(3):
+        with pytest.raises(OSError):
+            mirror.run_once(RUNID, lane=BOARD)
+    assert [r["text"] for r in _held()[DOC]] == ["one"]
+
+
+def test_board_two_genuinely_distinct_rows_are_both_kept(board):
+    # The other direction, and the reason the identity includes `at`: dedupe
+    # must not swallow a real second row. Two seats, same text, same instant.
+    _append_thread_row("alpha", "same words", at=_at(0))
+    _append_thread_row("bravo", "same words", at=_at(0))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(_held()[DOC]) == 2
+
+
+def test_board_one_seat_repeating_itself_later_keeps_both_rows(board):
+    _append_thread_row("alpha", "ping", at=_at(0))
+    _append_thread_row("alpha", "ping", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(_held()[DOC]) == 2
+
+
 # ---- durable ordering: fsync before replace, for both state files --------
 #
 # The whole crash-safety argument is "held is durable BEFORE the cursor
