@@ -1100,10 +1100,84 @@ class TestThreadKey(unittest.TestCase):
     def test_worktree_dot_git_FILE_counts_as_a_repo(self):
         # A linked worktree's `.git` is a FILE containing "gitdir: ...", not a
         # directory. Testing only os.path.isdir would make every worktree --
-        # the shape this very slice is built in -- return None.
-        root = self._repo("comms-wt", git_is_file=True)
+        # the shape this very slice is built in -- return None. The NAME then
+        # comes from the main checkout the file points at (see the worktree
+        # tests below); here the point is that the file is a marker at all.
+        root = self._repo("comms-wt", git_is_file=True)  # -> /elsewhere/.git/worktrees/
         path = self._touch(root, "lib/swarm_mailbox.py")
-        self.assertEqual(mb.thread_key(path), "doc:comms-wt/lib/swarm_mailbox.py")
+        self.assertEqual(mb.thread_key(path), "doc:elsewhere/lib/swarm_mailbox.py")
+
+    def test_a_linked_worktree_keys_on_the_MAIN_checkouts_name(self):
+        """The convener's finding on PR #51. `git worktree add` gives the
+        worktree its own directory name, so keying on that basename threads
+        the SAME document separately per worktree -- and slice 3b's hook leg
+        runs from worktrees routinely. The `.git` file names the main
+        checkout; follow it."""
+        main = self._repo("comms")
+        wt_admin = os.path.join(main, ".git", "worktrees", "wt-slice-2")
+        os.makedirs(wt_admin, exist_ok=True)
+        wt = os.path.join(self.tmp, "comms-wt-slice-2")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: %s\n" % wt_admin)
+        path = self._touch(wt, "lib/swarm_mailbox.py")
+        assert_ = self.assertEqual
+        assert_(mb.thread_key(path), "doc:comms/lib/swarm_mailbox.py")
+
+    def test_a_worktree_relpath_stays_relative_to_the_WORKTREE_root(self):
+        # Only the repo NAME comes from the main checkout. The path is where
+        # the file actually is, which is the same relpath in either place.
+        main = self._repo("comms")
+        wt_admin = os.path.join(main, ".git", "worktrees", "wt")
+        os.makedirs(wt_admin, exist_ok=True)
+        wt = os.path.join(self.tmp, "some-other-name")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: %s\n" % wt_admin)
+        path = self._touch(wt, "docs/a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/docs/a.md")
+
+    def test_a_worktree_gitdir_written_as_a_RELATIVE_path_resolves(self):
+        # git writes an absolute path today; a relative one is legal and a
+        # moved checkout produces it. Resolved against the worktree root.
+        main = self._repo("comms")
+        os.makedirs(os.path.join(main, ".git", "worktrees", "wt"), exist_ok=True)
+        wt = os.path.join(self.tmp, "wt-dir")
+        os.makedirs(wt, exist_ok=True)
+        with open(os.path.join(wt, ".git"), "w") as fh:
+            fh.write("gitdir: ../comms/.git/worktrees/wt\n")
+        path = self._touch(wt, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms/a.md")
+
+    def test_a_dot_git_FILE_that_is_not_a_worktree_keeps_the_local_basename(self):
+        # A submodule's .git file points at .git/modules/<name>, not
+        # /.git/worktrees/. Its checkout dir IS its own repo, so the local
+        # basename is the right answer -- guessing the superproject's name
+        # would merge two projects' threads.
+        root = self._repo("subproj", git_is_file=True)
+        with open(os.path.join(root, ".git"), "w") as fh:
+            fh.write("gitdir: ../../.git/modules/subproj\n")
+        path = self._touch(root, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:subproj/a.md")
+
+    def test_an_unreadable_dot_git_file_falls_back_to_the_local_basename(self):
+        # Degrade to the pre-fix answer, never to None: a thread named after
+        # the worktree is a mis-grouping a human can see; no thread at all is
+        # a row that silently never renders.
+        root = self._repo("comms-wt", git_is_file=True)
+        os.chmod(os.path.join(root, ".git"), 0o000)
+        path = self._touch(root, "a.md")
+        try:
+            self.assertEqual(mb.thread_key(path), "doc:comms-wt/a.md")
+        finally:
+            os.chmod(os.path.join(root, ".git"), 0o600)
+
+    def test_a_dot_git_file_with_junk_in_it_falls_back(self):
+        root = self._repo("comms-wt", git_is_file=True)
+        with open(os.path.join(root, ".git"), "w") as fh:
+            fh.write("this is not a gitdir line\n")
+        path = self._touch(root, "a.md")
+        self.assertEqual(mb.thread_key(path), "doc:comms-wt/a.md")
 
     def test_nearest_ancestor_wins_over_an_outer_repo(self):
         outer = self._repo("outer")

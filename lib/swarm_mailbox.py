@@ -261,6 +261,58 @@ THREAD_KEY_PREFIX = "doc:"
 # Testing only isdir would unthread every row written from a worktree.
 _REPO_MARKER = ".git"
 
+# What a linked worktree's `.git` FILE contains: one line, "gitdir: <path>",
+# pointing at <main checkout>/.git/worktrees/<name>. That path is the only
+# on-disk link from a worktree back to the checkout it belongs to.
+_GITDIR_PREFIX = "gitdir:"
+_WORKTREES_SEGMENT = os.sep + _REPO_MARKER + os.sep + "worktrees" + os.sep
+
+# A `.git` file is one short line. Cap the read: this runs per Write/Edit, and
+# a caller should never be able to make a hook slurp an arbitrary file.
+_GITDIR_READ_CAP = 4096
+
+
+def _repo_name(root):
+    """The repo NAME for a directory holding a `.git` entry.
+
+    Normally the directory's own basename. For a LINKED WORKTREE -- where
+    `.git` is a file reading "gitdir: <main>/.git/worktrees/<name>" -- it is
+    the MAIN CHECKOUT's basename instead, because a worktree is the same repo
+    in a different directory and keying on the worktree's name threads one
+    document separately per worktree. That is not hypothetical: the hook leg
+    that calls thread_key runs from worktrees routinely.
+
+    Every failure degrades to the local basename, never to None: a thread
+    named after the worktree is a mis-grouping a human can SEE, while no
+    thread at all is a row that silently never renders.
+
+    A `.git` file that is NOT a worktree pointer -- a submodule's, which
+    reads ".git/modules/<name>" -- keeps the local basename on purpose. A
+    submodule checkout is its own document space; borrowing the
+    superproject's name would merge two projects' threads.
+    """
+    marker = os.path.join(root, _REPO_MARKER)
+    if not os.path.isfile(marker):
+        return os.path.basename(root)
+    try:
+        with open(marker) as fh:
+            line = fh.read(_GITDIR_READ_CAP).strip()
+    except OSError:
+        return os.path.basename(root)
+    if not line.startswith(_GITDIR_PREFIX):
+        return os.path.basename(root)
+    gitdir = line[len(_GITDIR_PREFIX):].strip()
+    if not gitdir:
+        return os.path.basename(root)
+    if not os.path.isabs(gitdir):
+        # git writes an absolute path today; a relative one is legal, and a
+        # moved checkout produces one. It is relative to the worktree root.
+        gitdir = os.path.normpath(os.path.join(root, gitdir))
+    head, sep, _ = gitdir.partition(_WORKTREES_SEGMENT)
+    if not sep:
+        return os.path.basename(root)  # a submodule, or something else
+    return os.path.basename(head) or os.path.basename(root)
+
 
 def thread_key(path):
     """The thread name for `path`: "doc:<repo>/<relpath>", or None if `path`
@@ -276,6 +328,11 @@ def thread_key(path):
     NEAREST ancestor, not outermost: a vendored repo inside a repo is its own
     document space, and keying its files on the outer repo would merge two
     projects' threads.
+
+    A LINKED WORKTREE keys on the MAIN CHECKOUT's name (see _repo_name): a
+    worktree is the same repo in a different directory, and the relpath is
+    identical in both, so one document must not thread twice just because it
+    was edited from a worktree.
 
     NO SUBPROCESS, deliberately: the caller is a per-Write/Edit hook, and
     `git rev-parse` costs a process spawn on every keystroke-scale edit (it
@@ -298,14 +355,11 @@ def thread_key(path):
     cur = real if os.path.isdir(real) else os.path.dirname(real)
     while True:
         if os.path.exists(os.path.join(cur, _REPO_MARKER)):
+            repo = _repo_name(cur)
             rel = os.path.relpath(real, cur)
             if rel == os.curdir:
-                return THREAD_KEY_PREFIX + os.path.basename(cur)
-            return "%s%s/%s" % (
-                THREAD_KEY_PREFIX,
-                os.path.basename(cur),
-                rel.replace(os.sep, "/"),
-            )
+                return THREAD_KEY_PREFIX + repo
+            return "%s%s/%s" % (THREAD_KEY_PREFIX, repo, rel.replace(os.sep, "/"))
         parent = os.path.dirname(cur)
         if parent == cur:  # hit the filesystem root without finding a marker
             return None
