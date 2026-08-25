@@ -57,6 +57,32 @@
 #   output -- like the no-armed-run path, just decided in python because
 #   participation is a per-agent question the bash gate cannot answer.
 #
+# IDENTITY GATE -- NO IDENTITY, NO CURSOR
+#   The cursor key and the participation key are the same field: the payload's
+#   agent_id, falling back to session_id. A payload carrying neither identifies
+#   NOBODY. This used to default to the literal key "unknown"; it now exits 0 as
+#   a bystander before enrollment and before any cursor read. A shared fallback
+#   key is not a harmless default -- enroll it once and every unidentified
+#   caller on the machine advances one shared cursor, marking rows delivered to
+#   readers that never saw them.
+#
+#   WHY IT IS NOT THEORETICAL -- FOREIGN RUNTIMES SCAVENGE THIS HOOK
+#   Runtimes other than the ones this adapter targets read Claude-shaped hook
+#   config on their own: grok scans ~/.claude/settings.json by DEFAULT, so on
+#   any machine where install.sh beside this file has run, grok already executes
+#   this script on every tool call -- and grok drops hook stdout, so every row it
+#   "delivered" is lost. COMPAT OPT-OUT (grok): set
+#       [compat.claude]
+#       hooks = false
+#   in ~/.grok/config.toml, then use the poll path (bin/comms read) as grok's
+#   only delivery channel. Other runtimes with a Claude-compat hook scanner want
+#   the equivalent switch.
+#
+#   Teaching grok's camelCase sessionId to the lookup above is deliberately NOT
+#   the fix: that hands a runtime which discards our stdout a REAL cursor, which
+#   is the hazard itself. Identity is a thing a payload proves, not a thing this
+#   hook guesses.
+#
 # OUTPUT (PostToolUse contract)
 #   {"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":...}}
 #   The text is wrapped UNTRUSTED: it is data from sibling agents, never
@@ -163,11 +189,22 @@ def _field(obj, *keys):
     return None
 
 
+# ---- IDENTITY GATE -- NO IDENTITY, NO CURSOR (issue #27) ------------------
 # agent_id is the cursor key AND the participation key: unique per subagent, so
-# two siblings under one run keep independent cursors and rosters. Fall back to
-# session_id, then a constant.
-agent_id = _field(payload, "agent_id", "session_id") or "unknown"
-safe_agent = "".join(c for c in agent_id if c.isalnum() or c in "-_.") or "unknown"
+# two siblings under one run keep independent cursors and rosters. It falls back
+# to session_id and then to NOTHING: a payload carrying neither key identifies
+# nobody, and there is no safe default for it. A shared placeholder key (this
+# used to be the literal string "unknown") is the worst of the options -- once
+# any one caller enrolls it, every unidentified caller on the machine advances
+# that ONE cursor, marking rows delivered to readers that never saw them.
+#
+# Resolved HERE, above enrollment and above every cursor read, so an
+# unidentified caller leaves as a bystander by construction: it cannot enroll,
+# cannot reach process_run, and writes no cursor, no mtime and no telemetry.
+agent_id = _field(payload, "agent_id", "session_id")
+safe_agent = "".join(c for c in (agent_id or "") if c.isalnum() or c in "-_.")
+if not safe_agent:
+    sys.exit(0)
 now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 runs = swarm_arm.armed_runs(state_dir=state_dir)

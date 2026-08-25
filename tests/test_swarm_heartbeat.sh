@@ -24,7 +24,9 @@
 # load-bearing test); (g) SELF-ENROLL via the handshake command; (h) TWO runs
 # armed at once do not cross-contaminate; (i) SUBSCRIPTION scoping -- a
 # participant enrolled with a topic set + seat sees only its topics and its own
-# "@<seat>" unicast; (j) ECHO SUPPRESSION; (k) parent admin verbs do not opt in.
+# "@<seat>" unicast; (j) ECHO SUPPRESSION; (k) parent admin verbs do not opt in;
+# (l) IDENTITY GATE -- a payload carrying no recognized identity key writes no
+# cursor, no telemetry and no stdout, and cannot enroll (issue #27).
 
 set -uo pipefail
 
@@ -80,6 +82,23 @@ payload() {  # payload <agent_id> [command]
         "$1" "${2:-ls}"
 }
 
+# A GROK-shaped payload from a foreign runtime that scavenged a Claude-shaped
+# hook config: camelCase sessionId, grok's own event/tool spellings, and NO
+# agent_id anywhere. These are the key spellings from a real captured grok hook
+# payload (PR #25's probe: hookEventName post_tool_use, toolName
+# run_terminal_command, sessionId), not an invented shape.
+foreign_payload() {  # foreign_payload [command]
+    printf '{"hookEventName":"post_tool_use","toolName":"run_terminal_command","sessionId":"grok-sess-1","toolInput":{"command":"%s"}}' \
+        "${1:-ls}"
+}
+
+# A Claude-shaped payload with the right keys and NO identity at all -- the
+# other way a caller arrives unidentified.
+anon_payload() {  # anon_payload [command]
+    printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"%s"}}' \
+        "${1:-ls}"
+}
+
 # Append a row directly to a seat's jsonl (deterministic `at`).
 post_row() {  # post_row <runid> <seat> <kind> <text> <at> [topic]
     local dir="$ROOT/comms-$1"
@@ -109,7 +128,16 @@ else:
     print(d.get("hookSpecificOutput",{}).get("additionalContext",""), end="")'
 }
 
+run_hook_raw() {  # run_hook_raw <payload-json> ; same globals as run_hook
+    HOOK_OUT="$(printf '%s' "$1" | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" \
+        /bin/bash "$HOOK")"
+    HOOK_RC=$?
+}
+
 log_lines() { wc -l < "$LOG" 2>/dev/null | tr -d ' '; }
+
+# Every cursor/mtime file the hook has written, across all runs.
+cursor_files() { find "$STATE/swarm-cursor" -type f 2>/dev/null | wc -l | tr -d ' '; }
 
 run_suite() {  # one fully-isolated pass
     STATE="$(mktemp -d)" || exit 1
@@ -285,6 +313,62 @@ run_suite() {  # one fully-isolated pass
     else
         fail=$((fail + 1)); echo "  FAIL (k) enroll command did not enroll" >&2
     fi
+
+    # -----------------------------------------------------------------------
+    # (l) IDENTITY GATE (issue #27): a caller the payload does not identify must
+    #     advance NO cursor, ever. A runtime that scavenges Claude-shaped hook
+    #     configs (grok scans ~/.claude/settings.json by default) executes this
+    #     hook on every tool call and DISCARDS its stdout, so any cursor it
+    #     advances marks rows delivered to a reader that never saw them.
+    #
+    #     The old code defaulted such a payload to the literal key "unknown".
+    #     Nothing forbade "unknown" from being enrolled, and once it was, every
+    #     unidentified caller on the machine shared that one cursor -- so this
+    #     arms the run with "unknown" already a participant, which is the state
+    #     the fallback made reachable, and asserts the foreign beat still does
+    #     nothing.
+    RL="hbtestl$$x$RANDOM"
+    arm_run "$RL"
+    enroll_agent "$RL" unknown
+    post_row "$RL" seatL finding "L-ROW-NEVER-DELIVERED" "2026-06-01T00:00:01+00:00"
+    lines_before="$(log_lines)"
+    cursors_before="$(cursor_files)"
+    run_hook_raw "$(foreign_payload 'ls -la')"
+    ck "(l) foreign payload exits 0" "0" "$HOOK_RC"
+    ck "(l) foreign payload emits ZERO stdout" "" "$HOOK_OUT"
+    ck "(l) foreign payload writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
+    ck "(l) foreign payload writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
+
+    #     Same gate on the enrollment side: an unidentified payload whose command
+    #     IS a valid opt-in must not enroll anything -- the handshake is never
+    #     reached, so no shared key appears on the roster.
+    RL2="hbtestl2$$x$RANDOM"
+    arm_run "$RL2"
+    lines_before="$(log_lines)"
+    cursors_before="$(cursor_files)"
+    run_hook_raw "$(anon_payload "python3 lib/swarm_mailbox.py read $RL2 seatZ")"
+    ck "(l) anonymous opt-in exits 0" "0" "$HOOK_RC"
+    ck "(l) anonymous opt-in emits ZERO stdout" "" "$HOOK_OUT"
+    ck "(l) anonymous opt-in writes NO cursor file" "${cursors_before:-0}" "$(cursor_files)"
+    ck "(l) anonymous opt-in writes NO telemetry" "${lines_before:-0}" "$(log_lines)"
+    if is_part "$RL2" unknown; then
+        fail=$((fail + 1)); echo "  FAIL (l) anonymous payload enrolled the shared 'unknown' key" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    #     Positive control for this gate: an IDENTIFIED agent on the same armed
+    #     run still enrolls and still receives the row, so (l) is not passing by
+    #     the hook being dead.
+    run_hook agentL "python3 lib/swarm_mailbox.py read $RL2 seatZ"
+    if is_part "$RL2" agentL; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "  FAIL (l) identified agent failed to enroll (gate is over-broad)" >&2
+    fi
+    post_row "$RL2" seatL2 finding "L2-ROW-DELIVERED" "2026-06-02T00:00:01+00:00"
+    run_hook agentL; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(l) identified agent still receives rows" "L2-ROW-DELIVERED" "$ctx"
 
     rm -rf "$STATE" "$ROOT"
 }
