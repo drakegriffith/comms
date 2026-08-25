@@ -80,9 +80,16 @@ serially, and an ad-hoc --once can slot between a follower's polls.
 
 FAILURE: a row that cannot be delivered after the retry budget is NEVER
 dropped silently -- it is written to <runid>.skipped.jsonl in the state dir
-and shouted to stderr, then the cursor advances past it (the skipped file is
-the durable record; re-posting forever would wedge the mirror behind one bad
-batch). 429 honours Retry-After.
+(flushed and fsynced before the cursor moves past it, so a crash cannot keep
+the newer cursor and lose the record) and shouted to stderr, then the cursor
+advances past it (the skipped file is the durable record; re-posting forever
+would wedge the mirror behind one bad batch). 429 honours Retry-After.
+
+HOW MANY TIMES A ROW POSTS: exactly once across concurrent pollers (the lock,
+see CONCURRENCY below), at least once across a crash. The cursor is saved
+after the posts, so a crash between a delivered chunk and that save re-posts
+the chunk next pass. Deliberate: the alternative direction loses rows
+invisibly. See run_once.
 
 SECRET: DISCORD_COMMS_WEBHOOK_URL from the environment, else parsed from
 $COMMS_SECRETS_FILE (default ~/.secrets/comms.env). The URL is never printed,
@@ -235,9 +242,18 @@ def _acquire_pass_lock(runid, lane=DEFAULT_LANE):
     fd = os.open(_lock_path(runid, lane), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
+        # EAGAIN/EWOULDBLOCK -- and ONLY that -- means another poller holds
+        # it. Any other OSError (permissions, a stale handle, an unwritable
+        # state dir) is a broken machine, and swallowing it as contention
+        # would leave a mirror that quietly posts nothing forever. Let it
+        # raise: --once is loud, and --follow's _run_once_logged names it on
+        # one line and keeps polling.
         os.close(fd)
         return None
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -645,6 +661,14 @@ def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
                 json.dumps({"reason": reason, "row": swarm_mailbox.without_source(row)})
                 + "\n"
             )
+        # ON THE PLATTER BEFORE THE CURSOR FORGETS THE ROW. This file is the
+        # ONLY record of a row the caller is about to advance past, so the
+        # write has to be durable before _save_cursor runs -- a crash in
+        # between would otherwise persist the newer cursor and lose the
+        # recovery record, which is a silent drop wearing a "never silently
+        # lossy" docstring.
+        fh.flush()
+        os.fsync(fh.fileno())
     sys.stderr.write(
         "discord mirror: SKIPPED %d row(s) (%s); recorded in %s\n"
         % (len(rows), reason, path)
@@ -652,8 +676,8 @@ def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
 
 
 def run_once(runid, lane=DEFAULT_LANE):
-    """Mirror everything new in one lane, exactly once. Exit-code semantics
-    of main(). Raises SystemExit(2) via resolve_webhook_url if this lane's
+    """Mirror everything new in one lane, once. Exit-code semantics of
+    main(). Raises SystemExit(2) via resolve_webhook_url if this lane's
     secret is missing -- callers that must not exit (--follow, --follow-all)
     catch that themselves; see module docstring, LAUNCHD SAFETY.
 
@@ -666,7 +690,18 @@ def run_once(runid, lane=DEFAULT_LANE):
 
     The secret check stays FIRST, ahead of the lock: exit 2 on a missing
     secret is --once's contract with a human, and a lock some other poller
-    happens to hold must not turn that into a quiet 0."""
+    happens to hold must not turn that into a quiet 0.
+
+    HOW MANY TIMES A ROW CAN POST, precisely: exactly once across CONCURRENT
+    pollers (that is what the lock buys), at least once across a CRASH. The
+    cursor is saved after the posts, so a process that dies -- or whose
+    _save_cursor raises -- between a delivered chunk and the save re-posts
+    that chunk on the next pass. That is deliberate, and it is the same trade
+    every other cursor in this repo makes (see swarm_mailbox.read_delta, and
+    the slice 2 design note on issue #40, D1): committing the cursor first
+    would turn a duplicate, which a human reading the channel can see and
+    ignore, into a lost row, which nobody can see at all. Recovery for a
+    duplicate is nothing; recovery for a lost row does not exist."""
     url = resolve_webhook_url(lane)  # before anything else: missing secret = 2 always
     lock_fd = _acquire_pass_lock(runid, lane)
     if lock_fd is None:

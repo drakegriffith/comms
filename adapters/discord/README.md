@@ -201,10 +201,14 @@ need posting. See issue #20.
 
 `<COMMS_STATE_DIR>/<lane state dir>/<runid>.cursor.json`, a flat JSON object:
 
-    {"alpha@alpha.jsonl#8912345": 12, "beta~studio@remote~studio.jsonl#8912346": 4}
+    {"alpha/alpha.jsonl#8912345": 12, "beta~studio/remote~studio.jsonl#8912346": 4}
 
-The key is `<seat>@<source file>#<inode>`; the value is how many of that
-seat's rows the mirror has read OUT OF THAT FILE. Three properties earn the
+The key is `<seat>/<source file>#<inode>`; the value is how many of that
+seat's rows the mirror has read OUT OF THAT FILE. The separator is `/`
+because it is the only character neither half can contain -- `@` and `#` are
+both legal in a seat name and in a machine label, so `beta~studio#2` is a
+nameable seat whose mirror file is `remote~studio#2.jsonl`, and a separator
+either half can contain makes the key ambiguous. Three properties earn the
 shape:
 
 - **Per file, not per seat.** One seat can own rows in two files at once (its
@@ -221,7 +225,10 @@ shape:
   "the first N rows of this seat, in merged order, are already seen". The next
   poll spends that count exactly that way, writes the per-file keys, and drops
   the bare seat key. Deploying this never re-posts history and never skips a
-  row.
+  row. One case is deliberately not behavior-preserving: if the legacy count
+  is LARGER than the rows now visible (a truncated or replaced seat file), the
+  surplus is not banked, so rows appended later post rather than being
+  swallowed by a count that dead rows earned.
 
 ## Forum board webhook (resolution only, not a lane yet)
 
@@ -282,11 +289,11 @@ because a step nobody could fail is not a check.
 | 2 | repeat the same command twice more, watch the follower | three messages, in order, no repeats | a repeat = cursor not advancing; a gap = a row filtered out |
 | 3 | restart the follower job (`launchctl kickstart -k`), post again | only the NEW row appears | history re-posted = the cursor file was not read (check the state dir path) |
 | 4 | start a SECOND `--follow <runid>` by hand, same lane | its stderr says another poller holds the run; the channel gets each row exactly once | the row appears twice = the lock is not being taken |
-| 5 | kill -9 the first follower, poll again | the hand-started one takes over on its next pass | it stays locked out = a stale lock (should be impossible: flock dies with the process) |
+| 5 | kill -9 the first follower mid-post, poll again | the hand-started one takes over on its next pass; at most the in-flight message repeats (at-least-once, see Behavior guarantees) | it stays locked out = a stale lock (should be impossible: flock dies with the process); a row MISSING is the finding |
 | 6 | on the laptop: `adapters/remote/sync.py pull` from the studio | rows land in the laptop's `remote~studio.jsonl` and NOTHING new appears in Discord | the pulled rows appear a second time = #20 is back |
 | 7 | with the laptop's mirror running, push a row from laptop to studio, then pull it back | the row appears exactly once, authored by the laptop's seat | twice = the echo/pulled discrimination broke |
 | 8 | post one unicast (`--to <seat>`) and one `comment` | both appear in the `convo` channel; the plain findings from step 1 do NOT | a finding in `convo` = lane filter; nothing at all = `DISCORD_COMMS_CONVO_WEBHOOK_URL` |
-| 9 | inspect `<runid>.cursor.json` | keys read `<seat>@<file>#<inode>`; one key per (seat, file) | a bare `<seat>` key left over = migration did not run this pass |
+| 9 | inspect `<runid>.cursor.json` | keys read `<seat>/<file>#<inode>`; one key per (seat, file) | a bare `<seat>` key left over = migration did not run this pass |
 | 10 | `<runid>.skipped.jsonl` | absent, or every entry explained | any entry nobody can explain is the finding of the rehearsal |
 
 **After:** put the counts from step 3 next to what the channel shows. Equal is
@@ -377,11 +384,19 @@ the loop.
 - **Kind-agnostic.** Whatever `kind` a row carries is mirrored verbatim; the
   vocabulary is enforced at write time by `lib/swarm_mailbox.VALID_KINDS`,
   which is being extended on a parallel branch. The mirror never hardcodes it.
-- **No reposts, upgrade-safe.** A per-run cursor (per-seat-per-source-file row
-  counts, valid because seat files are append-only single-writer) lives in
-  `COMMS_STATE_DIR`; restarts resume where they left off. A cursor file
-  written in ANY earlier format is honored and migrated in place on the next
-  poll, so deploying never re-posts history -- see Cursor format above.
+- **Exactly once across pollers, at least once across a crash.** A per-run
+  cursor (per-seat-per-source-file row counts, valid because seat files are
+  append-only single-writer) lives in `COMMS_STATE_DIR`, and the lock means
+  two pollers can never both post a row. The cursor is saved AFTER the posts,
+  so a crash (or an unwritable state dir) between a delivered message and
+  that save re-posts that message on the next pass. This is the deliberate
+  direction: committing the cursor first would turn a duplicate a human can
+  see and ignore into a lost row nobody can see. Recovery for a duplicate is
+  nothing; there is no recovery for a lost row. An ordinary restart re-posts
+  nothing, because the cursor was saved.
+- **Upgrade-safe.** A cursor file written in ANY earlier format is honored and
+  migrated in place on the next poll, so deploying never re-posts history --
+  see Cursor format above.
 - **One poller per (run, lane), enforced.** An `fcntl.flock` per pass, not a
   rule in a README; the second poller no-ops loudly. See Concurrency above.
 - **Batched per author.** Rows that arrive together from the SAME seat go out
@@ -391,7 +406,11 @@ the loop.
 - **Rate-limit aware, never silently lossy.** 429 honours `Retry-After` with
   a capped retry budget; rows that still fail are written to
   `<runid>.skipped.jsonl` in the state dir and shouted to stderr, then the
-  cursor advances (the skipped file is the durable record).
+  cursor advances (the skipped file is the durable record). That file is
+  flushed and `fsync`ed before the cursor moves past the row, so a crash
+  cannot persist the newer cursor while losing the record it points at.
+  Recovery is that file: it holds each row as its author wrote it, so a
+  human can re-post or re-inject it.
 
 ## Deliberately NOT synced
 

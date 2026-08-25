@@ -1239,7 +1239,7 @@ def test_normal_poll_still_advances_the_new_shape_cursor(webhook):
     cursor = mirror._load_cursor(RUNID)
     assert list(cursor.values()) == [1]
     key = list(cursor)[0]
-    assert key.startswith("alpha@alpha.jsonl#")
+    assert key.startswith("alpha/alpha.jsonl#")
     swarm_mailbox.post(RUNID, "alpha", "finding", "two")
     assert mirror.run_once(RUNID) == 0
     assert mirror._load_cursor(RUNID)[key] == 2
@@ -1269,13 +1269,42 @@ def test_old_shape_cursor_migrates_in_place_on_the_next_poll(webhook):
 def test_skipped_log_records_the_row_as_authored_not_the_read_time_tag(webhook, capsys):
     """The skipped file is the durable replay record, so it must hold the
     row its author wrote -- the source tag is a fact about THIS machine's
-    disk, never part of the row."""
+    disk, never part of the row.
+
+    The first assertion is the positive control that makes the second one
+    mean something: prove the row the mirror actually posts from IS tagged,
+    or "no _src in the log" is true of any code that never tags at all."""
     webhook.script[:] = [429] * (mirror.MAX_RETRIES + 1)
     swarm_mailbox.post(RUNID, "alpha", "finding", "undeliverable")
+    fresh, _ = mirror.collect_new(RUNID)
+    assert [swarm_mailbox.source_of(r) for r in fresh] != [None]  # tagged on read
     assert mirror.run_once(RUNID) == 1
     with open(mirror._skipped_path(RUNID)) as fh:
         recorded = [json.loads(l) for l in fh]
+    assert recorded[0]["row"]["text"] == "undeliverable"
     assert swarm_mailbox.SOURCE_KEY not in recorded[0]["row"]
+
+
+def test_skipped_log_is_fsynced_before_the_cursor_advances(webhook, monkeypatch):
+    """Order is the guarantee: the skipped file is the ONLY record of a row
+    the cursor is about to move past, so it has to be on the platter before
+    the cursor that forgets it. Without the fsync a crash can persist the
+    newer cursor and lose the recovery record -- a silent drop wearing a
+    'never silently lossy' docstring."""
+    events = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(mirror.os, "fsync", lambda fd: events.append("fsync") or real_fsync(fd))
+    real_save = mirror._save_cursor
+    monkeypatch.setattr(
+        mirror, "_save_cursor",
+        lambda runid, cursor, lane=mirror.DEFAULT_LANE: events.append("save_cursor")
+        or real_save(runid, cursor, lane),
+    )
+    webhook.script[:] = [429] * (mirror.MAX_RETRIES + 1)
+    swarm_mailbox.post(RUNID, "alpha", "finding", "undeliverable")
+    assert mirror.run_once(RUNID) == 1
+    assert "fsync" in events
+    assert events.index("fsync") < events.index("save_cursor")
 
 
 # ---- one poller per (run, lane): fcntl.flock -------------------------------
@@ -1367,6 +1396,34 @@ def test_lock_file_lives_in_the_lane_state_dir(webhook):
     assert mirror._lock_path(RUNID, "convo") != mirror._lock_path(RUNID, "all")
     assert "discord-mirror-convo" in mirror._lock_path(RUNID, "convo")
     assert mirror._lock_path(RUNID).endswith(".lock")
+
+
+def test_a_lock_error_that_is_not_contention_is_never_swallowed(monkeypatch):
+    """Contention is EAGAIN and nothing else. A permission error, a stale NFS
+    handle, or an unwritable state dir must not read as 'someone else is
+    polling' -- that turns a broken machine into a mirror that quietly posts
+    nothing forever. Under --follow the raise is caught, named with its
+    exception class, and retried by _run_once_logged; under --once it is loud."""
+    real_flock = mirror.fcntl.flock
+
+    def refuse(fd, op):
+        raise PermissionError("flock not permitted here")
+
+    monkeypatch.setattr(mirror.fcntl, "flock", refuse)
+    with pytest.raises(PermissionError):
+        mirror._acquire_pass_lock(RUNID)
+    monkeypatch.setattr(mirror.fcntl, "flock", real_flock)
+
+
+def test_follow_loop_survives_a_lock_error_instead_of_dying(webhook, monkeypatch, capsys):
+    """The other half of the test above: a raising lock must not kill a
+    follower's loop, because a launchd KeepAlive job would crash-loop on it."""
+    monkeypatch.setattr(
+        mirror.fcntl, "flock",
+        lambda fd, op: (_ for _ in ()).throw(PermissionError("nope")),
+    )
+    assert mirror._run_once_logged(RUNID, mirror.DEFAULT_LANE) == 1
+    assert "PermissionError" in capsys.readouterr().err
 
 
 def test_missing_secret_still_exits_2_when_another_poller_holds_the_lock(capsys):
