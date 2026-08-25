@@ -356,10 +356,10 @@ def _participant_path(runid, agent_id):
 def test_add_topics_adds_a_new_topic_and_returns_the_whole_list():
     swarm_arm.arm("r1")
     swarm_arm.enroll("r1", "agent-a", topics="projA", seat="alpha")
-    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == [
-        "projA",
-        "doc:comms/x.py",
-    ]
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == (
+        ["projA", "doc:comms/x.py"],
+        True,
+    )
     topics, seat = swarm_arm.participant_sub("r1", "agent-a")
     assert topics == ["projA", "doc:comms/x.py"]
     assert seat == "alpha"
@@ -368,11 +368,10 @@ def test_add_topics_adds_a_new_topic_and_returns_the_whole_list():
 def test_add_topics_accepts_a_comma_string_like_every_other_topic_arg():
     swarm_arm.arm("r1")
     swarm_arm.enroll("r1", "agent-a", topics="projA")
-    assert swarm_arm.add_topics("r1", "agent-a", "doc:a,doc:b") == [
-        "projA",
-        "doc:a",
-        "doc:b",
-    ]
+    assert swarm_arm.add_topics("r1", "agent-a", "doc:a,doc:b") == (
+        ["projA", "doc:a", "doc:b"],
+        True,
+    )
 
 
 def test_add_topics_dedupes_and_preserves_existing_order():
@@ -380,7 +379,7 @@ def test_add_topics_dedupes_and_preserves_existing_order():
     swarm_arm.enroll("r1", "agent-a", topics="projA,projB")
     assert swarm_arm.add_topics(
         "r1", "agent-a", ["projB", "doc:comms/x.py", "projA", "doc:comms/x.py"]
-    ) == ["projA", "projB", "doc:comms/x.py"]
+    ) == (["projA", "projB", "doc:comms/x.py"], True)
 
 
 def test_add_topics_preserves_seat_and_identity_fields():
@@ -409,10 +408,10 @@ def test_add_topics_with_nothing_new_does_not_write_the_file():
     st = os.stat(path)
     os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
     before = os.stat(path)
-    assert swarm_arm.add_topics("r1", "agent-a", ["projA", "projB"]) == [
-        "projA",
-        "projB",
-    ]
+    assert swarm_arm.add_topics("r1", "agent-a", ["projA", "projB"]) == (
+        ["projA", "projB"],
+        False,
+    )
     after = os.stat(path)
     assert after.st_mtime == before.st_mtime
     assert after.st_ino == before.st_ino
@@ -425,7 +424,7 @@ def test_add_topics_with_an_empty_topic_list_is_a_no_op():
     st = os.stat(path)
     os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
     before = os.stat(path)
-    assert swarm_arm.add_topics("r1", "agent-a", []) == ["projA"]
+    assert swarm_arm.add_topics("r1", "agent-a", []) == (["projA"], False)
     assert os.stat(path).st_ino == before.st_ino
 
 
@@ -435,13 +434,13 @@ def test_add_topics_on_an_unenrolled_agent_returns_empty_and_creates_no_file():
     # bystander on the machine a participant the first time it wrote to disk,
     # which is the machine-global contamination this whole module removed.
     swarm_arm.arm("r1")
-    assert swarm_arm.add_topics("r1", "ghost", ["doc:comms/x.py"]) == []
+    assert swarm_arm.add_topics("r1", "ghost", ["doc:comms/x.py"]) == ([], False)
     assert swarm_arm.is_participant("r1", "ghost") is False
     assert os.listdir(swarm_arm._participants_dir("r1")) == []
 
 
 def test_add_topics_on_an_unarmed_run_returns_empty():
-    assert swarm_arm.add_topics("never-armed-run", "agent-a", ["doc:x"]) == []
+    assert swarm_arm.add_topics("never-armed-run", "agent-a", ["doc:x"]) == ([], False)
 
 
 def test_add_topics_on_a_malformed_participant_file_returns_empty():
@@ -451,7 +450,7 @@ def test_add_topics_on_a_malformed_participant_file_returns_empty():
     swarm_arm.enroll("r1", "agent-a", topics="projA")
     with open(_participant_path("r1", "agent-a"), "w") as fh:
         fh.write("{not json")
-    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"]) == []
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"]) == ([], False)
 
 
 def test_add_topics_leaves_no_temp_file_behind():
@@ -466,7 +465,8 @@ _CONCURRENT_ADD = (
     "sys.path.insert(0, sys.argv[1])\n"
     "import swarm_arm\n"
     "time.sleep(max(0.0, float(sys.argv[2]) - time.time()))\n"
-    "swarm_arm.add_topics('r1', 'agent-a', [sys.argv[3]])\n"
+    "_topics, changed = swarm_arm.add_topics('r1', 'agent-a', [sys.argv[3]])\n"
+    "sys.stdout.write('CHANGED' if changed else 'UNCHANGED')\n"
 )
 
 
@@ -509,7 +509,7 @@ def test_add_topics_refuses_to_narrow_a_subscribe_all_participant():
     st = os.stat(path)
     os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
     before = os.stat(path)
-    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == []
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == ([], False)
     assert os.stat(path).st_ino == before.st_ino
     assert swarm_arm.participant_sub("r1", "agent-a")[0] == []
 
@@ -521,7 +521,7 @@ def test_add_topics_does_not_freeze_the_run_default_into_a_per_agent_list():
     swarm_arm.arm("r1", topic="projDefault")
     swarm_arm.enroll("r1", "agent-a")
     assert swarm_arm.participant_sub("r1", "agent-a")[0] == ["projDefault"]
-    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == []
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"]) == ([], False)
     with open(_participant_path("r1", "agent-a")) as fh:
         assert json.load(fh)["topics"] == []
     assert swarm_arm.participant_sub("r1", "agent-a")[0] == ["projDefault"]
@@ -559,3 +559,69 @@ def test_own_topics_sees_what_add_topics_just_wrote():
     swarm_arm.enroll("r1", "agent-a", topics="projA")
     swarm_arm.add_topics("r1", "agent-a", ["doc:comms/x.py"])
     assert swarm_arm.own_topics("r1", "agent-a") == ["projA", "doc:comms/x.py"]
+
+
+def test_add_topics_reports_changed_true_only_when_it_wrote():
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"])[1] is True
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"])[1] is False
+
+
+def test_add_topics_concurrent_adders_of_the_same_key_report_one_winner(
+    isolated_state,
+):
+    # The flag must be decided UNDER THE LOCK. A caller comparing the topic
+    # list before and after its own call would race: two beats adding the same
+    # key both see it absent beforehand and both report "changed", so a doc
+    # key that was enrolled once gets counted twice. Exactly one writer wins.
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    lib_dir = os.path.dirname(os.path.abspath(swarm_arm.__file__))
+    env = dict(os.environ)
+    env["COMMS_STATE_DIR"] = str(isolated_state)
+    env.pop("SWARM_ARM_STATE_DIR", None)
+    start = time.time() + 1.5
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CONCURRENT_ADD, lib_dir, repr(start), "doc:same"],
+            env=env,
+            stdout=subprocess.PIPE,
+        )
+        for _ in range(2)
+    ]
+    verdicts = []
+    for p in procs:
+        out, _ = p.communicate(timeout=60)
+        assert p.returncode == 0
+        verdicts.append(out.decode())
+    assert sorted(verdicts) == ["CHANGED", "UNCHANGED"]
+    assert swarm_arm.own_topics("r1", "agent-a") == ["projA", "doc:same"]
+
+
+def test_add_topics_that_cannot_lock_does_not_write_at_all(capsys, monkeypatch):
+    # A read-modify-write that proceeds WITHOUT the lock is not a degraded
+    # write, it is a lost-update generator: the whole reason the lock exists.
+    # Refusing costs one un-grown subscription (the next Write/Edit beat
+    # retries); proceeding costs another writer's topics, silently.
+    import fcntl
+
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", topics="projA")
+    path = _participant_path("r1", "agent-a")
+    st = os.stat(path)
+    os.utime(path, (st.st_atime - 60, st.st_mtime - 60))
+    before = os.stat(path)
+
+    def _refuse(*a, **kw):
+        raise OSError("no locks available")
+
+    monkeypatch.setattr(fcntl, "flock", _refuse)
+    assert swarm_arm.add_topics("r1", "agent-a", ["doc:x"]) == (["projA"], False)
+    after = os.stat(path)
+    assert after.st_mtime == before.st_mtime
+    assert after.st_ino == before.st_ino
+    err = capsys.readouterr().err
+    assert "add_topics" in err
+    assert "no locks available" in err
+    assert err.count("\n") == 1

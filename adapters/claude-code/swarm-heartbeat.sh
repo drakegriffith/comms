@@ -316,6 +316,7 @@ def append_telemetry(runid, topic_label, rows_inspected, delta_emitted, short_ci
 row_lines = []                 # emitted rows across every participating run
 deferred_cursor = []           # (cursor_dir, cursor_file, new_cursor)
 deferred_mtime = []            # (cursor_dir, mtime_file, "set"|"clear", val)
+enrolled_this_beat = set()     # runids whose subscription GREW on this beat
 
 
 def process_run(runid):
@@ -371,7 +372,14 @@ def process_run(runid):
     except (OSError, ValueError):
         last_mtime = -1.0
 
-    if files and newest <= last_mtime:
+    # The short-circuit asks "did the MAILBOX change", but the mailbox is only
+    # half the query -- the SUBSCRIPTION is the other half, and a doc key
+    # enrolled on this beat can make an already-present row match. Skipping the
+    # scan then would defer the first delivery on a new subscription until some
+    # unrelated seat happened to post. Bypass is for THIS beat only (the set is
+    # per-process): the deferred_mtime write below still records `newest`, so
+    # the next quiet beat short-circuits normally and the speed path survives.
+    if files and newest <= last_mtime and runid not in enrolled_this_beat:
         append_telemetry(runid, topic_label, 0, 0, short_circuit=True)
         return
 
@@ -504,13 +512,16 @@ def doc_enrol():
     if not key:
         return  # outside any repo -- no thread, never a fabricated key
     for runid in my_runs:
-        # own_topics, not participant_sub: participant_sub substitutes the
-        # run-level default for an agent that declared none, and writing that
-        # borrowed default back would freeze it into a per-agent list.
-        before = swarm_arm.own_topics(runid, agent_id, state_dir=state_dir)
-        if not before or key in before:
-            continue  # subscribe-all (never narrow), or already subscribed
-        if key in swarm_arm.add_topics(runid, agent_id, [key], state_dir=state_dir):
+        # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
+        # -- read the topics, compare after the call -- would race: two beats
+        # adding the same key both see it absent beforehand and both report an
+        # enrolment that happened once. The lock is the only place with one
+        # answer, so the answer is returned from there.
+        _topics, changed = swarm_arm.add_topics(
+            runid, agent_id, [key], state_dir=state_dir
+        )
+        if changed:
+            enrolled_this_beat.add(runid)
             append_telemetry(runid, "doc-enrol " + key, 0, 0)
 
 

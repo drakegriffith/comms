@@ -188,7 +188,16 @@ def _locks_dir(runid, state_dir=None):
 
 def add_topics(runid, agent_id, topics, state_dir=None):
     """Union `topics` into an ALREADY-ENROLLED agent's subscription. Returns
-    the resulting topic list (existing order preserved, new topics appended).
+    (topics_list, changed): the resulting list (existing order preserved, new
+    topics appended) and whether THIS call is the one that wrote it.
+
+    `changed` IS DECIDED UNDER THE LOCK, and that is the whole point of
+    returning it. A caller cannot compute it by reading the list before and
+    after its own call: between those two reads another beat can add the same
+    key, so both callers see it absent beforehand, both see it present
+    afterwards, and both report an enrolment that happened once. The only
+    place that question has a single answer is inside the critical section, so
+    the answer is returned from there rather than reconstructed outside it.
 
     WHY THIS IS NOT A FLAG ON enroll(). enroll() is write-once by design (the
     `if not os.path.exists(path)` gate above), so a second enroll carrying an
@@ -202,12 +211,12 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     becomes one of its subscribed topics, so sibling rows ABOUT that document
     reach the agent that is working on it. See swarm-heartbeat.sh's header.
 
-    NOT ENROLLING IS THE POINT. A missing participant file returns [] and
-    creates NOTHING. An agent that never opted in must not become a
+    NOT ENROLLING IS THE POINT. A missing participant file returns ([], False)
+    and creates NOTHING. An agent that never opted in must not become a
     participant by the side effect of writing a file -- that would re-create,
     through the back door, exactly the machine-global contamination this
     module's per-participant roster removed. Same for an unarmed run, an
-    unreadable file, or a malformed one: [] and no write.
+    unreadable file, or a malformed one: ([], False) and no write.
 
     A SUBSCRIBE-ALL PARTICIPANT IS NEVER NARROWED, and this is the subtlest
     rule here. An EMPTY topics list means "every topic" everywhere in this
@@ -217,8 +226,9 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     row from an agent that was receiving all of them. The guard lives here,
     not in the caller, because this module is where "empty means all" is
     DEFINED; a caller that had to remember it would eventually not. Such a
-    participant gets [] and no write, the same shape as "nothing to add to" --
-    both mean the subscription is unchanged and the caller has nothing to do.
+    participant gets ([], False) and no write, the same shape as "nothing to
+    add to" -- both mean the subscription is unchanged and there is nothing to
+    do about it.
 
     NO-OP MEANS NO WRITE. When every topic is already present the file is not
     touched at all -- not rewritten with identical bytes. This runs on every
@@ -232,9 +242,16 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     other's. The write itself is tmp + flush + fsync + os.replace, so a READER
     (the heartbeat's own participant_sub, mid-beat) sees either the whole old
     file or the whole new one, never a partial one; readers therefore need no
-    lock of their own. Lock failure degrades to an unlocked write rather than
-    to no write: a lost update is a missed row, a refused write is a
-    subscription that never grows at all.
+    lock of their own.
+
+    A LOCK WE CANNOT TAKE MEANS WE DO NOT WRITE. Failure to create the lock
+    dir, open the lock file, or acquire the flock returns
+    (current_topics, False) plus ONE stderr line, and writes nothing. Falling
+    through to an unlocked read-modify-write is not a degraded write, it is a
+    lost-update generator -- exactly the failure the lock exists to prevent,
+    reintroduced at the moment the safeguard breaks. Refusing costs one
+    un-grown subscription and the next Write/Edit beat retries; proceeding
+    costs another writer's topics, silently and permanently.
 
     UNBOUNDED BY DESIGN, FOR NOW: a long session subscribes one topic per file
     it touches. Accepted for v1 (the list is read once per beat and holds
@@ -245,9 +262,11 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     in: runid; agent_id (raw, sanitized here the same way enroll does);
       topics (comma string or list, same normalization as everywhere else);
       state_dir (default $COMMS_STATE_DIR chain).
-    out: the resulting topic list, or [] when there is nothing to add to.
+    out: (topics_list, changed). changed is True on exactly the calls that
+      rewrote the file. ([], False) whenever there is nothing to add to.
     side effects: at most one atomic rewrite of the participant file, plus the
-      lock dir/file. Never creates a participant.
+      lock dir/file, plus one stderr line if the lock could not be taken.
+      Never creates a participant.
     """
     import fcntl
 
@@ -255,7 +274,7 @@ def add_topics(runid, agent_id, topics, state_dir=None):
     pdir = _participants_dir(runid, state_dir)
     path = os.path.join(pdir, _safe(agent_id))
     if not os.path.exists(path):
-        return []
+        return ([], False)
 
     lock_fh = None
     try:
@@ -264,26 +283,38 @@ def add_topics(runid, agent_id, topics, state_dir=None):
             os.path.join(_locks_dir(runid, state_dir), _safe(agent_id) + ".lock"), "a"
         )
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        pass  # degrade to an unlocked write; see CONCURRENCY above
+    except Exception as exc:
+        # Broad on purpose: however the lock failed, the answer is the same --
+        # do not write. See "A LOCK WE CANNOT TAKE" above.
+        if lock_fh is not None:
+            try:
+                lock_fh.close()
+            except OSError:
+                pass
+        sys.stderr.write(
+            "swarm_arm: add_topics could not lock %s (%s); subscription NOT grown\n"
+            % (path, exc)
+        )
+        return (own_topics(runid, agent_id, state_dir=state_dir), False)
 
     try:
         try:
             with open(path) as fh:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError):
-            return []
+            return ([], False)
         if not isinstance(data, dict):
-            return []
+            return ([], False)
         current = _as_topics(data.get("topics"))
         if not current:
-            return []  # subscribe-all: adding would NARROW it, see above
+            # subscribe-all: adding would NARROW it, see above
+            return ([], False)
         merged = list(current)
         for t in new:
             if t not in merged:
                 merged.append(t)
         if merged == current:
-            return current  # NO-OP MEANS NO WRITE
+            return (current, False)  # NO-OP MEANS NO WRITE
 
         data["topics"] = merged
         tmp = path + ".tmp." + str(os.getpid())
@@ -298,8 +329,8 @@ def add_topics(runid, agent_id, topics, state_dir=None):
                 os.remove(tmp)
             except OSError:
                 pass
-            return current  # the list on disk is still the old one
-        return merged
+            return (current, False)  # the list on disk is still the old one
+        return (merged, True)
     finally:
         if lock_fh is not None:
             try:
