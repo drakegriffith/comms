@@ -101,6 +101,32 @@ than reasoning about it: set `[compat.claude] hooks = false` in
 `~/.grok/config.toml` so grok stops scanning the Claude hook source, and let
 the poll loop below be the only delivery path.
 
+### Compat opt-out status (this machine, 2026-08-25, grok 0.2.106)
+
+The opt-out is now IN PLACE on this machine. `~/.grok/config.toml` carries:
+
+```toml
+[compat.claude]
+hooks = false
+```
+
+Verified with `grok inspect` run from a scratch cwd after the edit:
+
+```
+Harness Compatibility
+└ claude
+  └ hooks      OFF  (config)
+```
+
+and all 17 hooks tagged `user [claude]` in the `Hooks (18)` block show
+`[disabled]` (the 18th entry, `plugin: codex`, is unrelated -- it is the codex
+plugin's own hook, not sourced from `~/.claude/settings.json`, and is still
+active). Before this edit, `grok inspect` reported those same 17 hooks loaded
+and enabled, sourced from `~/.claude/settings.json` (PR #45 / issue #28's
+comment on issue #31, 2026-08-25). This is a per-machine setting, not a repo
+file -- a fresh machine still needs this write before a grok seat is enrolled
+in any run, and `grok inspect` is how to confirm it took.
+
 ## The recipe
 
 1. **Enroll on line one of the brief.** The first command grok runs names the
@@ -179,3 +205,74 @@ grok --allow "Bash(*/bin/comms *)" "<brief>"
   ever grows push delivery.
 - Delivery auditing: read the telemetry/mailbox files, not the seat's
   self-report (see "The delivery oracle" in the top-level README).
+- **The `--allow` pattern above can silently never match.** `Bash(...)` allow
+  rules are checked against the WHOLE command string as grok received it, with
+  no special treatment for a leading environment assignment (per grok's own
+  docs, `22-permissions-and-safety.md`). A brief that tells the agent to set
+  `COMMS=$HOME/code/comms/bin/comms` and then run `$COMMS enroll ...` produces
+  a tool call whose literal text starts with `COMMS=`, not the binary path, so
+  `--allow "Bash(*/bin/comms *)"` never matches it, the call sits waiting on a
+  prompt headless mode cannot answer, and the turn is silently cancelled with
+  no enrollment, no error, and a self-report that still sounds like it worked.
+  The recipe that was actually observed to work (2026-08-25 verification,
+  below) skips the shell variable: the brief names the full literal path in
+  each command line, one command per tool call, and the `--allow` rule matches
+  that literal path as a bare prefix, e.g.
+  `--allow "Bash(/full/path/to/bin/comms)"`.
+
+## Live poll-seat verification (receiver-verified, 2026-08-25, grok 0.2.106)
+
+Issue #31's acceptance criteria: a grok seat completes an enroll/read/reply
+round trip, and receipt is proven from MAILBOX STATE, not the agent's
+self-report. Run against the real `bin/comms` defaults (`~/.comms/state`), a
+scratch runid keeping it namespaced. Ran after the compat opt-out above was
+confirmed in place.
+
+Setup:
+
+```
+runid=grok-verify-20260825   seat=g1   agent-id=g1-grok   topic=verify
+passphrase=COMMS-GROK-VERIFY-1F70CF3C
+```
+
+Commands, in order:
+
+```
+bin/comms arm grok-verify-20260825 --topic verify
+bin/comms post grok-verify-20260825 coordinator claim \
+  "MAILBOX ROW for g1: reply with this exact passphrase to prove you read it: COMMS-GROK-VERIFY-1F70CF3C" \
+  --to g1
+grok --allow "Bash(/Users/drakegriffith8/code/comms/bin/comms)" \
+  --output-format plain --max-turns 12 -p "<brief: enroll as g1-grok/g1 on
+  topic verify, read the mailbox, find the passphrase in the row addressed to
+  g1, then post a reply to coordinator quoting it, one literal command per
+  tool call, no shell variables>"
+```
+
+grok's self-report (not trusted as the verdict, recorded for comparison only):
+"Passphrase: COMMS-GROK-VERIFY-1F70CF3C. Step 3 succeeded (exit 0). Posted a
+reply from seat g1 to coordinator: `received: COMMS-GROK-VERIFY-1F70CF3C`."
+
+The oracle -- mailbox state, read after the run:
+
+```
+$ bin/comms status grok-verify-20260825
+{"runid": "grok-verify-20260825", "armed": true, ...,
+ "participants": ["g1-grok"]}
+
+$ bin/comms read grok-verify-20260825 g1 --replay
+{"seat": "coordinator", "at": "2026-08-25T21:27:37...Z", "kind": "claim",
+ "text": "MAILBOX ROW for g1: reply with this exact passphrase to prove you
+ read it: COMMS-GROK-VERIFY-1F70CF3C", "topic": "@g1", "to": "g1"}
+
+$ bin/comms read grok-verify-20260825 coordinator --replay
+{"seat": "g1", "at": "2026-08-25T21:32:33...Z", "kind": "reply",
+ "text": "received: COMMS-GROK-VERIFY-1F70CF3C", "topic": "@coordinator",
+ "to": "coordinator"}
+```
+
+`status` shows `g1-grok` enrolled (the enroll ran). `read ... coordinator`
+shows a `reply` row from seat `g1`, addressed `@coordinator`, quoting the
+planted passphrase back verbatim, timestamped after the planted row -- receipt
+proven from the mailbox grok's own commands wrote, not from grok's answer
+text. Round trip closed: enroll, read, reply, all confirmed from state.
