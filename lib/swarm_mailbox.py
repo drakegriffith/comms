@@ -306,16 +306,21 @@ def post(runid, seat, kind, text, topic=None, to=None):
 #   everyone else sees byte-identical rows to before.
 SOURCE_KEY = "_src"
 
-# Separates the seat from its source tag in a cursor key. A legacy cursor's
-# keys are bare seat names, so a key containing this separator is
+# Separates the seat from its source tag in a cursor key. It has to be "/":
+# that is the ONE character neither half can contain -- _valid_seat rejects it
+# in a seat name, and no filename holds it -- while "@" and "#" are both legal
+# in a seat name and in a machine label (so `beta~studio#2` is a nameable seat
+# whose mirror file is `remote~studio#2.jsonl`). A separator either half can
+# contain makes a key ambiguous, and an ambiguous key is a miscounted cursor.
+# A legacy cursor's keys are bare seat names, so a key containing "/" is
 # unambiguously a post-#39 one (see fresh_rows_by_seat's migration).
-CURSOR_KEY_SEP = "@"
+CURSOR_KEY_SEP = "/"
 
 # The pull-mirror file's name shape, as adapters/remote/sync.py spells it
 # (MIRROR_PREFIX + QUALIFIER + <hub label>). RECOGNIZED here, NAMED there --
 # tests/test_swarm_mailbox.py asserts the two agree, because two spellings of
 # one convention is exactly how #20 comes back.
-MIRROR_FILE_PREFIX = "remote"
+MIRROR_FILE_PREFIX = "remote~"
 
 
 def source_tag(fh, name):
@@ -343,6 +348,23 @@ def source_of(row):
     return row.get(SOURCE_KEY)
 
 
+def source_name(src):
+    """The FILE NAME inside a source tag: "alpha.jsonl#8912345" ->
+    "alpha.jsonl", and a tag that never got an inode (source_tag degrades to
+    the bare name when fstat fails) -> itself.
+
+    Split from the right and checked, not `split("#")[0]`: "#" is legal in a
+    seat name and in a machine label, so `remote~studio#2.jsonl` is a
+    nameable file and cutting at the FIRST "#" would hand back
+    "remote~studio" -- a name that fails the .jsonl test and takes a pulled
+    row's rows back into the post path (#20, all over again).
+    """
+    head, sep, tail = src.rpartition("#")
+    if sep and tail.isdigit() and head.endswith(".jsonl"):
+        return head
+    return src
+
+
 def without_source(row):
     """A copy of `row` as its author wrote it, with any read-time source tag
     removed. Use before persisting or forwarding a row that came from a
@@ -361,20 +383,29 @@ def is_mirror_source(row):
     that most need posting. An untagged row (a read without with_source, or a
     row from a non-file source like adapters/remote's subprocess) reads as
     False -- not-known is never treated as not-deliverable.
+
+    The `~<label>` suffix is REQUIRED, and the label must be non-empty: a
+    plain `remote.jsonl` is a first-class seat file that some agent could
+    legitimately own (adapters/remote reserves the name in prose, _valid_seat
+    does not enforce it), and matching it here would silently drop that
+    seat's every row. Erring toward "not a mirror" costs a duplicate at
+    worst; erring the other way loses rows.
     """
     src = source_of(row)
     if not src:
         return False
-    name = src.split("#")[0]
+    name = source_name(src)
     if not name.endswith(".jsonl"):
         return False
     stem = name[: -len(".jsonl")]
-    return stem == MIRROR_FILE_PREFIX or stem.startswith(MIRROR_FILE_PREFIX + "~")
+    return stem.startswith(MIRROR_FILE_PREFIX) and len(stem) > len(MIRROR_FILE_PREFIX)
 
 
 def cursor_key(row):
-    """The identity a count cursor must key on: "<seat>@<source tag>" for a
-    tagged row, the bare seat for an untagged one.
+    """The identity a count cursor must key on: "<seat>/<source tag>" for a
+    tagged row, the bare seat for an untagged one. The separator is "/" for
+    the reason CURSOR_KEY_SEP gives: it is the one character neither a seat
+    name nor a filename can contain, so the key is never ambiguous.
 
     The seat stays in the key even though the file is already there, because
     ONE file can carry MANY seats: `remote~<hub>.jsonl` holds every seat the
@@ -578,6 +609,16 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
     assigning the whole legacy count to the seat's first-class file, which
     would skip as many of that file's undelivered rows as the seat had
     mirror-file rows -- a silent drop, the one failure this mailbox refuses.
+
+    ONE MIGRATION CASE IS DELIBERATELY NOT BEHAVIOR-PRESERVING: a legacy count
+    LARGER than the rows now visible for that seat (its file was truncated,
+    replaced, or restored from a shorter copy). The budget is spent down to
+    what is there, the legacy key is retired, and rows appended later POST --
+    where the old code would have kept treating them as already counted. That
+    is the #23 fix doing its job rather than a regression: the surplus count
+    was earned by rows that no longer exist, and banking it would skip live
+    rows to honor dead ones. Same trade as source_tag's inode, in the same
+    direction: a visible duplicate beats an invisible loss.
 
     behavior: walks rows in order tracking a per-(seat, source) index; a row at
       index >= cursor[key] is fresh. THE CURSOR ADVANCES OVER EVERY ROW,

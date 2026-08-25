@@ -775,7 +775,31 @@ class TestSourceIdentity(unittest.TestCase):
     def test_cursor_key_of_a_tagged_row_names_seat_and_source(self):
         row = dict(self._row("alpha", "1"))
         row[mb.SOURCE_KEY] = "remote~studio.jsonl#7"
-        self.assertEqual(mb.cursor_key(row), "alpha@remote~studio.jsonl#7")
+        self.assertEqual(mb.cursor_key(row), "alpha/remote~studio.jsonl#7")
+
+    def test_cursor_key_separator_is_illegal_in_both_halves(self):
+        # "#" and "@" are LEGAL in a seat name and in a machine label (only
+        # "/" is rejected by _valid_seat, and only "/" cannot be in a
+        # filename), so either of those as the separator makes a key
+        # ambiguous. The separator has to be the one character neither half
+        # can contain.
+        self.assertEqual(mb.CURSOR_KEY_SEP, "/")
+
+    def test_cursor_key_round_trips_a_seat_and_label_containing_hashes(self):
+        row = dict(self._row("a#b", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio#2.jsonl#8912345"
+        key = mb.cursor_key(row)
+        self.assertEqual(key, "a#b/remote~studio#2.jsonl#8912345")
+        seat, _, src = key.partition(mb.CURSOR_KEY_SEP)
+        self.assertEqual(seat, "a#b")
+        self.assertEqual(mb.source_name(src), "remote~studio#2.jsonl")
+
+    def test_source_name_of_an_unstattable_tag_is_the_whole_name(self):
+        # source_tag degrades to the bare filename when fstat fails, and that
+        # name may itself contain "#" -- so the inode split is a rsplit that
+        # must recognize it has nothing to split off.
+        self.assertEqual(mb.source_name("remote~a#12.jsonl"), "remote~a#12.jsonl")
+        self.assertEqual(mb.source_name("alpha.jsonl#88"), "alpha.jsonl")
 
     def test_untagged_rows_keep_the_flat_per_seat_cursor(self):
         rows = [self._row("a", "1"), self._row("b", "2"), self._row("a", "3")]
@@ -811,8 +835,8 @@ class TestSourceIdentity(unittest.TestCase):
         older[mb.SOURCE_KEY] = "remote~hub.jsonl#2"
         fresh, cursor2 = mb.fresh_rows_by_seat([older] + rows, cursor)
         self.assertEqual([r["text"] for r in fresh], ["older-elsewhere"])
-        self.assertEqual(cursor2["a@a.jsonl#1"], 1)
-        self.assertEqual(cursor2["a@remote~hub.jsonl#2"], 1)
+        self.assertEqual(cursor2["a/a.jsonl#1"], 1)
+        self.assertEqual(cursor2["a/remote~hub.jsonl#2"], 1)
 
     # ---- back-compat: the old {seat: count} cursor migrates in place -----
 
@@ -840,6 +864,25 @@ class TestSourceIdentity(unittest.TestCase):
         self.assertEqual(fresh, [])
         self.assertEqual(cursor2, cursor)
 
+    def test_legacy_count_larger_than_the_rows_now_visible_posts_the_rest(self):
+        """The purge case, pinned deliberately. A legacy cursor claims 3 rows
+        for a seat whose file now holds 1 (truncated, replaced, or restored
+        from a shorter copy). Migration spends what it can, retires the
+        legacy key, and later appends POST. That is the #23 fix doing its
+        job: the old count was earned by rows that are no longer there, and
+        carrying the unspent budget forward would skip live rows to honor a
+        count for dead ones -- a silent drop to avoid a visible duplicate,
+        which is the wrong trade in this mailbox."""
+        self._write("test-src10", "alpha.jsonl", [self._row("alpha", "1", "survivor")])
+        rows = mb.read_siblings("test-src10", "reader", with_source=True)
+        fresh, cursor = mb.fresh_rows_by_seat(rows, {"alpha": 3})
+        self.assertEqual(fresh, [])          # the one visible row is still spent
+        self.assertNotIn("alpha", cursor)    # ...and the budget is not banked
+        self._write("test-src10", "alpha.jsonl", [self._row("alpha", "2", "appended")])
+        rows = mb.read_siblings("test-src10", "reader", with_source=True)
+        fresh2, _ = mb.fresh_rows_by_seat(rows, cursor)
+        self.assertEqual([r["text"] for r in fresh2], ["appended"])
+
     def test_legacy_key_for_a_seat_with_no_rows_this_pass_is_kept(self):
         # A seat file that is momentarily unreadable must not lose its
         # position -- dropping the key would re-post the whole file.
@@ -865,6 +908,26 @@ class TestSourceIdentity(unittest.TestCase):
 
     def test_is_mirror_source_false_for_an_untagged_row(self):
         self.assertFalse(mb.is_mirror_source(self._row("alpha", "1")))
+
+    def test_is_mirror_source_false_for_a_seat_actually_named_remote(self):
+        # adapters/remote RESERVES the name; _valid_seat does not enforce the
+        # reservation, so a first-class `remote.jsonl` can exist. A pull
+        # mirror is always `remote~<label>.jsonl` with a non-empty label --
+        # matching the bare name too would silently drop that seat's rows,
+        # and a silent drop is the one failure this mailbox refuses.
+        row = dict(self._row("remote", "1"))
+        row[mb.SOURCE_KEY] = "remote.jsonl#7"
+        self.assertFalse(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_false_for_an_empty_label(self):
+        row = dict(self._row("remote~", "1"))
+        row[mb.SOURCE_KEY] = "remote~.jsonl#7"
+        self.assertFalse(mb.is_mirror_source(row))
+
+    def test_is_mirror_source_survives_a_label_containing_a_hash(self):
+        row = dict(self._row("beta~studio#2", "1"))
+        row[mb.SOURCE_KEY] = "remote~studio#2.jsonl#8912345"
+        self.assertTrue(mb.is_mirror_source(row))
 
     def test_mirror_file_naming_agrees_with_adapters_remote(self):
         """The drift guard: adapters/remote/sync.py NAMES the pull mirror
