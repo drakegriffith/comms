@@ -138,18 +138,90 @@ needs the loud failure. A per-run exception (a bad row, an unwritable state
 dir) is likewise caught, named on one stderr line with the runid and
 exception class, and does not stop the loop or the rest of the pass.
 
-### Concurrency: one poller per (run, lane)
+### Concurrency: one poller per (run, lane), enforced
 
-**Never run two mirror processes against the same runid AND the same lane at
-once** -- neither `--follow <runid>` twice, nor `--follow <runid>` alongside
-a `--follow-all` whose default `--lane all` also covers that runid. Two
-pollers on one (run, lane) both read the same cursor, both post, and BOTH
-advance it -- the result is double-posted rows in the channel, not a race
-that merely errors. (The cursor's tmp file is PID-suffixed so the two
-processes' writes cannot collide on the SAME tmp path, but that only removes
-one failure mode; it does not make concurrent pollers on one (run, lane)
-safe.) One lane's `all` job and another's `convo` job on the SAME runid are
-fine -- they are different (run, lane) pairs with separate state dirs.
+Two pollers on one (run, lane) both read the same cursor, both post, and BOTH
+advance it -- double-posted rows in the channel, not a race that merely
+errors. That used to be a rule in this paragraph. It is now a lock.
+
+Every pass takes an exclusive `fcntl.flock` on
+`<COMMS_STATE_DIR>/<lane state dir>/<runid>.lock`. The second poller **does
+not block and does not post**: it writes one stderr line naming the run and
+lane, returns 0, and its rows are delivered by whichever poller holds the
+lock. Nothing is dropped -- anything that arrives after the winner's read is
+picked up on the loser's next poll.
+
+    discord mirror: another poller holds run 'comms-...' lane 'all'; skipping this pass (its rows are that poller's to post)
+
+Why skip rather than wait: `--follow` runs under a launchd `KeepAlive` job, so
+a blocking poller would pile processes up behind a lock the first one holds
+for its whole life, and every one of them would post the same backlog when it
+finally won. A skipped pass costs one `--interval`.
+
+Scope, deliberately narrow:
+
+- **Per (runid, lane).** Different runs never contend, so `--follow-all` still
+  walks the whole fleet in one pass, and one lane's `all` job beside another's
+  `convo` job on the same runid stays a supported pair (separate state dirs,
+  separate locks).
+- **Per pass, not per process.** The lock is released between polls, so an
+  ad-hoc `--once` slots between a follower's passes instead of being locked
+  out for as long as the follower runs.
+- **Same machine only.** `flock` is a local-filesystem lock. Two machines
+  mirroring the same runid is not a shape this repo has (each machine keeps
+  its own mailbox), and the cross-machine duplicate that DOES exist is
+  handled by the pulled-row rule below, not by a lock.
+
+A missing webhook secret still exits 2 under `--once` even when another poller
+holds the lock: that exit is the contract with the human running it, and a
+lock someone else happens to hold must not turn it into a quiet 0.
+
+### Pulled rows are counted, never posted
+
+The run directory also holds `remote~<hub>.jsonl` -- the file
+`adapters/remote` appends rows PULLED off another machine to. Those rows are
+copies of hub rows that the hub's own mirror already posted to this same
+channel, so mirroring them again posts everything twice, once per machine.
+The mirror drops them from what it posts and still counts them against the
+cursor (count-but-skip, the same shape the lane filter uses, so they are never
+re-scanned).
+
+**The discriminator is the source FILE, never the seat string.** Direction
+matters:
+
+| Row | Where it lives | Who mirrors it |
+| --- | --- | --- |
+| pushed by this machine to the hub | first-class `alpha~macbook.jsonl` on the HUB | the hub's mirror, and it must keep posting it |
+| pulled from the hub to a spoke | `remote~<hub>.jsonl` on the SPOKE | nobody: the hub already posted the original |
+
+So "skip any seat containing `~`" would silence exactly the rows that most
+need posting. See issue #20.
+
+### Cursor format
+
+`<COMMS_STATE_DIR>/<lane state dir>/<runid>.cursor.json`, a flat JSON object:
+
+    {"alpha@alpha.jsonl#8912345": 12, "beta~studio@remote~studio.jsonl#8912346": 4}
+
+The key is `<seat>@<source file>#<inode>`; the value is how many of that
+seat's rows the mirror has read OUT OF THAT FILE. Three properties earn the
+shape:
+
+- **Per file, not per seat.** One seat can own rows in two files at once (its
+  own, and the pull mirror), and a pulled row with an older `at` used to shift
+  that seat's merged sequence and push an already-delivered row back under the
+  count -- it then posted twice (issue #23). What lands in one file cannot
+  move another file's indices.
+- **Inode, not just name.** The key is a file IDENTITY. A purged and
+  re-created `<seat>.jsonl` reads as a new source and starts a fresh count, so
+  its rows post again rather than being skipped by a count the old file
+  earned. A visible duplicate beats an invisible loss; ordinary appends never
+  change the inode.
+- **Old cursors migrate in place.** A pre-existing `{"<seat>": N}` file means
+  "the first N rows of this seat, in merged order, are already seen". The next
+  poll spends that count exactly that way, writes the per-file keys, and drops
+  the bare seat key. Deploying this never re-posts history and never skips a
+  row.
 
 ## Forum board webhook (resolution only, not a lane yet)
 
@@ -184,13 +256,50 @@ the same as the other webhook vars. Whether posting `thread_name` to this
 URL actually creates a Discord forum post is verified by hand once the
 webhook exists and slice 2 lands the posting code.
 
+## Live rehearsal checklist
+
+Every guarantee above is proven by tests against a local fake webhook. The
+rehearsal is the other kind of evidence: real Discord, real launchd jobs, two
+machines. Work top to bottom -- each step names what would count as a failure,
+because a step nobody could fail is not a check.
+
+**Before (human steps, not scripted):**
+
+1. Discord UI: the forum channel exists and has a webhook. Drop the URL in
+   yourself -- `open -e ~/.secrets/comms.env`, add
+   `DISCORD_COMMS_FORUM_WEBHOOK_URL=<url>`, `chmod 600 ~/.secrets/comms.env`.
+   Never paste the URL into a terminal that is being transcribed.
+2. `bash adapters/discord/install.sh` reports all three webhook vars as
+   configured. It reports EXISTENCE, never values, and writes nothing.
+3. Note the current row counts you expect to see, per machine. A rehearsal
+   with no expected number is a demo.
+
+**Rehearsal, in order:**
+
+| # | Step | Pass looks like | Fail looks like |
+| --- | --- | --- | --- |
+| 1 | `comms post <runid> <seat> finding "rehearsal 1"` on the studio | one message in the `all` channel, authored `<seat> (studio)` | nothing (secret/lane wrong), or a bot-named line (username field dropped) |
+| 2 | repeat the same command twice more, watch the follower | three messages, in order, no repeats | a repeat = cursor not advancing; a gap = a row filtered out |
+| 3 | restart the follower job (`launchctl kickstart -k`), post again | only the NEW row appears | history re-posted = the cursor file was not read (check the state dir path) |
+| 4 | start a SECOND `--follow <runid>` by hand, same lane | its stderr says another poller holds the run; the channel gets each row exactly once | the row appears twice = the lock is not being taken |
+| 5 | kill -9 the first follower, poll again | the hand-started one takes over on its next pass | it stays locked out = a stale lock (should be impossible: flock dies with the process) |
+| 6 | on the laptop: `adapters/remote/sync.py pull` from the studio | rows land in the laptop's `remote~studio.jsonl` and NOTHING new appears in Discord | the pulled rows appear a second time = #20 is back |
+| 7 | with the laptop's mirror running, push a row from laptop to studio, then pull it back | the row appears exactly once, authored by the laptop's seat | twice = the echo/pulled discrimination broke |
+| 8 | post one unicast (`--to <seat>`) and one `comment` | both appear in the `convo` channel; the plain findings from step 1 do NOT | a finding in `convo` = lane filter; nothing at all = `DISCORD_COMMS_CONVO_WEBHOOK_URL` |
+| 9 | inspect `<runid>.cursor.json` | keys read `<seat>@<file>#<inode>`; one key per (seat, file) | a bare `<seat>` key left over = migration did not run this pass |
+| 10 | `<runid>.skipped.jsonl` | absent, or every entry explained | any entry nobody can explain is the finding of the rehearsal |
+
+**After:** put the counts from step 3 next to what the channel shows. Equal is
+the result; "looked fine" is not. Anything unexplained goes to a GitHub issue
+before the forum-thread work (slice 2) lands on top of it.
+
 ## Env knobs
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the author line, `<seat> (<machine>)` |
 | `COMMS_ROOT` | `/tmp` | mailbox root (same knob as the mailbox itself) |
-| `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-row records |
+| `COMMS_STATE_DIR` | `~/.comms/state` | cursor, poller lock, skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
 | `COMMS_MIRROR_INTERVAL` | `5` | `--follow`/`--follow-all` poll seconds |
 
@@ -268,12 +377,13 @@ the loop.
 - **Kind-agnostic.** Whatever `kind` a row carries is mirrored verbatim; the
   vocabulary is enforced at write time by `lib/swarm_mailbox.VALID_KINDS`,
   which is being extended on a parallel branch. The mirror never hardcodes it.
-- **No reposts, upgrade-safe.** A per-run cursor (per-seat row counts, valid
-  because seat files are append-only single-writer) lives in
-  `COMMS_STATE_DIR`; restarts resume where they left off. The cursor FORMAT
-  is unchanged by the emoji/authorship rendering upgrade -- a cursor file
-  written before this feature landed is honored exactly as before, so
-  deploying it never re-posts history.
+- **No reposts, upgrade-safe.** A per-run cursor (per-seat-per-source-file row
+  counts, valid because seat files are append-only single-writer) lives in
+  `COMMS_STATE_DIR`; restarts resume where they left off. A cursor file
+  written in ANY earlier format is honored and migrated in place on the next
+  poll, so deploying never re-posts history -- see Cursor format above.
+- **One poller per (run, lane), enforced.** An `fcntl.flock` per pass, not a
+  rule in a README; the second poller no-ops loudly. See Concurrency above.
 - **Batched per author.** Rows that arrive together from the SAME seat go out
   as one message, chunked under Discord's 2000-char content cap; a seat
   change always starts a new message (Discord's `username` is one value per
