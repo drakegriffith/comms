@@ -7,6 +7,12 @@
 # (read by swarm_mailbox.py) both point at mktemp dirs, so nothing here touches
 # real arm state, real mailboxes, or the real heartbeat's cursors.
 #
+# The one subcommand NOT checked here is `cursor` (the confirmed-delivery pair
+# for shell drivers): it is routed through this same dispatcher and exercised
+# end to end, receipts and all, in tests/test_poll_driver.sh, which is where its
+# semantics live. Adding a duplicate stub here would pin the route twice and the
+# meaning nowhere.
+#
 # Exit: 0 all passed, 1 any failed. Prints a passed/failed count either way.
 
 set -uo pipefail

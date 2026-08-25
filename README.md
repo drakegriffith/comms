@@ -196,6 +196,51 @@ Quickstart below:
 - **Consume a read whole.** Piping it through `head` truncates the output, not
   the cursor; `--replay` is the recovery.
 
+### If the runtime cannot poll for itself: three blocks, not eight
+
+The four blocks above assume the agent can run `comms read` inside its own
+turn. A runtime that cannot -- kimi, a bare prompt binary, a curl loop against
+a local endpoint -- needs something OUTSIDE it to notice new rows and hand them
+over, and that is `bin/comms-poll-driver`. It reads, formats, invokes your
+command, and remembers what got through:
+
+**Block 1 of 3** -- clone and prove the CLI runs (identical to block 1 above).
+
+**Block 2 of 3** -- arm the run once, before any seat starts:
+
+```
+bin/comms arm myrun --topic proj
+```
+
+**Block 3 of 3** -- start the driver. It enrolls the seat, subscribes it, and
+polls until you kill it:
+
+```
+bin/comms-poll-driver myrun alpha --enroll --topics proj \
+    -- your-runtime --prompt '{}'
+```
+
+The rows replace the literal `{}` in the command's arguments, or arrive on its
+stdin if you write no `{}`. **The count**, since a step count is only a claim
+if you can re-derive it: 3 copy-paste blocks, clone to running driver, against
+4 for a self-polling seat and against the 8 hand-templated steps the kimi
+recipe used to need (clone, arm, subscribe, write the brief, start the session,
+copy out its id, template runid/seat/cwd into a driver command, start the
+driver). Blocks 2 and 3 are the only ones per seat; block 1 is per machine.
+Nothing here is hand-templated except the run id, the seat name, and the
+command -- which are the arguments.
+
+The driver's hard rule, and the reason it exists rather than a three-line shell
+loop: **its cursor advances only when the delivery command exits 0.** A runtime
+that was down for one poll gets those rows again on the next one. It reads with
+`--replay` so the CLI's print-time cursor never competes with it -- two cursors
+over one stream is one too many, and the loser is a row nobody sees. Its
+receipt is a JSONL log under `$COMMS_STATE_DIR/poll-driver/`, which is how you
+answer "did seat alpha actually get row N" after the fact.
+
+Add `--once --dry-run` to see exactly what would be delivered without invoking
+anything or moving the cursor.
+
 ### Can it do better than poll?
 
 Push delivery -- rows appearing in the agent's turn without it asking -- is an
@@ -326,6 +371,7 @@ landed, read the log, not the seats.
 
 ```
 bin/comms                    dispatcher CLI (routes to lib/, preserves exit codes)
+bin/comms-poll-driver        generic poll driver: delivers rows to any command, cursor advances only on exit 0
 lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
 lib/swarm_claims.py          run-scoped write-set claims arbiter
@@ -339,7 +385,7 @@ adapters/grok/               poll-loop recipe for the grok CLI; records why its 
 adapters/discord/            mirrors mailbox rows to a Discord channel
 adapters/github/             polls gh api for merged/closed PRs and issues, posts landings to Discord
 adapters/remote/             carries rows between two machines over ssh, hub-and-spoke
-tests/                       pytest suites + heartbeat suite + CLI smoke test
+tests/                       pytest suites + heartbeat suite + CLI smoke test + poll driver suite
 ```
 
 ## Tests
@@ -349,6 +395,7 @@ python3 -m pytest tests -q
 bash tests/test_swarm_heartbeat.sh
 bash tests/test_comms_cli.sh
 bash tests/test_push_probe.sh
+bash tests/test_poll_driver.sh
 ```
 
 All suites isolate their writes to temp dirs; nothing touches real state.

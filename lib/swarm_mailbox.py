@@ -702,6 +702,18 @@ class DeliveryCursor:
     needs confirmed delivery reads with --replay and keeps one of these
     instead. Two cursors over one stream is one too many.
 
+    BASH CONSUMERS GET THE SAME PAIR OVER TWO PROCESSES (issue #29). A shell
+    driver cannot hold `confirm` across its delivery -- the process that read
+    the rows has exited by the time the delivery command runs -- so the CLI
+    splits the pair: `comms cursor take <path>` reads rows as JSONL on stdin
+    and prints a RECEIPT line (the position it would write) followed by the
+    fresh rows, writing nothing; `comms cursor confirm <path> <receipt>` writes
+    that position. The order and the failure behavior are identical to the
+    in-process pair, which is the point: `bin/comms-poll-driver` and
+    `adapters/kimi/poll-driver.sh` get confirmed delivery without a fourth
+    private copy of the arithmetic. The receipt is the only extra surface, and
+    confirm_receipt() max-merges it so a stale one cannot rewind.
+
     behavior: load() returns the persisted {seat: count} map. take(rows)
       splits rows into the ones past those counts (via fresh_rows_by_seat, so
       the arithmetic and its "the cursor advances over filtered rows too" rule
@@ -759,13 +771,52 @@ class DeliveryCursor:
 
     def take(self, rows, keep=None):
         """The rows past this cursor, plus the callable that records having
-        delivered them. Writes nothing; see the class docstring."""
+        delivered them. Writes nothing; see the class docstring.
+
+        `confirm.cursor` is the POSITION confirm would write -- the receipt.
+        An in-process caller never needs it and should just call confirm(). It
+        exists for the out-of-process pair below (`cursor take` / `cursor
+        confirm`), where the delivery happens in a different process than the
+        read and the position has to survive as text between the two. Exposing
+        it beats letting that CLI re-run fresh_rows_by_seat itself, which would
+        be a second copy of the arithmetic this class exists to hold.
+        """
         fresh, new_cursor = fresh_rows_by_seat(rows, self.load(), keep=keep)
 
         def confirm():
             self._commit(new_cursor)
 
+        confirm.cursor = new_cursor
         return fresh, confirm
+
+    def confirm_receipt(self, receipt):
+        """Commit a position handed back by an EARLIER process's
+        `take().cursor`, merged so no seat's count ever moves backwards.
+
+        WHY THIS EXISTS: a shell consumer cannot hold a Python closure across
+        its delivery -- one `comms cursor take` invocation has already exited
+        by the time the delivery command runs. So the pair is split: take
+        prints the receipt, the caller delivers, and confirm writes the receipt
+        only if the delivery exited 0. The in-process `confirm()` is still the
+        preferred form; this is the same commit with the closure replaced by a
+        line of text.
+        in: receipt, a {seat: count} dict from a take() on THIS path.
+        behavior: max-merges with what is currently persisted. A stale receipt
+          (a slow deliverer confirming after a faster one) therefore cannot
+          rewind the cursor and re-deliver rows already confirmed, matching
+          fresh_rows_by_seat's own never-backwards rule. It CANNOT defend
+          against a forged receipt claiming rows that were never delivered --
+          that is the one-consumer-per-path precondition's job.
+        errors: ValueError if the receipt is not a {seat: int-able} map;
+          OSError if the state dir cannot be written.
+        """
+        if not isinstance(receipt, dict):
+            raise ValueError("receipt must be a JSON object of {seat: count}")
+        merged = dict(self.load())
+        for seat, count in receipt.items():
+            merged[seat] = max(int(count), int(merged.get(seat, 0)))
+        self._commit(merged)
+        return merged
 
     def _commit(self, cursor):
         """Persist atomically: tmp + os.replace, tmp name PID-suffixed so two
@@ -971,6 +1022,68 @@ def _cmd_read(runid, seat, topic=None, subs=False, replay=False):
     return 0
 
 
+def _read_jsonl(stream):
+    """Row dicts from a JSONL stream, blank lines skipped.
+
+    A malformed line is a hard ValueError, not a skip: this is the input of a
+    delivery cursor, and a line quietly dropped here is a row quietly dropped
+    from the stream -- the exact failure the cursor exists to prevent. The read
+    that feeds it emits one json.dumps per row, so a bad line means something
+    else wrote into the pipe and the caller needs to know.
+    """
+    rows = []
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            raise ValueError("cursor take: stdin is not JSONL: %.80s" % line)
+    return rows
+
+
+def _cmd_cursor(rest):
+    """The out-of-process half of DeliveryCursor, for shell drivers.
+
+      cursor take    <path>              rows as JSONL on stdin
+                                         -> receipt line, then the fresh rows
+      cursor confirm <path> <receipt>    -> commits that receipt
+
+    take() WRITES NOTHING -- no file appears -- so a driver whose delivery
+    command failed simply never runs confirm and the rows come back next pass.
+    The receipt is always printed, even when no rows are fresh, so the caller's
+    parse is one shape: line 1 is the receipt, lines 2..N are rows.
+
+    Read the rows with `comms read ... --replay`. The CLI's own read cursor
+    commits at PRINT time, which for a driver is before delivery is known to
+    have worked; two cursors over one stream is one too many and the loser is
+    a row nobody sees.
+    """
+    if not rest:
+        raise ValueError("cursor needs take|confirm")
+    verb = rest[0]
+    if verb == "take":
+        if len(rest) != 2:
+            raise ValueError("cursor take needs <path> (rows as JSONL on stdin)")
+        cursor = DeliveryCursor(rest[1])
+        fresh, confirm = cursor.take(_read_jsonl(sys.stdin))
+        print(json.dumps(confirm.cursor, sort_keys=True))
+        for row in fresh:
+            print(json.dumps(row))
+        return 0
+    if verb == "confirm":
+        if len(rest) != 3:
+            raise ValueError("cursor confirm needs <path> <receipt>")
+        try:
+            receipt = json.loads(rest[2])
+        except ValueError:
+            raise ValueError("cursor confirm: receipt is not JSON: %.80s" % rest[2])
+        DeliveryCursor(rest[1]).confirm_receipt(receipt)
+        return 0
+    raise ValueError("cursor: unknown verb %r (want take|confirm)" % verb)
+
+
 def main(argv):
     if len(argv) < 2:
         sys.stderr.write(
@@ -978,10 +1091,16 @@ def main(argv):
             "       swarm_mailbox.py subscribe <runid> <seat> <topic> [<topic> ...]\n"
             "       swarm_mailbox.py post <runid> <seat> <kind> <text> [--topic <name> | --to <seat>]\n"
             "       swarm_mailbox.py read <runid> <seat> [--topic <name> | --subs] [--replay]\n"
+            "       swarm_mailbox.py cursor take <path>   (rows as JSONL on stdin)\n"
+            "       swarm_mailbox.py cursor confirm <path> <receipt>\n"
         )
         return 2
     cmd = argv[1]
     try:
+        if cmd == "cursor":
+            # Dispatched BEFORE flag extraction: a receipt is opaque caller
+            # text and must not be parsed for --topic/--subs on its way past.
+            return _cmd_cursor(argv[2:])
         rest, flags = _extract_flags(argv[2:])
         topic, to, subs = flags["topic"], flags["to"], flags["subs"]
         replay = flags["replay"]

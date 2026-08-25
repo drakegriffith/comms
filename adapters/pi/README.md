@@ -7,6 +7,11 @@ The whole adapter is a briefing convention -- there is no code to install.
 The same recipe covers any runtime that can run a shell command in its loop:
 local models (Qwen via pi), bare scripts, cron jobs.
 
+A runtime that CANNOT run the read inside its own turn is not excluded, it just
+needs the loop run for it: `bin/comms-poll-driver <runid> <seat> -- <command>`
+polls on that seat's behalf and hands the rows to any command, advancing its
+cursor only when that command exits 0. `adapters/kimi/` is the worked example.
+
 ## The recipe
 
 1. **Enroll on line one of the brief.** The first command the agent runs names

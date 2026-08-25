@@ -623,6 +623,121 @@ class TestReadCursorCLI(unittest.TestCase):
         self.assertIn("not both", r.stderr)
 
 
+class TestDeliveryCursorCLI(unittest.TestCase):
+    """`cursor take` / `cursor confirm` -- the same confirmed-delivery pair,
+    split across two processes so a SHELL driver can hold it (issue #29).
+
+    The thing that has to survive the split is the ORDER, and the property that
+    makes the order safe: take writes nothing, so a driver whose delivery
+    command failed simply never runs confirm. These pin that across process
+    boundaries, where the closure cannot help and a receipt line has to.
+    """
+
+    def setUp(self):
+        self.script = os.path.join(_LIB, "swarm_mailbox.py")
+        self.path = os.path.join(os.environ["COMMS_STATE_DIR"], "cli-cursor.json")
+
+    def _run(self, args, stdin=""):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, self.script] + args,
+            input=stdin, capture_output=True, text=True, env=dict(os.environ),
+        )
+
+    def _rows(self, seat, *texts):
+        return [{"seat": seat, "at": "2026-08-25T00:00:0%d" % i, "text": t}
+                for i, t in enumerate(texts)]
+
+    def _jsonl(self, rows):
+        return "".join(json.dumps(r) + "\n" for r in rows)
+
+    def _take(self, rows):
+        r = self._run(["cursor", "take", self.path], self._jsonl(rows))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.splitlines()
+        return lines[0], [json.loads(l)["text"] for l in lines[1:] if l.strip()]
+
+    def test_take_prints_the_receipt_first_then_the_fresh_rows(self):
+        receipt, texts = self._take(self._rows("alpha", "one", "two"))
+        self.assertEqual(json.loads(receipt), {"alpha": 2})
+        self.assertEqual(texts, ["one", "two"])
+
+    def test_take_writes_nothing_at_all(self):
+        self._take(self._rows("alpha", "one"))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_receipt_is_printed_even_when_nothing_is_fresh(self):
+        """One shape for the caller's parse: line 1 is always the receipt."""
+        receipt, texts = self._take([])
+        self.assertEqual(json.loads(receipt), {})
+        self.assertEqual(texts, [])
+
+    def test_without_confirm_the_same_rows_come_back(self):
+        rows = self._rows("alpha", "one")
+        self._take(rows)          # a delivery that failed: no confirm follows
+        _receipt, texts = self._take(rows)
+        self.assertEqual(texts, ["one"])
+
+    def test_confirm_commits_the_receipt_and_the_rows_stop_coming_back(self):
+        rows = self._rows("alpha", "one")
+        receipt, _ = self._take(rows)
+        r = self._run(["cursor", "confirm", self.path, receipt])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _receipt, texts = self._take(rows)
+        self.assertEqual(texts, [])
+
+    def test_the_receipt_is_exactly_what_the_in_process_pair_would_write(self):
+        """The two forms are one mechanism, not two: if this drifts, a bash
+        driver and a python driver on one board disagree about what is
+        delivered."""
+        rows = self._rows("alpha", "one", "two")
+        receipt, _ = self._take(rows)
+        _fresh, confirm = mb.DeliveryCursor(self.path).take(rows)
+        self.assertEqual(json.loads(receipt), confirm.cursor)
+
+    def test_a_stale_receipt_cannot_rewind_the_cursor(self):
+        self._run(["cursor", "confirm", self.path, '{"alpha": 3}'])
+        self._run(["cursor", "confirm", self.path, '{"alpha": 1}'])
+        self.assertEqual(mb.DeliveryCursor(self.path).load(), {"alpha": 3})
+
+    def test_a_receipt_naming_another_seat_does_not_disturb_this_one(self):
+        self._run(["cursor", "confirm", self.path, '{"alpha": 2}'])
+        self._run(["cursor", "confirm", self.path, '{"beta": 1}'])
+        self.assertEqual(mb.DeliveryCursor(self.path).load(), {"alpha": 2, "beta": 1})
+
+    def test_malformed_input_fails_loudly_instead_of_skipping_a_row(self):
+        """A silently skipped line is a silently dropped row -- the exact
+        failure a delivery cursor exists to prevent."""
+        r = self._run(["cursor", "take", self.path], "not json\n")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("JSONL", r.stderr)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_malformed_receipt_is_refused(self):
+        r = self._run(["cursor", "confirm", self.path, "not json"])
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_a_receipt_that_is_not_a_map_is_refused(self):
+        r = self._run(["cursor", "confirm", self.path, "[1, 2]"])
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_unknown_verb_and_missing_arguments_are_refused(self):
+        self.assertEqual(self._run(["cursor"]).returncode, 1)
+        self.assertEqual(self._run(["cursor", "sideways", self.path]).returncode, 1)
+        self.assertEqual(self._run(["cursor", "take"]).returncode, 1)
+        self.assertEqual(self._run(["cursor", "confirm", self.path]).returncode, 1)
+
+    def test_a_receipt_is_not_parsed_for_flags_on_its_way_past(self):
+        """Receipts are opaque caller text; flag extraction must not touch
+        them, or a cursor path or receipt containing --topic would be eaten."""
+        r = self._run(["cursor", "confirm", self.path, '{"--topic": 1}'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(mb.DeliveryCursor(self.path).load(), {"--topic": 1})
+
+
 class TestConvoKinds(unittest.TestCase):
     """CONVO_KINDS is the kind-half of the discord mirror's convo-lane
     predicate (S5): it must never name a kind VALID_KINDS does not allow,
