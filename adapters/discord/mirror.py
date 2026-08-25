@@ -108,7 +108,32 @@ filter is still counted against the cursor (the cursor is a per-seat row
 count over ALL rows, filter or no) -- otherwise a run with a mix of chatter
 and plain findings would re-scan its non-convo rows on every pass forever.
 Lanes are otherwise identical: same batching, same retry, same skip-and-log
-failure path, just parameterized by lane name.
+failure path, just parameterized by lane name -- with ONE exception, the
+board lane, below.
+
+BOARD LANE (issue #40): mirrors rows that name the DOCUMENT they are about
+(a `thread` field, written by swarm_mailbox.post out of thread_key) into a
+Discord FORUM channel, one thread per document, through
+DISCORD_COMMS_FORUM_WEBHOOK_URL and the discord-mirror-board/ state dir. Two
+things make it unlike every other lane:
+
+  WHEN IT POSTS. A row is not posted on arrival. It is HELD until its
+  document's conversation is alive -- lib/swarm_threads.alive: at least
+  COMMS_THREAD_ALIVE_SEATS distinct non-status seats, and some consecutive
+  pair from two different seats no more than COMMS_THREAD_ALIVE_SECONDS
+  apart. Without that gate, every document a single agent so much as
+  mentioned opens a thread, and a board of one-line threads is a board
+  nobody reads. A row with NO thread is count-but-skipped, exactly as the
+  convo lane skips a non-conversation row: a forum webhook has no
+  un-threaded destination, and the `all` lane already mirrors those rows.
+
+  WHAT IT REMEMBERS. A second state file, <runid>.held.json, shape
+  {thread_key: [rows]} in `at` order -- "what have I not yet posted", which
+  the cursor structurally cannot answer ("what have I read"). It is written
+  BEFORE the cursor advances on every pass, and that order is what makes
+  advancing the cursor safe. See _board_pass for the whole per-pass order and
+  why each step sits where it does, and adapters/discord/threads.py for the
+  fleet-wide map that turns a thread key into a Discord thread id.
 
 LAUNCHD SAFETY: --follow and --follow-all run under a launchd KeepAlive job,
 which restarts a job that exits nonzero -- so a job that exits on every poll
@@ -286,9 +311,9 @@ def _held_path(runid, lane=DEFAULT_LANE):
 # WHY PER PASS AND NOT PER PROCESS: --follow-all walks every run in one pass,
 # so a process-lifetime lock would have to be taken per run anyway, and a
 # human's ad-hoc `--once` would be locked out of a machine running a follower
-# for as long as it runs. (Slice 2's fleet-wide thread map needs its OWN
-# lock: its key spans runs, which this lock deliberately does not -- see
-# issue #40, D3.)
+# for as long as it runs. (The board lane's fleet-wide thread map has its OWN
+# lock, in adapters/discord/threads.py, for exactly that reason: a thread key
+# spans runs, which this lock deliberately does not -- see issue #40, D3.)
 def _lock_path(runid, lane=DEFAULT_LANE):
     return os.path.join(_mirror_dir(lane), _safe(runid) + ".lock")
 
@@ -430,18 +455,19 @@ def resolve_webhook_url(lane=DEFAULT_LANE):
 
 def find_forum_webhook_url():
     """Resolve the forum board's webhook URL, same env-or-secrets-file path
-    as the lane vars, with no side effects. NOT a lane: there is no
-    LANE_SECRET_VARS/LANE_STATE_DIRS entry for "forum" and no --lane forum,
-    because posting to it needs thread_name / ?thread_id=, which slice 2
-    owns. This function only resolves the URL; nothing in this module posts
-    to it yet."""
+    as every lane var, with no side effects.
+
+    This var IS the board lane's secret now (LANE_SECRET_VARS["board"]), so
+    `_find_webhook_url("board")` resolves the same value. The named helper
+    stays because it says WHICH webhook without the caller knowing the lane
+    vocabulary, and because callers outside this module already reach for
+    it. There is still no lane named "forum": the lane is "board"."""
     return _find_webhook_url_for_var(FORUM_SECRET_VAR)
 
 
 def resolve_forum_webhook_url():
     """Same as find_forum_webhook_url but exits 2 with the drop-in message
-    when absent, mirroring resolve_webhook_url's contract. Still not a
-    lane -- no CLI path calls this in this slice."""
+    when absent, mirroring resolve_webhook_url's contract."""
     return _resolve_webhook_url_for_var(FORUM_SECRET_VAR)
 
 

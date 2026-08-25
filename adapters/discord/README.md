@@ -109,10 +109,11 @@ A row the convo lane skips still advances that lane's cursor -- it is never
 re-scanned on the next pass, it is just never posted. The two lanes never
 share a cursor, a skipped-rows log, or a secret:
 
-| Lane | Secret var | State dir |
-| --- | --- | --- |
-| `all` (default) | `DISCORD_COMMS_WEBHOOK_URL` | `discord-mirror/` |
-| `convo` | `DISCORD_COMMS_CONVO_WEBHOOK_URL` | `discord-mirror-convo/` |
+| Lane | Secret var | State dir | What it posts |
+| --- | --- | --- | --- |
+| `all` (default) | `DISCORD_COMMS_WEBHOOK_URL` | `discord-mirror/` | every row, one channel, on arrival |
+| `convo` | `DISCORD_COMMS_CONVO_WEBHOOK_URL` | `discord-mirror-convo/` | unicasts + `comment`/`reply`, on arrival |
+| `board` | `DISCORD_COMMS_FORUM_WEBHOOK_URL` | `discord-mirror-board/` | rows carrying a `thread`, into one forum thread per document, **once that document's conversation is alive** (see below) |
 
 Set up the convo lane's secret the same way as the default lane's (Setup
 step 2 above), just with the `_CONVO_` var name and, in Discord, a second
@@ -172,6 +173,20 @@ Scope, deliberately narrow:
   its own mailbox), and the cross-machine duplicate that DOES exist is
   handled by the pulled-row rule below, not by a lock.
 
+The board lane takes a **second, independent lock**, and it has to: a thread
+key spans runs (two runs discuss one document), which the per-(run, lane)
+lock deliberately does not. `adapters/discord/threads.py` flocks
+`<lane state dir>/threads.lock` and holds it across read map -> create thread
+-> persist map, so a check-then-act cannot interleave and orphan a thread.
+Unlike the pass lock it BLOCKS rather than skipping: the loser has rows of
+its own to deliver into a thread the winner is creating, and the wait is one
+HTTP round trip. It is a sidecar file and not the map itself because the map
+is written tmp + `os.replace`, so an fd locked on the map names an inode that
+stops being the map the instant it is saved. Two MACHINES racing is still
+unfixed -- a local lock cannot serialize them; the cost is at most one
+duplicate thread per document per machine, and the revisit condition is a
+second machine running the board lane.
+
 A missing webhook secret still exits 2 under `--once` even when another poller
 holds the lock: that exit is the contract with the human running it, and a
 lock someone else happens to hold must not turn it into a quiet 0.
@@ -230,38 +245,126 @@ shape:
   surplus is not banked, so rows appended later post rather than being
   swallowed by a count that dead rows earned.
 
-## Forum board webhook (resolution only, not a lane yet)
+## The board lane: one forum thread per document
 
-`DISCORD_COMMS_FORUM_WEBHOOK_URL` resolves through the exact same
-env-or-secrets-file path as the two webhook vars above
-(`mirror.find_forum_webhook_url()` / `mirror.resolve_forum_webhook_url()`),
-but it is deliberately **not** a third lane: it is absent from
-`LANE_SECRET_VARS` and `LANE_STATE_DIRS`, so it has no cursor, no state dir,
-and `--lane forum` is rejected by the CLI the same way any unknown lane name
-is. Nothing in this codebase posts to it yet.
+`--lane board` mirrors rows that say what document they are ABOUT into a
+Discord **forum** channel, one thread per document. It is the only lane whose
+delivery is deferred, and the only one with a second state file.
 
-Why not fold it in as a lane: the two existing lanes post to a normal text
-channel with a bare `{"content": ..., "username": ...}` payload. A forum
-channel requires `thread_name` on the first post (or `?thread_id=` on a
-reply into an existing thread) -- a different POST shape, not just a
-different webhook URL. Building that posting lane is slice 2's job. Adding
-`forum` to `LANE_SECRET_VARS` now would stand up a `--lane forum` that
-resolves a URL and then posts the wrong payload shape to it.
+    python3 adapters/discord/mirror.py --once <runid> --lane board
+    python3 adapters/discord/mirror.py --follow-all --lane board
 
-Setup (same three steps as the other vars, once the forum channel and its
-webhook exist -- creating both is a human, Discord-UI step, not scripted
-here): add `DISCORD_COMMS_FORUM_WEBHOOK_URL=<url>` to
-`~/.secrets/comms.env` (or export it), `chmod 600` the file.
-`adapters/discord/install.sh` reports whether it is configured (existence
-only, never the value) but does not block install on it -- see
-install.sh's own header comment.
+### What makes a row eligible
 
-**Live check is a manual step, not code**: this slice's tests only prove
-resolution (env var, then secrets file, then the exact drop-in message on
-`resolve_forum_webhook_url()` when absent) with a fake local HTTP server,
-the same as the other webhook vars. Whether posting `thread_name` to this
-URL actually creates a Discord forum post is verified by hand once the
-webhook exists and slice 2 lands the posting code.
+A row carries a `thread` field, written by `swarm_mailbox.post(...,
+thread=)`. The key comes from `swarm_mailbox.thread_key(path)`:
+`doc:<repo>/<relpath>`, where `<repo>` is the basename of the nearest
+ancestor holding a `.git` entry (a directory in a clone, a FILE in a linked
+worktree) and the path is realpath'd first, so a symlink and a `..` and
+`/tmp` vs `/private/tmp` all key on ONE thread. A path outside every repo
+returns `None`, and a row with no `thread` is count-but-skipped by this lane
+(a forum webhook rejects a post with neither `thread_name` nor `?thread_id=`,
+and the `all` lane already mirrors those rows anyway).
+
+### The alive rule: two seats, close together
+
+A document does NOT get a thread the moment somebody mentions it. It gets one
+when its rows are a conversation, which `lib/swarm_threads.alive` defines as
+both of:
+
+- at least `COMMS_THREAD_ALIVE_SEATS` (default **2**) distinct seats have
+  posted a non-`status` row in it, **and**
+- some **consecutive** pair of those rows comes from two DIFFERENT seats no
+  more than `COMMS_THREAD_ALIVE_SECONDS` (default **1800**, i.e. 30 minutes)
+  apart, with a strictly positive gap.
+
+Both halves earn their place. Distinct seats alone renders a thread where one
+seat posted and another posted a week later: two speakers, no conversation.
+A timely pair alone renders one seat posting twice in a minute: a monologue
+with good rhythm. `status` rows -- the ambient "session started" birth
+announcement -- are excluded from both halves, or every document one agent
+so much as opened would look like a two-party exchange.
+
+Until a document goes alive its rows WAIT. When it goes alive, **the whole
+backlog posts**, oldest first, across as many messages as the seat changes
+force (Discord's webhook `username` is per-POST, so a seat change always
+starts a new message). `lib/swarm_threads` is a pure module with no I/O
+precisely so `bin/comms threads` can ask the identical question without a
+second copy of this rule.
+
+### State files (all in `<COMMS_STATE_DIR>/discord-mirror-board/`)
+
+| File | Scope | Shape | Answers |
+| --- | --- | --- | --- |
+| `<runid>.cursor.json` | per run | `{"<seat>/<file>#<inode>": count}` | what have I READ |
+| `<runid>.held.json` | per run | `{"doc:<repo>/<path>": [row, ...]}`, rows in `at` order | what do I still OWE |
+| `threads.json` | **fleet-wide, per lane** | `{"doc:<repo>/<path>": "<discord thread id>"}` | which Discord thread is this document |
+| `threads.lock` | fleet-wide, per lane | empty | the map's flock (see Concurrency) |
+| `<runid>.lock`, `<runid>.skipped.jsonl` | per run | as the other lanes | -- |
+
+Two files because there are two questions, and the cursor structurally cannot
+answer the second: its keep-predicate is a bool over one row, so "post this
+later" is unrepresentable there. The thread map is fleet-wide and NOT
+per-run on purpose -- one document is discussed by seats in different runs,
+and a per-run map opens a second thread for the same file.
+
+### The per-pass order, which is the whole safety argument
+
+1. load the held file
+2. `collect_new` (fresh rows + the new cursor)
+3. bucket held + fresh by thread key, sorted by `at`
+4. **write held**, including the buckets about to post
+5. **save the cursor**
+6. for each ALIVE key: get-or-create its thread, post the whole backlog
+7. rewrite held minus what each chunk delivered, **after each chunk**
+
+Step 4 before step 5 is the load-bearing pair. The cursor advancing means "I
+have read these"; the held file existing means "I still owe these". Making
+held durable first is what makes advancing the cursor safe -- a crash between
+4 and 6 re-posts nothing and loses nothing, a crash between 6 and 7 duplicates
+a message, which is the same at-least-once trade every cursor in this repo
+makes. The reverse order would define a row that is read, not posted, and
+remembered nowhere.
+
+Step 7 per chunk, not once at the end: a drain of a long backlog is many
+POSTs over many seconds, and rewriting after each one means a failure in the
+middle costs only the chunks not yet delivered. The once-at-the-end version
+re-posts the ENTIRE backlog on the next pass every time one POST fails.
+
+### When something breaks
+
+| Point | What happens |
+| --- | --- |
+| `DISCORD_COMMS_FORUM_WEBHOOK_URL` missing | `--once --lane board` exits 2 with the drop-in; `--follow` warns once and retries in 60s. The other lanes are unaffected. |
+| create-thread POST fails (4xx/5xx, or a body with no id) | `thread_for` returns `None`, nothing posts, the rows stay held, next pass tries again |
+| create succeeded but the map could not be saved | `None`, one stderr line, rows stay held; one empty thread is leaked and auto-archives -- better than posting into a thread nothing remembers |
+| map file corrupt | read as `{}`, one stderr line, the thread is recreated (at most one duplicate) |
+| post-into-thread fails after retries | that chunk goes to `<runid>.skipped.jsonl` and is dropped from held (one bad batch must not wedge every row behind it); that thread's remainder waits for the next pass |
+| held file corrupt or unreadable | read as `{}`, one LOUD stderr line. The un-posted backlog in it is genuinely lost -- the cursor is already past it. |
+| a document never goes alive | its rows sit in held until `COMMS_THREAD_HOLD_MAX`, then the oldest are dropped and recorded in the skipped log |
+| two agents enrolled on one seat name | one stderr line per pass naming the seat and both agent ids; nothing is blocked (see `swarm_arm.seat_collisions`, issue #42) |
+
+Every board POST carries `allowed_mentions: {"parse": []}`. That is a
+constant, not a knob: a mailbox row is prose an agent wrote, and prose
+containing `@everyone` must never ring a phone.
+
+### Setup (a human step in the Discord UI first)
+
+1. In Discord, create a **forum** channel -- not a text channel. One thread
+   per document is a shape only a forum holds.
+2. That channel's Settings -> Integrations -> Webhooks -> New Webhook -> Copy
+   Webhook URL.
+3. `open -e ~/.secrets/comms.env`, add
+   `DISCORD_COMMS_FORUM_WEBHOOK_URL=<that URL>`, then `chmod 600` the file.
+4. `bash adapters/discord/install.sh` reports whether it is configured
+   (existence only, never the value) and does not block on it -- the board
+   lane is opt-in.
+
+**Live check is a manual step, not code.** These tests prove the payload
+shape (`thread_name` + `wait=true` on create, `?thread_id=` on the posts) and
+every failure branch against a fake poster, never a live Discord. That the
+resulting thread looks right in the forum is verified by hand once the
+webhook exists.
 
 ## Live rehearsal checklist
 
@@ -277,7 +380,8 @@ because a step nobody could fail is not a check.
    `DISCORD_COMMS_FORUM_WEBHOOK_URL=<url>`, `chmod 600 ~/.secrets/comms.env`.
    Never paste the URL into a terminal that is being transcribed.
 2. `bash adapters/discord/install.sh` reports all three webhook vars as
-   configured. It reports EXISTENCE, never values, and writes nothing.
+   configured -- the forum one is the `board` lane's secret. It reports
+   EXISTENCE, never values, and writes nothing.
 3. Note the current row counts you expect to see, per machine. A rehearsal
    with no expected number is a demo.
 
@@ -295,10 +399,14 @@ because a step nobody could fail is not a check.
 | 8 | post one unicast (`--to <seat>`) and one `comment` | both appear in the `convo` channel; the plain findings from step 1 do NOT | a finding in `convo` = lane filter; nothing at all = `DISCORD_COMMS_CONVO_WEBHOOK_URL` |
 | 9 | inspect `<runid>.cursor.json` | keys read `<seat>/<file>#<inode>`; one key per (seat, file) | a bare `<seat>` key left over = migration did not run this pass |
 | 10 | `<runid>.skipped.jsonl` | absent, or every entry explained | any entry nobody can explain is the finding of the rehearsal |
+| 11 | with `--lane board` running, post ONE row with `--thread doc:comms/x.md` | nothing appears in the forum; the row is in `<runid>.held.json` under that key | a thread appears = the alive rule is not gating |
+| 12 | from a SECOND seat, post another row with the same `--thread`, within 30 min | a forum thread named `comms/x.md` appears holding BOTH rows, oldest first | only the second row = the drain posted the trigger and abandoned the backlog, the exact bug #40 names |
+| 13 | post a third row on the same key | it lands in the SAME thread | a second thread = `threads.json` was not read or not persisted |
+| 14 | inspect `threads.json` | one entry per document, fleet-wide (no runid in the filename) | a per-run map = a duplicate thread the first time two runs discuss one file |
 
 **After:** put the counts from step 3 next to what the channel shows. Equal is
 the result; "looked fine" is not. Anything unexplained goes to a GitHub issue
-before the forum-thread work (slice 2) lands on top of it.
+before anything else lands on top of it.
 
 ## Env knobs
 
@@ -309,6 +417,13 @@ before the forum-thread work (slice 2) lands on top of it.
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor, poller lock, skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
 | `COMMS_MIRROR_INTERVAL` | `5` | `--follow`/`--follow-all` poll seconds |
+| `COMMS_THREAD_ALIVE_SECONDS` | `1800` | board lane: how close two seats' rows must be for a document's conversation to count as alive |
+| `COMMS_THREAD_ALIVE_SEATS` | `2` | board lane: how many distinct non-`status` seats a document needs before it renders |
+| `COMMS_THREAD_HOLD_MAX` | `500` | board lane: rows one document may hold un-posted; past it the oldest are dropped and recorded in the skipped log |
+
+A junk value in any of the three board knobs (a plist typo) warns on stderr
+and uses the default. The lane's job is delivering rows; refusing to run
+because a tuning parameter was misspelled loses more than it protects.
 
 ## Seat identity (optional)
 
@@ -399,6 +514,12 @@ the loop.
   see Cursor format above.
 - **One poller per (run, lane), enforced.** An `fcntl.flock` per pass, not a
   rule in a README; the second poller no-ops loudly. See Concurrency above.
+- **Deferred, never dropped (board lane).** A row whose document is not yet a
+  conversation is held in `<runid>.held.json`, which is made durable BEFORE
+  the cursor advances past it -- so a crash mid-pass re-posts at worst and
+  forgets nothing. The held file is rewritten after each delivered chunk, so
+  a failure partway through a long drain costs only the chunks that did not
+  land. See The board lane above.
 - **Batched per author.** Rows that arrive together from the SAME seat go out
   as one message, chunked under Discord's 2000-char content cap; a seat
   change always starts a new message (Discord's `username` is one value per
