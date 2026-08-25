@@ -9,6 +9,7 @@ writing their own "is this conversation live" rule.
 """
 
 import datetime
+import json
 import os
 import sys
 
@@ -18,6 +19,7 @@ sys.path.insert(
     0,
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"),
 )
+import swarm_mailbox as mb  # noqa: E402
 import swarm_threads as st  # noqa: E402
 
 BASE = datetime.datetime(2026, 8, 25, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -33,6 +35,17 @@ def row(seat, offset_s, kind="comment", thread="doc:comms/a.md", text="t"):
         "topic": "default",
         "thread": thread,
     }
+
+
+# ---- closed vocabulary: STATUS_KIND is a real swarm_mailbox kind ----------
+#
+# swarm_mailbox.VALID_KINDS is the CLOSED vocabulary post() enforces; a kind
+# spelled here that is not in it would make the "status rows never count"
+# rule silently vacuous the moment a status row could never legally exist.
+
+
+def test_status_kind_is_a_valid_mailbox_kind():
+    assert st.STATUS_KIND in mb.VALID_KINDS
 
 
 # ---- group_by_thread -------------------------------------------------------
@@ -264,6 +277,192 @@ def test_alive_does_not_mutate_the_rows_it_is_given():
     before = [dict(r) for r in rows]
     st.alive(rows)
     assert rows == before
+
+
+# ---- full_board_rows: the shared "read everything" I/O helper -------------
+#
+# These tests DO touch files -- conftest's autouse fixture points COMMS_ROOT
+# at a per-test tmp dir, so nothing here can reach the real mailbox.
+
+
+def _post(runid, seat, thread, kind="comment", text="t", at=None):
+    row = mb.post(runid, seat, kind, text, thread=thread)
+    if at is not None:
+        # Overwrite the `at` this test wants deterministically, by rewriting
+        # the seat's own file -- post() always stamps "now", and these tests
+        # need control over ordering/gaps the way the pure-predicate tests
+        # above get it from the `row()` helper's `offset_s`.
+        path = mb._seat_path(runid, seat)
+        with open(path) as fh:
+            lines = fh.readlines()
+        import json as _json
+
+        last = _json.loads(lines[-1])
+        last["at"] = at
+        lines[-1] = _json.dumps(last) + "\n"
+        with open(path, "w") as fh:
+            fh.writelines(lines)
+        row = last
+    return row
+
+
+def test_full_board_rows_reads_every_run_by_default():
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r2", "b", "doc:x/a.md")
+    rows = st.full_board_rows(mb)
+    assert len(rows) == 2
+
+
+def test_full_board_rows_restricted_to_one_run():
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r2", "b", "doc:x/a.md")
+    rows = st.full_board_rows(mb, run="test-r1")
+    assert len(rows) == 1
+    assert rows[0]["seat"] == "a"
+
+
+def test_full_board_rows_of_an_empty_mailbox_is_empty():
+    assert st.full_board_rows(mb) == []
+
+
+# ---- last_gap_s -------------------------------------------------------------
+
+
+def test_last_gap_s_of_two_rows_is_the_gap_between_them():
+    rows = [row("a", 0), row("b", 90)]
+    assert st.last_gap_s(rows) == 90
+
+
+def test_last_gap_s_ignores_status_rows_at_the_end():
+    rows = [row("a", 0), row("b", 90), row("c", 200, kind="status")]
+    assert st.last_gap_s(rows) == 90
+
+
+def test_last_gap_s_of_a_single_row_is_none():
+    assert st.last_gap_s([row("a", 0)]) is None
+
+
+def test_last_gap_s_of_no_rows_is_none():
+    assert st.last_gap_s([]) is None
+
+
+# ---- CLI: `swarm_threads.py threads` ---------------------------------------
+
+
+def test_main_no_args_exits_2_with_usage(capsys):
+    assert st.main(["swarm_threads.py"]) == 2
+    assert "usage" in capsys.readouterr().err
+
+
+def test_main_unknown_subcommand_exits_2_with_usage(capsys):
+    assert st.main(["swarm_threads.py", "bogus"]) == 2
+    assert "usage" in capsys.readouterr().err
+
+
+def test_main_threads_on_an_empty_mailbox_is_the_positive_control(capsys):
+    # A metric that inspected nothing never had the chance to say anything
+    # true about liveness -- exit 2, not a quiet-looking exit 0.
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "threads_inspected=0" in err
+
+
+def test_main_threads_prints_inspected_and_alive_counts(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1 threads_alive=1" in out
+    assert "doc:x/a.md" in out
+
+
+def test_main_threads_seats_flag_raises_the_bar(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads", "--seats", "3"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1 threads_alive=0" in out
+
+
+def test_main_threads_alive_flag_narrows_the_window(capsys, monkeypatch):
+    _post("test-r1", "a", "doc:x/a.md", at="2026-08-25T12:00:00+00:00")
+    _post("test-r1", "b", "doc:x/a.md", at="2026-08-25T12:05:00+00:00")
+    rc = st.main(["swarm_threads.py", "threads", "--alive", "60"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_alive=0" in out
+
+
+def test_main_threads_env_defaults_are_read_when_no_flag_given(capsys, monkeypatch):
+    _post("test-r1", "a", "doc:x/a.md", at="2026-08-25T12:00:00+00:00")
+    _post("test-r1", "b", "doc:x/a.md", at="2026-08-25T12:05:00+00:00")
+    monkeypatch.setenv(st.ALIVE_SECONDS_VAR, "60")
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    assert "threads_alive=0" in capsys.readouterr().out
+
+
+def test_main_threads_env_seats_default(capsys, monkeypatch):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    monkeypatch.setenv(st.ALIVE_SEATS_VAR, "3")
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    assert "threads_alive=0" in capsys.readouterr().out
+
+
+def test_main_threads_run_flag_inspects_only_the_named_run(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    _post("test-r2", "c", "doc:y/b.md")
+    rc = st.main(["swarm_threads.py", "threads", "--run", "test-r1"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "doc:x/a.md" in out
+    assert "doc:y/b.md" not in out
+
+
+def test_main_threads_all_runs_flag_is_the_default_made_explicit(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r2", "b", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads", "--all-runs"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1" in out
+
+
+def test_main_threads_run_and_all_runs_together_is_a_usage_error(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    rc = st.main(
+        ["swarm_threads.py", "threads", "--run", "test-r1", "--all-runs"]
+    )
+    assert rc == 2
+    assert "usage" in capsys.readouterr().err
+
+
+def test_main_threads_json_output(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads", "--json"])
+    assert rc == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    summary = json.loads(lines[0])
+    assert summary == {"threads_inspected": 1, "threads_alive": 1}
+    detail = json.loads(lines[1])
+    assert detail["thread"] == "doc:x/a.md"
+    assert detail["alive"] is True
+    assert detail["seats"] == 2
+    assert detail["rows"] == 2
+
+
+def test_main_threads_unexpected_positional_argument_exits_2(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads", "extra"])
+    assert rc == 2
+    assert "usage" in capsys.readouterr().err
 
 
 if __name__ == "__main__":
