@@ -208,17 +208,21 @@ Can your CLI run a shell command inside its own turn?
          reach in, or nothing here can deliver to it.
 
 Does it PROVE it injects a hook's stdout back into the agent's turn?
-  Run the injection probe in adapters/CONTRACT.md. Do not read vendor docs:
+  Run the injection probe: bash adapters/probe/arm-probe.sh --config <its
+  hook config>, run it headless, then bash adapters/probe/probe-verdict.sh
+  <probe dir>. Do not read vendor docs:
   a hook SURFACE is not push. grok loads Claude-shaped hooks, fires them,
   and throws their stdout away.
-    probe passes                      -> PUSH. Wire the one existing heartbeat
-                                         (adapters/claude-code/swarm-heartbeat.sh)
-                                         the way adapters/codex/install.sh does.
-    probe fails, positive control OK  -> stay POLL. This is where grok landed.
-    positive control MISSING          -> COULD NOT DETERMINE. Fix the wiring
-                                         and re-run; declare nothing. A probe
-                                         that inspected zero subjects is not a
-                                         negative result.
+    probe passes         (exit 0) -> PUSH. Wire the one existing heartbeat
+                                     (adapters/claude-code/swarm-heartbeat.sh)
+                                     the way adapters/codex/install.sh does,
+                                     ticking adapters/probe/INSTALLER-CHECKLIST.md.
+    fails, control OK    (exit 1) -> stay POLL. This is where grok landed.
+    control MISSING      (exit 2) -> COULD NOT DETERMINE. Fix the wiring
+                                     and re-run; declare nothing. A probe
+                                     that inspected zero subjects is not a
+                                     negative result, and exit 2 is neither
+                                     a pass nor a fail.
   No hook mechanism to install the probe into at all? That is not a failed
   probe either -- it is an ASSERTED ABSENCE, and the contract says what you
   have to have searched before you may write it down. This is kimi.
@@ -326,6 +330,7 @@ lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
 lib/swarm_claims.py          run-scoped write-set claims arbiter
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
+adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
 adapters/kimi/               resume-driver for a runtime with no hook surface
@@ -343,6 +348,7 @@ tests/                       pytest suites + heartbeat suite + CLI smoke test
 python3 -m pytest tests -q
 bash tests/test_swarm_heartbeat.sh
 bash tests/test_comms_cli.sh
+bash tests/test_push_probe.sh
 ```
 
 All suites isolate their writes to temp dirs; nothing touches real state.

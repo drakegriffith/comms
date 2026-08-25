@@ -53,9 +53,23 @@ So codex earned `push` by proving the injection, not by having hooks. Wiring the
 heartbeat into grok today would run it on every tool call and discard every row
 it printed.
 
+**Loading project hooks needs a TRUSTED project, not just a git repo.** A
+2026-08-25 re-run with `adapters/probe/` armed a project-scoped
+`.claude/settings.json` inside a fresh `git init` repo and got exit 2:
+`grok inspect` reported `Project trusted: no` and `Config Sources -> Project:
+(none)` while still loading 18 hooks from the user's own
+`~/.claude/settings.json`. grok answered `NOTHING-APPEARED` and the hook had
+never fired -- the same trap, sprung a second time, caught this time by the
+positive control. That run records nothing; the verdict below stands on the
+original probe.
+
 **What would upgrade this to push:** re-run the probe above against a newer grok
 and get the passphrase back instead of `NOTHING-APPEARED`, with the stdin-copy
-file present as the positive control. If that flips, grok needs no new heartbeat
+file present as the positive control. `adapters/probe/` is that probe, runnable:
+`bash adapters/probe/arm-probe.sh --config <hook config> --format wrapped`, then
+`bash adapters/probe/probe-verdict.sh <probe dir> --expect-event post_tool_use
+--expect-tool run_terminal_command`. Trust the project first, or you will get
+exit 2 again. If that flips, grok needs no new heartbeat
 -- it reuses `adapters/claude-code/swarm-heartbeat.sh` exactly as
 `adapters/codex/` does, and this file gains a one-screen `install.sh`. Audit
 with the delivery oracle (`swarm-heartbeat.log` in the state dir) plus the
