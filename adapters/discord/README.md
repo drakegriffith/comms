@@ -292,6 +292,24 @@ starts a new message). `lib/swarm_threads` is a pure module with no I/O
 precisely so `bin/comms threads` can ask the identical question without a
 second copy of this rule.
 
+**Alive is a one-way transition, and `threads.json` is its record.** The
+predicate decides whether to OPEN a thread; it never decides whether to
+deliver into one that already exists. Once a document has a thread, every
+later row for it posts straight into that thread -- one seat, months later,
+no second speaker required. Re-asking the predicate each pass would stall
+those rows in held forever, because a drained thread leaves no rows behind to
+be alive with.
+
+**Scope, exactly (design note D2, unchanged in v1): alive is evaluated per
+(run, lane); the thread map is fleet-wide.** A pass judges a document using
+only the rows of the run it is mirroring -- that run's fresh rows plus its own
+held ones. The cost, named: a document discussed by two different runs (or
+two machines) needs **two seats within ONE run** before its thread is ever
+opened; alpha in run A and bravo in run B do not add up to a live
+conversation. Once ANY run opens it, though, the map is fleet-wide and every
+run's rows land in that same thread. Cross-run liveness is deferred work, not
+a claim this build makes.
+
 ### State files (all in `<COMMS_STATE_DIR>/discord-mirror-board/`)
 
 | File | Scope | Shape | Answers |
@@ -342,6 +360,7 @@ re-posts the ENTIRE backlog on the next pass every time one POST fails.
 | post-into-thread fails after retries | that chunk goes to `<runid>.skipped.jsonl` and is dropped from held (one bad batch must not wedge every row behind it); that thread's remainder waits for the next pass |
 | held file corrupt or unreadable | read as `{}`, one LOUD stderr line. The un-posted backlog in it is genuinely lost -- the cursor is already past it. |
 | a document never goes alive | its rows sit in held until `COMMS_THREAD_HOLD_MAX`, then the oldest are dropped and recorded in the skipped log |
+| a document already has a thread | its rows post immediately, no predicate, no create call -- including a single row from a single seat |
 | two agents enrolled on one seat name | one stderr line per pass naming the seat and both agent ids; nothing is blocked (see `swarm_arm.seat_collisions`, issue #42) |
 
 Every board POST carries `allowed_mentions: {"parse": []}`. That is a
@@ -514,12 +533,20 @@ the loop.
   see Cursor format above.
 - **One poller per (run, lane), enforced.** An `fcntl.flock` per pass, not a
   rule in a README; the second poller no-ops loudly. See Concurrency above.
-- **Deferred, never dropped (board lane).** A row whose document is not yet a
-  conversation is held in `<runid>.held.json`, which is made durable BEFORE
-  the cursor advances past it -- so a crash mid-pass re-posts at worst and
-  forgets nothing. The held file is rewritten after each delivered chunk, so
-  a failure partway through a long drain costs only the chunks that did not
-  land. See The board lane above.
+- **Deferred, and never dropped WITHOUT A RECORD (board lane).** A row whose
+  document is not yet a conversation is held in `<runid>.held.json`, which is
+  made durable -- written, `fsync`ed, then renamed -- BEFORE the cursor
+  advances past it, so a crash mid-pass re-posts at worst and forgets
+  nothing. The held file is rewritten after each delivered chunk, so a
+  failure partway through a long drain costs only the chunks that did not
+  land. **What is NOT promised is unlimited automatic retry.** A chunk that
+  exhausts its delivery retries is written to `<runid>.skipped.jsonl`
+  (flushed and `fsync`ed) and REMOVED from held: it will not be retried on
+  its own, and recovery is a human replaying that file. Retaining it instead
+  would wedge every later row in that document behind one poisoned batch.
+  Same for rows dropped at `COMMS_THREAD_HOLD_MAX`. The guarantee is "no row
+  disappears without a durable record", not "every row eventually reaches
+  Discord". See The board lane above.
 - **Batched per author.** Rows that arrive together from the SAME seat go out
   as one message, chunked under Discord's 2000-char content cap; a seat
   change always starts a new message (Discord's `username` is one value per

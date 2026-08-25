@@ -123,8 +123,13 @@ things make it unlike every other lane:
   pair from two different seats no more than COMMS_THREAD_ALIVE_SECONDS
   apart. Without that gate, every document a single agent so much as
   mentioned opens a thread, and a board of one-line threads is a board
-  nobody reads. A row with NO thread is count-but-skipped, exactly as the
-  convo lane skips a non-conversation row: a forum webhook has no
+  nobody reads. That gate is ONE-WAY: it decides whether to OPEN a thread,
+  never whether to deliver into one that exists, and the thread map is the
+  record of the transition (see _drain). Alive is judged per (run, lane) in
+  v1 -- design note D2 -- so a document needs two seats within ONE run to
+  open its thread; the map is fleet-wide, so once any run opens it, every
+  run's rows land in it. A row with NO thread is count-but-skipped, exactly
+  as the convo lane skips a non-conversation row: a forum webhook has no
   un-threaded destination, and the `all` lane already mirrors those rows.
 
   WHAT IT REMEMBERS. A second state file, <runid>.held.json, shape
@@ -957,6 +962,17 @@ def _drain(runid, lane, url, buckets, machine):
     land -- oldest first, across as many POSTs as the seat changes and the
     content cap force.
 
+    ALIVE IS A ONE-WAY TRANSITION, AND THE THREAD MAP IS ITS RECORD (PR #51
+    review). `alive` decides whether to OPEN a thread; it never decides
+    whether to deliver into one that already exists. A key already in the map
+    posts its bucket directly, without consulting the predicate at all.
+    Re-asking it every pass was a silent stall: a drained thread leaves no
+    rows behind, so its liveness history is gone, and the next lone row from
+    one seat would sit in held forever looking exactly like a row that is
+    merely waiting its turn. That is README rehearsal step 13, and it is also
+    what makes the fleet-wide map pay off -- once ANY run opens a document's
+    thread, every run's rows have a destination.
+
     HELD IS REWRITTEN PER CHUNK, not once at the end (a small deviation from
     the design note, which allowed once-per-drain). A drain of a long backlog
     is many POSTs and many seconds; rewriting after each one means a crash or
@@ -975,14 +991,19 @@ def _drain(runid, lane, url, buckets, machine):
     window_s = _env_int(ALIVE_SECONDS_VAR, ALIVE_SECONDS_DEFAULT)
     min_seats = _env_int(ALIVE_SEATS_VAR, ALIVE_SEATS_DEFAULT)
     poster = threads.webhook_poster(url)
+    # One read of the fleet-wide map per pass: a key already in it has
+    # ALREADY gone alive, here or in another run, and needs no predicate.
+    known = threads.load_map(lane)
     skipped = False
     for key in sorted(buckets):
         rows = buckets[key]
-        if not swarm_threads.alive(rows, window_s=window_s, min_seats=min_seats):
-            continue
-        thread_id = threads.thread_for(key, thread_title(key), lane, poster)
-        if thread_id is None:
-            continue  # D6: every thread_for failure leaves the rows held
+        thread_id = known.get(key)
+        if not thread_id:
+            if not swarm_threads.alive(rows, window_s=window_s, min_seats=min_seats):
+                continue
+            thread_id = threads.thread_for(key, thread_title(key), lane, poster)
+            if thread_id is None:
+                continue  # D6: every thread_for failure leaves the rows held
         target = _thread_url(url, thread_id)
         for author, content, chunk in chunk_rows(rows, machine, identities=identities):
             delivered = post_content(

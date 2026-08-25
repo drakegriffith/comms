@@ -1692,13 +1692,87 @@ def test_board_thread_title_drops_the_doc_prefix(board):
 
 
 def test_board_reuses_the_thread_across_passes_creating_it_once(board):
+    # FIXED (PR #51 review): this used to hand the second pass a fresh
+    # two-seat exchange, so it proved only that the map is read -- it would
+    # have passed even if alive() were re-required every pass. The single
+    # later row below is what actually tests reuse.
     _append_thread_row("alpha", "a", at=_at(0))
     _append_thread_row("bravo", "b", at=_at(30))
     mirror.run_once(RUNID, lane=BOARD)
     _append_thread_row("alpha", "c", at=_at(60))
-    _append_thread_row("bravo", "d", at=_at(90))
     mirror.run_once(RUNID, lane=BOARD)
     assert len(board.created) == 1
+
+
+# ---- alive is a ONE-WAY transition; the map is its record -----------------
+#
+# Once a document has a thread, it HAS one. The alive predicate decides
+# whether to OPEN a thread, never whether to deliver into one that exists.
+# Re-asking it every pass was the bug: a drained thread's liveness history is
+# gone (the rows left held), so the next single row from one seat would sit
+# in held forever -- breaking README rehearsal step 13 and, worse, doing it
+# silently, since a held row looks exactly like a row that is merely waiting.
+
+
+def test_board_a_single_later_row_lands_in_the_EXISTING_thread(board):
+    # Rehearsal step 13, as a test. One seat, no second speaker, no window:
+    # none of that matters once the thread exists.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    del board.posted[:]
+
+    _append_thread_row("alpha", "a lone follow-up", at=_at(600))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac a lone follow-up"]
+    assert all("thread_id=T1" in p["url"] for p in board.posted)
+    assert _held() == {}
+
+
+def test_board_a_late_row_long_past_the_window_still_lands(board):
+    # The window is about when a conversation STARTS being one, not about
+    # expiring a thread. A day later is still that document's thread.
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    del board.posted[:]
+    _append_thread_row("carol", "much later", at="2026-08-29T00:00:00+00:00")
+    mirror.run_once(RUNID, lane=BOARD)
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac much later"]
+
+
+def test_board_an_existing_thread_needs_no_create_call(board):
+    _append_thread_row("alpha", "a", at=_at(0))
+    _append_thread_row("bravo", "b", at=_at(30))
+    mirror.run_once(RUNID, lane=BOARD)
+    _append_thread_row("alpha", "c", at=_at(60))
+    mirror.run_once(RUNID, lane=BOARD)
+    assert len(board.created) == 1  # no second create, and no second HTTP call
+
+
+def test_board_a_key_ALREADY_in_the_map_posts_without_ever_going_alive(board):
+    # The map is fleet-wide: another RUN (or another machine's operator) may
+    # have opened this thread. A single row from a single seat in THIS run
+    # then has a destination, and holding it would be holding a row whose
+    # thread is sitting right there.
+    os.makedirs(os.path.dirname(mirror.threads.map_path(BOARD)), exist_ok=True)
+    with open(mirror.threads.map_path(BOARD), "w") as fh:
+        json.dump({DOC: "T-preexisting"}, fh)
+    _append_thread_row("alpha", "solo", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.created == []
+    assert _texts(board.posted) == ["\U0001f4ec\U0001f4ac solo"]
+    assert all("thread_id=T-preexisting" in p["url"] for p in board.posted)
+
+
+def test_board_a_key_with_NO_thread_yet_still_has_to_earn_one(board):
+    # The other half: the transition is one-way, not absent. A document
+    # nobody has answered still does not open a thread.
+    _append_thread_row("alpha", "lonely", at=_at(0))
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert board.created == []
+    assert board.posted == []
+    assert [r["text"] for r in _held()[DOC]] == ["lonely"]
 
 
 def test_board_two_documents_get_two_threads(board):
