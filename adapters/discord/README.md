@@ -361,6 +361,7 @@ re-posts the ENTIRE backlog on the next pass every time one POST fails.
 | --- | --- |
 | `DISCORD_COMMS_FORUM_WEBHOOK_URL` missing | `--once --lane board` exits 2 with the drop-in; `--follow` warns once and retries in 60s. The other lanes are unaffected. |
 | create-thread POST fails (4xx/5xx, or a body with no id) | `thread_for` returns `None`, nothing posts, the rows stay held, next pass tries again |
+| the thread-map lock cannot be taken (unwritable state dir, refused `flock`, no descriptors) | `None` and one stderr line, same as any other failure -- the rows stay held and the OTHER documents in the pass still drain |
 | create succeeded but the map could not be saved | `None`, one stderr line, rows stay held; one empty thread is leaked and auto-archives -- better than posting into a thread nothing remembers |
 | map file corrupt | read as `{}`, one stderr line, the thread is recreated (at most one duplicate) |
 | post-into-thread fails after retries | that chunk goes to `<runid>.skipped.jsonl` and is dropped from held (one bad batch must not wedge every row behind it); that thread's remainder waits for the next pass |

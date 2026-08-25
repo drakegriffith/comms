@@ -170,6 +170,53 @@ def test_a_successful_persist_leaves_no_tmp_file_behind():
     assert [n for n in os.listdir(d) if ".tmp." in n] == []
 
 
+def test_a_lock_that_cannot_be_taken_yields_None_not_an_exception(monkeypatch, capsys):
+    # PR #51 review, Codex 4: thread_for promises "errors: none propagate",
+    # but the lock dir creation, the os.open and the flock all ran BEFORE its
+    # try. A permission error or a descriptor exhaustion there aborted the
+    # whole mirror pass, so one unwritable state dir stopped every OTHER
+    # document's thread from draining too.
+    def refuse(*args, **kwargs):
+        raise PermissionError("cannot open the lock file")
+
+    monkeypatch.setattr(threads.os, "open", refuse)
+    assert threads.thread_for(KEY, NAME, LANE, _Poster("777")) is None
+    assert capsys.readouterr().err  # named, never silent
+
+
+def test_a_lock_dir_that_cannot_be_created_yields_None(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise PermissionError("read-only state dir")
+
+    monkeypatch.setattr(threads.os, "makedirs", refuse)
+    assert threads.thread_for(KEY, NAME, LANE, _Poster("777")) is None
+
+
+def test_a_flock_that_raises_yields_None_and_leaks_no_descriptor(monkeypatch):
+    def refuse(fd, op):
+        raise OSError("flock not permitted here")
+
+    monkeypatch.setattr(threads.fcntl, "flock", refuse)
+    assert threads.thread_for(KEY, NAME, LANE, _Poster("777")) is None
+
+
+def test_one_documents_lock_failure_does_not_stop_another_document(monkeypatch):
+    # The point of returning None: the pass keeps going. Fail the first
+    # call's lock only, then let the second succeed.
+    real_open = threads.os.open
+    state = {"first": True}
+
+    def sometimes(*args, **kwargs):
+        if state["first"]:
+            state["first"] = False
+            raise PermissionError("nope")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(threads.os, "open", sometimes)
+    assert threads.thread_for(KEY, NAME, LANE, _Poster("777")) is None
+    assert threads.thread_for("doc:comms/b.md", "b", LANE, _Poster("888")) == "888"
+
+
 # ---- the lock is held ACROSS the create ----------------------------------
 
 

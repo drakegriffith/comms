@@ -167,6 +167,11 @@ def _acquire_map_lock(lane):
     """Block until this machine's map lock is ours. Returns the open fd; the
     caller closes it, which releases the lock even if the process dies.
 
+    RAISES OSError on a state dir it cannot create, a lock file it cannot
+    open, or a flock the filesystem refuses. thread_for catches all three --
+    see its errors: contract -- rather than this function guessing which of
+    them is survivable.
+
     BLOCKING, unlike the mirror's per-pass lock: there the loser's rows are
     exactly what the winner is posting, so skipping costs nothing. Here the
     loser has rows of its OWN to deliver into a thread the winner is about to
@@ -193,7 +198,11 @@ def thread_for(key, name, lane, poster):
     out: a thread id string, or None.
     side effects: may create a Discord thread and rewrite the lane's map file;
       takes and releases the lane's map lock.
-    errors: none propagate. Every failure is None plus one stderr line.
+    errors: none propagate -- INCLUDING failures taking the lock itself
+      (an unwritable state dir, a refused flock, a descriptor table that is
+      full). Every failure is None plus one stderr line, because this is
+      called once per document in a loop and one broken document must not
+      stop the rest of the pass.
 
     ORDER IS THE CONTRACT: read map -> (miss) create -> PERSIST -> return.
     Persisting before returning is what stops the next pass, or the next
@@ -205,7 +214,21 @@ def thread_for(key, name, lane, poster):
     caller's held file. None keeps the rows held; the cost is one leaked empty
     thread, which Discord auto-archives.
     """
-    lock_fd = _acquire_map_lock(lane)
+    try:
+        lock_fd = _acquire_map_lock(lane)
+    except OSError as exc:
+        # PR #51 review, Codex 4. This used to sit outside the try and
+        # propagate: an unwritable state dir, a refused flock, or an
+        # exhausted descriptor table aborted the entire mirror pass, so ONE
+        # broken lock stopped every OTHER document's thread from draining
+        # too. None is the same answer every other failure here gives -- the
+        # rows stay held and the next pass tries again.
+        sys.stderr.write(
+            "discord threads: could not take the thread-map lock (%s); no "
+            "thread for %r this pass, its rows stay held\n"
+            % (exc.__class__.__name__, key)
+        )
+        return None
     try:
         current = load_map(lane)
         existing = current.get(key)
