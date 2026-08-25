@@ -83,17 +83,23 @@ is per-runtime sugar on top.
 
 Your CLI is not in that table, or the row says something you want to change?
 The categories are defined by falsifiable membership tests, not by vendor docs
--- see `adapters/CONTRACT.md`, and "Connect your CLI" below for the four blocks
-that connect any of them.
+-- see `adapters/CONTRACT.md`. "Connect your CLI" below is the four-block path
+that enrolls any shell-capable runtime as a POLL seat; push and resume-driver
+are upgrades from there, each behind its own probe.
 
 ## Installing
 
 ```
 git clone https://github.com/drakegriffith/comms
 cd comms
-bin/comms            # prints usage; you are installed
+bin/comms status             # exits 0 and prints {"armed_runs": []}; you are installed
 python3 -m pytest tests -q   # optional: prove it on your machine
 ```
+
+(`bin/comms` with no subcommand prints the usage text and exits 2, the CLI's
+usage-error code -- fine to read, useless as a check, and fatal inside a
+`set -e` script. `bin/comms status` is the smoke test that actually exercises
+the dispatcher, the `lib/` modules and the state dir, and exits 0.)
 
 There is nothing else: the core is `bin/comms` plus three stdlib-only Python
 files. No pip installs, no config files, no daemon. Two optional env knobs are
@@ -115,11 +121,12 @@ never in this repo.
 
 ## Connect your CLI
 
-Bringing your own agent CLI -- a Grok CLI, a local model, anything -- takes
-**four copy-paste blocks, clone to enrolled seat.** Count them below: 1 clone,
-2 arm, 3 brief, 4 launch. None of it depends on your runtime having hooks. If
-your runtime turns out to have PROVEN injection, that is an upgrade you make
-afterwards, and it changes nothing you did here.
+Bringing your own agent CLI -- a Grok CLI, a local model, anything that runs a
+shell command in its own turn -- takes **four copy-paste blocks, clone to
+enrolled seat.** Count them below: 1 clone, 2 arm, 3 brief, 4 launch. They
+enroll a POLL seat, which is the path every shell-capable runtime already
+qualifies for. If your runtime turns out to have PROVEN injection, that is an
+upgrade you make afterwards, and it changes nothing you did here.
 
 **Block 1 of 4** -- clone and prove the CLI runs (the same block as Installing,
 above):
@@ -127,7 +134,7 @@ above):
 ```
 git clone https://github.com/drakegriffith/comms
 cd comms
-bin/comms                    # prints usage; you are installed
+bin/comms status             # exits 0, prints {"armed_runs": []}
 ```
 
 **Block 2 of 4** -- the dispatcher arms the run once, before any seat starts:
@@ -144,12 +151,14 @@ then paste verbatim into your agent's prompt, above the actual task:
 COMMS=$HOME/code/comms/bin/comms
 
 Run this FIRST, before any other comms command:
-  $COMMS enroll myrun --agent-id alpha-mycli --topics proj --seat alpha
+  $COMMS enroll myrun --agent-id alpha-mycli --seat alpha
 
-After EVERY work step (a file edited, a test run, a conclusion reached):
+After EVERY work step (a file edited, a test run, a conclusion reached),
+run this EXACT command, never a variant of it:
   $COMMS read myrun alpha
-Empty output = nothing new. A row on topic @alpha is a peer commenting on
-your live work: answer it BEFORE your next work step:
+It prints only rows you have not been handed before. Empty output = nothing
+new; carry on. A row on topic @alpha is a peer commenting on your live work:
+answer it BEFORE your next work step:
   $COMMS post myrun alpha reply "<your answer>" --to <their-seat>
 
 When you land a result worth a peer's attention:
@@ -158,19 +167,34 @@ If you are blocked:
   $COMMS post myrun alpha blocker "<what and who owns it>" --topic proj
 ```
 
-**Block 4 of 4** -- launch the seat, adding whatever flag your runtime needs to
-run commands without stopping for approval:
+**Block 4 of 4** -- launch the seat with block 3 in front of the task. This is
+the one block only you can finish: how a prompt is passed, and which flag lets
+the agent run commands without stopping for approval, are facts about YOUR CLI,
+and no README here can know them. The shape, with the two runtimes whose flags
+are already recorded in this repo:
 
 ```
-<your-cli> "<the brief from block 3><the task>"
-# grok, for example:
-grok --allow "Bash(*/bin/comms *)" "<the brief from block 3><the task>"
+grok --allow "Bash(*/bin/comms *)" "<block 3><the task>"      # adapters/grok/
+<your-cli> <its unattended flag> "<block 3><the task>"        # everything else
 ```
 
 The seat is enrolled the moment it runs the enroll line, and `bin/comms status
 myrun` from any other shell lists it under `participants`. That is the whole
-integration: your runtime is now in the **poll** category, which is the floor
-every shell-capable runtime already meets.
+integration: this seat now takes delivery by **poll**, the path every
+shell-capable runtime qualifies for with no probe at all.
+
+Two rules that keep the loop honest, both from the read cursor described under
+Quickstart below:
+
+- **One reader, one view.** The brief above enrolls with no topic filter and
+  always runs the same plain `read`, so the seat stays on one cursor and
+  "empty output = nothing new" stays true. A seat that wants a narrower slice
+  registers it (`bin/comms subscribe myrun alpha proj`) and then reads
+  `--subs` every single time -- mixing the two forms hands the same row over
+  twice. The enrollment's own `--topics` is the PUSH filter, not the read
+  filter, which is why the poll brief leaves it out.
+- **Consume a read whole.** Piping it through `head` truncates the output, not
+  the cursor; `--replay` is the recovery.
 
 ### Can it do better than poll?
 
@@ -178,9 +202,10 @@ Push delivery -- rows appearing in the agent's turn without it asking -- is an
 upgrade, and it is a MEASUREMENT, never a docs claim:
 
 ```
-Can your CLI run a shell command in its loop?
-  no  -> it cannot participate at all; nothing here helps.
+Can your CLI run a shell command inside its own turn?
   yes -> it is POLL already. The four blocks above are the entire install.
+  no  -> skip to the last question: something outside the session has to
+         reach in, or nothing here can deliver to it.
 
 Does it PROVE it injects a hook's stdout back into the agent's turn?
   Run the injection probe in adapters/CONTRACT.md. Do not read vendor docs:
@@ -191,18 +216,23 @@ Does it PROVE it injects a hook's stdout back into the agent's turn?
                                          the way adapters/codex/install.sh does.
     probe fails, positive control OK  -> stay POLL. This is where grok landed.
     positive control MISSING          -> COULD NOT DETERMINE. Fix the wiring
-                                         and re-run; record no category. A
-                                         probe that inspected zero subjects is
-                                         not a negative result.
+                                         and re-run; declare nothing. A probe
+                                         that inspected zero subjects is not a
+                                         negative result.
+  No hook mechanism to install the probe into at all? That is not a failed
+  probe either -- it is an ASSERTED ABSENCE, and the contract says what you
+  have to have searched before you may write it down. This is kimi.
 
-No injection, and the agent has no way to read the mailbox from inside its
-own turn at all?
-  -> RESUME-DRIVER: an outside loop delivers rows as resume turns
-     (adapters/kimi/). Only if it also cannot poll -- a runtime that can run
-     a shell command should stay poll and skip the second process.
+Cannot read the mailbox from inside its own turn (the poll answer was no)?
+  -> RESUME-DRIVER: a loop outside the session delivers rows as resume turns
+     (adapters/kimi/). This is the path for a runtime that fails the poll
+     test, not an upgrade over passing it -- a runtime that can run a shell
+     command stays poll and skips the second process to supervise.
+  -> and if it can neither run a command in its turn nor take text from
+     outside, it has no delivery path. There is no adapter to write.
 ```
 
-To contribute the adapter back, copy the template for your category
+To contribute the adapter back, copy the template for your delivery path
 (`adapters/pi/` for poll, `adapters/kimi/` for resume-driver, `adapters/codex/`
 for push), record the version and date of what you measured, and add one row to
 the table above. Nothing in `bin/` or `lib/` learns your runtime's name -- that

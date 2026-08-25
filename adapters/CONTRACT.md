@@ -8,10 +8,12 @@ section is the short path if all you want is a working seat.
 
 Two facts shape everything below.
 
-- **Polling is the floor.** `bin/comms read <runid> <seat>` is a shell command.
-  Any runtime that can run a shell command already participates, with zero
-  integration and zero adapter code. No probe can move a runtime BELOW poll, so
-  no probe is a prerequisite for connecting one.
+- **Polling is the default, and it costs nothing.** `bin/comms read <runid>
+  <seat>` is a shell command, so a runtime that can run one inside its own turn
+  already participates, with zero integration and zero adapter code. No probe
+  is a prerequisite for that; probes only decide whether a runtime can do
+  BETTER than poll, or -- for the rarer runtime that cannot run a command in
+  its turn at all -- whether something outside can reach in instead.
 - **The core never learns runtime names.** `bin/comms` and `lib/*.py` carry no
   branch on which runtime is calling -- grep them for `claude|codex|kimi|grok`
   and every hit is prose in a docstring, a free-text identity example, or a
@@ -21,51 +23,89 @@ Two facts shape everything below.
 ## The three delivery categories
 
 A category is a claim about DELIVERY -- how a row reaches a running agent --
-and each one has a single falsifiable membership test. A runtime belongs to the
-strongest category whose test it has PASSED on your machine, at a stated
-version, on a stated date. Not the strongest category its vendor documents.
+and each one has a falsifiable membership test. The tests are not exclusive:
+Claude Code and codex pass the poll test as well as the push one, and a
+hook-less runtime with a resume flag can pass both poll and resume-driver. A
+category is therefore not a property of the runtime but a choice of DELIVERY
+PATH, made by the ordered procedure below, from the tests the runtime has
+PASSED on your machine, at a stated version, on a stated date. Not from the
+strongest path its vendor documents.
 
-### poll -- the floor
+The adapter declares exactly one path, because a row delivered twice by two
+paths is a row the seat reads twice.
 
-**Membership test.** The runtime can execute `bin/comms read <runid> <seat>` in
-its own loop, and that command's output enters its context.
+### poll -- the default path
+
+**Membership test.** The runtime can execute `bin/comms read <runid> <seat>`
+inside its own turn, and that command's output enters its context.
 
 **Probe.** Arm a run, post a row carrying a unique passphrase, brief the agent
 to run the read command and report what it saw. Pass = it reports the
 passphrase.
 
-**Failing this test means the runtime cannot participate at all**, in any
-category: push and resume-driver are ways of saving the agent the trouble of
-looking, not ways around needing a shell.
+**What the real floor is.** Participation needs a shell SOMEWHERE, not
+necessarily inside the agent's turn. A runtime that fails the poll test can
+still participate if some process outside it can put text into its live session
+-- that is resume-driver, and it is why kimi is a full participant while
+failing this test. The one runtime nothing here can reach is one that neither
+runs a shell command in its own loop nor accepts text into a live session from
+outside: it has no delivery path, so there is no adapter to write.
 
-**Cost of the category.** The agent has to choose to look. Cadence is the
-brief's business, not the stack's; "after every work step" is the proven one.
+**Cost of the path.** The agent has to choose to look. Cadence is the brief's
+business, not the stack's; "after every work step" is the proven one, and it is
+cheap because `comms read` is incremental -- it hands the seat only rows it has
+not been handed before in that view, so the loop does not re-read the board
+(see the cursor rules under "What every adapter owes").
 
 **Template.** `adapters/pi/README.md` (generic) or `adapters/grok/README.md`
 (the same recipe plus a measurement record). README only -- there is no code.
 
 ### resume-driver
 
-**Membership test.** Two parts, both required. (a) The push test below has been
-run and FAILED with its positive control intact. (b) A process OUTSIDE the
-session can deliver text into an EXISTING session addressed by id, and that
-text enters the agent's turn.
+**Membership test.** Two parts, both required.
 
-**Probe.** Start a session and note its id. From another shell, deliver a
-passphrase as a resume turn (`kimi -r <id> -p "..."`, or the runtime's
-equivalent). Read the session transcript: the passphrase is there, and the
-agent answered it, or (b) failed.
+(a) **Push is not proven.** Two different states of the world qualify, and each
+has its own evidence requirement, because "not proven" is a claim like any
+other and silence does not establish it:
+
+- *Measured negative.* The push probe ran and failed. Evidence: the positive
+  control (the hook's stdin copy) exists, AND the agent reported no passphrase.
+  This is grok.
+- *No hook surface at all.* The runtime has no mechanism to run a command on an
+  event, so the probe cannot be installed and its verdict is
+  could-not-determine forever. Evidence: an ASSERTED absence, not an assumed
+  one -- name the surfaces you searched at that version (the config file schema,
+  the `--help` output, the docs' command list) and record that none of them
+  offers an event hook. This is kimi.
+
+What never qualifies is the third outcome of the push probe: a probe that was
+installed but did not fire. Fix the wiring and re-run; it tells you nothing
+about either state above.
+
+(b) **Something outside can reach in.** A process OUTSIDE the session delivers
+text into an EXISTING session addressed by id, and that text enters the agent's
+turn.
+
+**Probe for (b).** Start a session and note its id. From another shell, deliver
+a passphrase as a resume turn (`kimi -r <id> -p "..."`, or the runtime's
+equivalent). Read the session transcript: the passphrase is there and the agent
+answered it, or (b) failed.
 
 **When to take it.** Only when the runtime cannot check the mailbox from inside
-its own turn. That is why kimi has it: no hook surface AND no in-session way to
-run the read. A runtime that can run a shell command should stay poll --
-resume-driver costs a second process to supervise and buys nothing poll lacks.
-grok passes the resume-driver test and deliberately does not use it
-(`adapters/grok/README.md`, "Notes").
+its own turn -- that is, only when the poll test also failed. That is why kimi
+has it: no hook surface AND no in-session way to run the read. A runtime that
+passes the poll test should stay poll: resume-driver costs a second process to
+supervise and buys nothing poll lacks. grok is the worked example of declining
+it -- its flags (`-r/--resume`, `-p`) say part (b) would pass, but the probe has
+not been run, so `adapters/grok/README.md` records that as an expectation, not
+as a measurement, and the adapter stays poll.
 
 **Template.** `adapters/kimi/` -- README plus a driver script. The driver's one
-hard rule: the cursor advances only after an invocation that SUCCEEDED, so a
-failed delivery re-delivers instead of dropping rows.
+hard rule: it owns the delivery cursor, and that cursor advances only after an
+invocation that SUCCEEDED, so a failed delivery re-delivers instead of dropping
+rows. Which is why it reads with `bin/comms read ... --replay`: the CLI's own
+cursor advances at print time, before delivery is known to have worked, and two
+cursors over one delivery is how rows go missing quietly.
 
 ### push -- proven injection
 
@@ -80,8 +120,10 @@ as JSON on stdin, and discards their stdout (probe 2026-08-25, grok 0.2.106,
 PR #25). Codex earned push by proving the injection, not by having hooks. The
 cost of getting this wrong is silent: a heartbeat wired into a runtime that
 does not inject runs on every tool call, prints rows nobody reads, and advances
-the read cursor past them, so rows are marked delivered to a reader that never
-saw them.
+THE HEARTBEAT'S OWN CURSOR past them -- the one under
+`$COMMS_STATE_DIR/swarm-cursor/<runid>/<agent_id>`, private to
+`adapters/claude-code/swarm-heartbeat.sh` and keyed on agent_id, not the CLI
+read cursor -- so rows are marked delivered to a reader that never saw them.
 
 **Probe, in order.**
 
@@ -129,13 +171,18 @@ tracked as issue #28.
 
 ## Classifying your runtime, in order
 
-1. Can it run a shell command in its loop? No -> it cannot participate.
-2. Yes -> it is POLL, today, with no further work. Ship the poll adapter. Every
-   step below is an upgrade, never a prerequisite.
-3. Run the push probe. Pass -> push. Real negative -> stay poll, and write down
-   what you measured. Could-not-determine -> re-run; do not record a category.
-4. Only if push failed AND the agent has no in-session way to read the mailbox,
-   run the resume-driver probe.
+1. Run the poll test. Passes -> the runtime's delivery path is POLL, today,
+   with no further work. Ship the poll adapter; steps 2-3 are an upgrade, never
+   a prerequisite.
+2. Run the push probe. Pass -> declare push. Real negative -> stay on the path
+   from step 1 and write down what you measured. Could-not-determine -> fix the
+   wiring and re-run; declare nothing.
+3. If the poll test FAILED, the runtime still has one path left: run the
+   resume-driver probe, having first established (a) -- a measured push
+   negative, or an asserted absence of any hook surface.
+4. All three failed -> nothing here can reach this runtime. There is no adapter
+   to write; say so in the ticket rather than shipping a README nobody can
+   follow.
 5. Record the verdict with the runtime's version, the date, and a pointer to
    the evidence. A category is a dated measurement, not a property of the
    product: a new release can flip it either way, and the adapter README says
@@ -143,18 +190,18 @@ tracked as issue #28.
 
 ## Category claims on record
 
-| Runtime | Category | What was measured | When |
+| Runtime | Delivery path | What was measured | When |
 | --- | --- | --- | --- |
 | Claude Code | push | PostToolUse `additionalContext` reached a live subagent; telemetry row `rows_inspected 6, delta_emitted 3` | 2026-08-21, comms #1 |
 | Codex | push | byte-compatible Claude-shaped `hooks.json`; injection observed. Headless needs `--dangerously-bypass-hook-trust` -- untrusted hooks are skipped SILENTLY | 2026-08-21, codex 0.148.0 |
-| Kimi | resume-driver | no hook surface at all; `kimi -r <id> -p` delivers into a live session | pre-extraction |
-| grok (xAI) | poll | hooks load and fire (stdin copy present) and stdout is discarded (`NOTHING-APPEARED`) | 2026-08-25, grok 0.2.106 |
-| pi (badlogic) | poll | no hook surface; runs shell commands | pre-extraction |
+| Kimi | resume-driver | push (a) by ASSERTED ABSENCE: no hook surface, so nothing can run after a tool call and the push probe cannot be installed. Poll test fails too -- no in-session way to read the mailbox. (b) passes: `kimi -r <id> -p` delivers into a live session | pre-extraction |
+| grok (xAI) | poll | hooks load and fire (stdin copy present) and stdout is discarded (`NOTHING-APPEARED`) -- a measured push negative | 2026-08-25, grok 0.2.106 |
+| pi (badlogic) | poll | no hook surface; runs shell commands in its own turn | pre-extraction |
 
 Everything else is UNVERIFIED until probed. Gemini CLI, Qwen Code, Copilot CLI
-and Cursor have the floor like any shell-capable runtime, and no push or
-resume-driver claim: nobody has run the probe. Do not promote them from a
-changelog.
+and Cursor get poll if and only if they pass the poll test, which nobody has
+run against them here, and they have no push or resume-driver claim at all. Do
+not promote them from a changelog.
 
 ## What every adapter owes, whatever its category
 
@@ -168,9 +215,30 @@ changelog.
 - **The closed kind vocabulary**, quoted verbatim in the brief block:
   `finding|claim|blocker|comment|reply|status`. An unlisted kind fails loudly.
   Relabel, never retry blind.
-- **Cursor semantics stated, not assumed.** The read cursor is per
-  `(runid, seat)` under `COMMS_STATE_DIR`; repeated reads never replay, and a
-  restarted session resumes where it left off.
+- **Cursor semantics stated, not assumed, and never conflated.** Two different
+  cursors exist, and an adapter README that blurs them will be debugged with
+  the wrong file open.
+  - *The CLI read cursor* (landed with issue #33). Keyed per
+    `(runid, seat, VIEW)`: one JSON file of per-seat row counts at
+    `$COMMS_STATE_DIR/read-cursor/<runid>/<seat>.<view>.json`, where the view
+    is `all` for an unfiltered read, `topic-<name>` for `--topic <name>`, and
+    `subs-<digest>` for `--subs`. It advances AFTER the rows are printed, over
+    exactly the rows that view selected -- print first, commit after, so a
+    crash between the two replays rows (visible) instead of dropping them
+    (invisible). A `--topic X` read therefore cannot mark another topic's rows
+    delivered, and the price is that a row in topic X is handed once to the
+    plain read and once to the `--topic X` read: **one reader, one view.** A
+    brief that switches forms mid-run will see rows twice. `--replay` prints
+    the whole board and neither reads nor moves any cursor -- the escape hatch
+    for auditing, and mandatory for any caller keeping a delivery cursor of its
+    own (`adapters/kimi/poll-driver.sh`, `adapters/remote/sync.py`). Piping a
+    read through `head` truncates the OUTPUT, not the cursor.
+  - *The heartbeat cursor*, private to
+    `adapters/claude-code/swarm-heartbeat.sh`: a last-seen timestamp at
+    `$COMMS_STATE_DIR/swarm-cursor/<runid>/<agent_id>`, keyed per
+    `(runid, agent_id)` -- agent_id, NOT seat -- and advanced after the beat
+    emits. Push adapters inherit it by reusing that script; they do not get to
+    redefine it.
 - **The delivery oracle.** When auditing whether rows landed, read
   `swarm-heartbeat.log` in the state dir and the mailbox files. Seat
   self-reports UNDERCOUNT: an agent that received an injection does not
