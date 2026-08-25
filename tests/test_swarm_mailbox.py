@@ -2,7 +2,9 @@
 """Self-test for swarm_mailbox -- the positive control that siblings exchange
 rows and never read their own, collision-free under interleaved writes."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -367,6 +369,62 @@ class TestRunIds(unittest.TestCase):
         mb.init("only-in-second-root")
         self.assertEqual(mb.run_ids(), ["only-in-second-root"])
         os.environ["COMMS_ROOT"] = self.tmp  # restore for other tests
+
+
+class TestSrcFileTag(unittest.TestCase):
+    """SRC_FILE_KEY (issue #20): _all_sibling_rows tags each row in memory
+    with the sibling FILE it was parsed from, so a reader can tell a pushed
+    row (lives in a first-class seat file) from a pulled row (lives only in
+    adapters/remote/sync.py's "remote~<hub>" mirror file) -- the seat name
+    alone cannot, because both shapes can contain "~". The tag must never
+    survive a round trip back to disk; see main()'s `read` command."""
+
+    def setUp(self):
+        self.tmp = os.environ["COMMS_ROOT"]
+
+    def test_read_siblings_tags_each_row_with_its_source_file(self):
+        mb.init("test-src1")
+        mb.post("test-src1", "alpha", "finding", "from alpha")
+        rows = mb.read_siblings("test-src1", "observer")
+        self.assertEqual(rows[0][mb.SRC_FILE_KEY], "alpha.jsonl")
+
+    def test_pulled_style_mirror_file_is_tagged_with_its_own_name(self):
+        """A row landed by adapters/remote/sync.py's append_mirrored into
+        "remote~studio.jsonl" is tagged with exactly that filename."""
+        mb.init("test-src2")
+        mb.append_mirrored(
+            "test-src2", "remote~studio",
+            [{"seat": "alpha~studio", "at": "t1", "kind": "finding", "text": "pulled"}],
+        )
+        rows = mb.read_siblings("test-src2", "observer")
+        self.assertEqual(rows[0][mb.SRC_FILE_KEY], "remote~studio.jsonl")
+
+    def test_tilde_seat_pushed_row_is_tagged_with_its_own_seat_file(self):
+        """A pushed row's file is its OWN seat name, not a "remote~" mirror
+        -- distinguishes it from the pulled case above even though both seat
+        names contain '~'."""
+        mb.init("test-src3")
+        mb.post("test-src3", "alpha~macbook", "finding", "pushed")
+        rows = mb.read_siblings("test-src3", "observer")
+        self.assertEqual(rows[0][mb.SRC_FILE_KEY], "alpha~macbook.jsonl")
+
+    def test_cli_read_command_strips_the_tag_before_printing(self):
+        """THE NON-PERSISTENCE GUARD: main()'s `read` command is the CLI/ssh
+        boundary adapters/remote/sync.py's pull parses (bin/comms read on the
+        hub). If SRC_FILE_KEY reached that stdout, sync.py's append_mirrored
+        would persist it verbatim into the puller's real mirror file --
+        exactly what "non-persisted" forbids."""
+        mb.init("test-src4")
+        mb.post("test-src4", "alpha", "finding", "from alpha")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mb.main(["swarm_mailbox.py", "read", "test-src4", "observer"])
+        self.assertEqual(rc, 0)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1)
+        printed = json.loads(lines[0])
+        self.assertNotIn(mb.SRC_FILE_KEY, printed)
+        self.assertEqual(printed["seat"], "alpha")
 
 
 if __name__ == "__main__":

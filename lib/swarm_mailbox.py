@@ -267,6 +267,26 @@ def post(runid, seat, kind, text, topic=None, to=None):
     return row
 
 
+# In-memory-only tag _all_sibling_rows stamps onto every row it parses, naming
+# the sibling FILE (e.g. "remote~studio.jsonl") the row came from -- issue #20.
+# A row's seat name alone cannot tell a PUSHED row (lives in a first-class seat
+# file like "alpha~macbook.jsonl", the hub's only mirror, which must keep
+# posting it) from a PULLED row (lives only in adapters/remote/sync.py's
+# "remote~<hub>.jsonl" mirror file, which the discord mirror must not re-post
+# on the spoke -- the hub already posted the original). The file, not the seat
+# string, is the fact that distinguishes them.
+#
+# NEVER PERSISTED: this key must not survive a round trip back to disk, or a
+# row pulled through it (see adapters/remote/sync.py fetch_remote_rows, which
+# parses the CLI's own JSON output) would carry it into a REAL mirror file on
+# another machine. Two guards keep that from happening: (1) every row here is
+# a freshly json.loads-ed dict, never the same object twice, so tagging it
+# cannot leak into a second reader's copy; (2) main()'s `read` command (the
+# only path that re-serializes a sibling row, over the CLI/ssh boundary that
+# adapters/remote/sync.py depends on) strips this key before printing.
+SRC_FILE_KEY = "_src_file"
+
+
 def _all_sibling_rows(runid, seat):
     """Parse every OTHER seat's .jsonl into a flat, UNFILTERED, UNSORTED list.
 
@@ -275,6 +295,9 @@ def _all_sibling_rows(runid, seat):
     the caller's own rows -- a seat reads siblings, not itself. Malformed lines (a
     partially-flushed final line from a concurrent writer) are skipped rather than
     crashing the reader.
+
+    Each row is tagged with SRC_FILE_KEY -- see its docstring above for why and
+    for the non-persistence guarantee.
     """
     d = _dir(runid)
     if not os.path.isdir(d):
@@ -291,9 +314,12 @@ def _all_sibling_rows(runid, seat):
                     if not line:
                         continue
                     try:
-                        rows.append(json.loads(line))
+                        row = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if isinstance(row, dict):
+                        row[SRC_FILE_KEY] = name
+                    rows.append(row)
         except OSError:
             continue
     return rows
@@ -516,6 +542,12 @@ def main(argv):
             else:
                 rows = read_siblings(rest[0], rest[1], topic=topic)
             for row in rows:
+                # SRC_FILE_KEY is in-memory-only (see its docstring): this is
+                # the CLI/ssh boundary adapters/remote/sync.py's pull reads
+                # through, and a row printed here that still carried it would
+                # get persisted verbatim into the puller's real mirror file.
+                if isinstance(row, dict) and SRC_FILE_KEY in row:
+                    row = {k: v for k, v in row.items() if k != SRC_FILE_KEY}
                 print(json.dumps(row))
             return 0
     except ValueError as exc:

@@ -424,6 +424,105 @@ def test_long_batch_chunks_under_discord_cap(webhook):
         assert "row%d" % i in joined  # nothing lost to chunking
 
 
+# ---- issue #20: do not re-post rows pulled by adapters/remote -------------
+#
+# Direction matters: a PUSHED row (adapters/remote/sync.py post) lives only
+# in the hub's first-class seat file (e.g. "alpha~macbook.jsonl") and the
+# hub mirror is its ONLY mirror -- it must keep posting those. A PULLED row
+# (sync.py pull) lives only in the spoke's "remote~<hub>.jsonl" mirror file
+# -- the hub's own mirror already posted the original once, so the spoke
+# mirror must skip exactly these while still advancing its cursor past them.
+# The discriminator is the source FILE, not the seat string, because both
+# shapes of row can carry a seat name containing "~": pull() (sync.py) tags
+# a pulled row's OWN seat with the hub's label too (e.g. "alpha~studio"),
+# the same qualify() a pushed row goes through -- the file it lands in
+# ("remote~studio.jsonl" vs "alpha~studio.jsonl") is the only thing that
+# differs. Fixture rows below use that exact shape (via append_mirrored,
+# never a literal seat "remote~studio" -- append_mirrored itself refuses a
+# row named after its own mirror file), so a seat-string-only predicate and
+# the real file-based one diverge on these tests instead of agreeing.
+
+
+def _append_pulled(seat, kind, text, hub="studio", at=None):
+    """Write a row the way adapters/remote/sync.py's pull() actually lands
+    it: appended (via swarm_mailbox.append_mirrored, THE sanctioned writer
+    of a mirror file) into "remote~<hub>.jsonl", with the row's own `seat`
+    qualified by the hub's label -- e.g. "alpha~studio", never the literal
+    mirror-file name "remote~studio" a real pulled row never carries."""
+    swarm_mailbox.append_mirrored(
+        RUNID, "remote~%s" % hub,
+        [{
+            "seat": seat,
+            "at": at or "2026-08-21T00:00:00+00:00",
+            "kind": kind,
+            "text": text,
+        }],
+    )
+
+
+def test_pulled_row_counted_by_cursor_but_never_returned_fresh_default_lane():
+    _append_pulled("alpha~studio", "finding", "pulled from the hub")
+    fresh, cursor = mirror.collect_new(RUNID, lane="all")
+    assert fresh == []
+    assert cursor == {"alpha~studio": 1}  # seen and counted, just not posted
+
+
+def test_pulled_row_counted_by_cursor_but_never_returned_fresh_convo_lane():
+    # kind=comment so it would otherwise PASS the convo lane's own filter --
+    # proves the remote-mirror filter is applied in addition to, not instead
+    # of, _is_convo_row.
+    _append_pulled("alpha~studio", "comment", "pulled convo row")
+    fresh, cursor = mirror.collect_new(RUNID, lane="convo")
+    assert fresh == []
+    assert cursor == {"alpha~studio": 1}
+
+
+def test_pulled_row_never_reposted_even_after_a_restart():
+    """The cursor already having counted the row must not let a later pass
+    return it either -- a filtered row must not be re-scanned on every poll,
+    but it must also never become 'fresh' just because a stale cursor entry
+    exists."""
+    _append_pulled("alpha~studio", "finding", "pulled from the hub")
+    fresh1, cursor1 = mirror.collect_new(RUNID, lane="all")
+    mirror._save_cursor(RUNID, cursor1, "all")
+    fresh2, cursor2 = mirror.collect_new(RUNID, lane="all")
+    assert fresh1 == fresh2 == []
+    assert cursor2 == {"alpha~studio": 1}
+
+
+def test_pushed_row_in_a_tilde_seat_file_is_still_returned_fresh_default_lane():
+    """Hub direction unbroken: a seat name containing '~' that is NOT a
+    remote-mirror file (a real pushed seat, qualified with the pusher's
+    machine label by adapters/remote/sync.py's qualify()) must still post."""
+    _append_raw("alpha~macbook", "finding", "pushed from the spoke, posted by the hub")
+    fresh, cursor = mirror.collect_new(RUNID, lane="all")
+    assert [r["seat"] for r in fresh] == ["alpha~macbook"]
+    assert cursor == {"alpha~macbook": 1}
+
+
+def test_pushed_row_in_a_tilde_seat_file_is_still_returned_fresh_convo_lane():
+    _append_raw("alpha~macbook", "comment", "pushed convo row")
+    fresh, cursor = mirror.collect_new(RUNID, lane="convo")
+    assert [r["seat"] for r in fresh] == ["alpha~macbook"]
+    assert cursor == {"alpha~macbook": 1}
+
+
+def test_mixed_pulled_and_pushed_rows_only_the_pulled_one_is_dropped():
+    _append_pulled("alpha~studio", "finding", "pulled, must not post")
+    _append_raw("alpha~macbook", "finding", "pushed, must post")
+    fresh, cursor = mirror.collect_new(RUNID, lane="all")
+    assert [r["seat"] for r in fresh] == ["alpha~macbook"]
+    assert cursor == {"alpha~studio": 1, "alpha~macbook": 1}
+
+
+def test_source_file_tag_never_leaks_into_the_posted_content(webhook):
+    """The in-memory-only tag (swarm_mailbox.SRC_FILE_KEY) must never show up
+    in what actually gets rendered to Discord for a row that DOES post."""
+    swarm_mailbox.post(RUNID, "alpha", "finding", "ordinary row")
+    assert mirror.run_once(RUNID) == 0
+    assert swarm_mailbox.SRC_FILE_KEY not in webhook.requests[0]["content"]
+
+
 # ---- 429 handling ---------------------------------------------------------
 
 
@@ -460,6 +559,9 @@ def test_429_exhaustion_logs_skipped_never_silent(webhook, capsys):
         recorded = [json.loads(l) for l in fh]
     assert len(recorded) == 1
     assert recorded[0]["row"]["text"] == "undeliverable"
+    # the in-memory-only source-file tag must not survive into this durable
+    # dead-letter file -- see swarm_mailbox.SRC_FILE_KEY's docstring.
+    assert swarm_mailbox.SRC_FILE_KEY not in recorded[0]["row"]
     # cursor advanced past the skipped row: no wedge, no repost storm
     webhook.script[:] = []
     webhook.requests[:] = []

@@ -104,9 +104,17 @@ import urllib.request
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "remote"))
 import comms_machine  # noqa: E402  (machine_label, re-exported below)
 import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
+# is_mirror_seat, the naming rule for a PULLED row's mirror file (issue #20,
+# see _is_remote_mirror_row below) -- imported rather than a second copy of
+# "remote~" living here to drift against. The reverse import (sync.py pulling
+# in this module) is what test_sync_does_not_import_the_discord_adapter
+# guards against; a display adapter reading a sync adapter's naming rule is
+# the safe direction.
+import sync as remote_sync  # noqa: E402
 
 # Reserved observer seat name handed to read_siblings so the mirror sees every
 # REAL seat's rows (read_siblings excludes only the named seat's own file).
@@ -173,6 +181,32 @@ def _is_convo_row(row):
     it. See adapters/discord/README.md, Lanes."""
     topic = str(row.get("topic", ""))
     return topic.startswith("@") or row.get("kind") in swarm_mailbox.CONVO_KINDS
+
+
+def _is_remote_mirror_row(row):
+    """True iff this row was PULLED onto this machine by adapters/remote/sync.py
+    (issue #20) -- i.e. its source file is a "remote~<hub>" mirror file, never a
+    first-class seat file.
+
+    WHY THE FILE AND NOT THE SEAT: a pulled row's `seat` is qualified with the
+    hub's label the same way a pushed row's is (e.g. both can look like
+    "alpha~macbook") -- qualify() and pull()'s per-hub mirror file diverge on
+    PURPOSE, not on shape. A pushed row lives ONLY in the hub's first-class
+    "alpha~macbook.jsonl" (the hub's mirror is its ONLY mirror, and must keep
+    posting it); a pulled row lives ONLY in the spoke's "remote~<hub>.jsonl"
+    (the hub's OWN mirror already posted the original once, so re-posting here
+    would double it -- see the issue's first-pull incident, 167 rows). The
+    source file is the one place that distinction still exists by the time a
+    row reaches this filter; the seat string alone would conflate the two.
+
+    `row` carries swarm_mailbox.SRC_FILE_KEY, stamped in-memory by
+    _all_sibling_rows over THIS machine's own mailbox dir -- collect_new never
+    reads across the network, so there is no risk of trusting a remote-supplied
+    value here."""
+    src = row.get(swarm_mailbox.SRC_FILE_KEY, "")
+    if not src.endswith(".jsonl"):
+        return False
+    return remote_sync.is_mirror_seat(src[: -len(".jsonl")])
 
 
 def _find_webhook_url(lane=DEFAULT_LANE):
@@ -388,10 +422,19 @@ def collect_new(runid, lane=DEFAULT_LANE):
 
     LANE FILTER: the cursor always advances over EVERY row (seen[] counts
     every row regardless of lane), but only rows matching this lane's filter
-    are returned in `fresh` for posting. The default lane's filter is a
-    no-op (every new row is fresh, exactly the pre-lane behavior); the convo
-    lane additionally requires _is_convo_row. A row a lane filters out still
+    are returned in `fresh` for posting. The default lane's filter drops only
+    remote-mirror rows (see REMOTE-MIRROR FILTER below); the convo lane
+    additionally requires _is_convo_row. A row a lane filters out still
     counts against that lane's cursor -- see module docstring, LANES.
+
+    REMOTE-MIRROR FILTER (issue #20, both lanes): a row whose source file is
+    adapters/remote/sync.py's "remote~<hub>" pull mirror is dropped from
+    `fresh` -- the hub's OWN mirror already posted it once, so returning it
+    here would double-post it to the same Discord channel. The cursor still
+    advances over it (same count-but-skip shape the convo lane already used
+    for non-convo rows), so it is never re-scanned. See
+    _is_remote_mirror_row for why the source FILE and not the seat string is
+    the test.
 
     The counting itself is swarm_mailbox.fresh_rows_by_seat (moved there when
     adapters/remote/sync.py needed the same arithmetic over another machine's
@@ -400,7 +443,13 @@ def collect_new(runid, lane=DEFAULT_LANE):
     that lane wants."""
     rows = swarm_mailbox.read_siblings(runid, OBSERVER_SEAT)
     cursor = _load_cursor(runid, lane)
-    keep = _is_convo_row if lane == "convo" else None
+    lane_keep = _is_convo_row if lane == "convo" else None
+
+    def keep(row):
+        if _is_remote_mirror_row(row):
+            return False
+        return lane_keep(row) if lane_keep is not None else True
+
     return swarm_mailbox.fresh_rows_by_seat(rows, cursor, keep=keep)
 
 
@@ -495,11 +544,21 @@ def post_content(url, content, username=None):
 
 def _log_skipped(runid, rows, reason, lane=DEFAULT_LANE):
     """The never-drop-silently channel: skipped rows go to stderr AND a
-    durable state-dir file, then the cursor may advance past them."""
+    durable state-dir file, then the cursor may advance past them.
+
+    A row here reached this function because it WAS in `fresh` (delivery
+    failed after retries), which means it still carries
+    swarm_mailbox.SRC_FILE_KEY -- the in-memory-only source-file tag (see
+    collect_new). Strip it before this, the one place a sibling row gets
+    written back to disk in this module, or the "never persisted" guarantee
+    that key's docstring makes would be false the first time a delivery
+    failed."""
     os.makedirs(_mirror_dir(lane), exist_ok=True)
     path = _skipped_path(runid, lane)
     with open(path, "a") as fh:
         for row in rows:
+            if isinstance(row, dict) and swarm_mailbox.SRC_FILE_KEY in row:
+                row = {k: v for k, v in row.items() if k != swarm_mailbox.SRC_FILE_KEY}
             fh.write(json.dumps({"reason": reason, "row": row}) + "\n")
     sys.stderr.write(
         "discord mirror: SKIPPED %d row(s) (%s); recorded in %s\n"
