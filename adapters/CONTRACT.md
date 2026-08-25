@@ -128,7 +128,9 @@ THE HEARTBEAT'S OWN CURSOR past them -- the one under
 `adapters/claude-code/swarm-heartbeat.sh` and keyed on agent_id, not the CLI
 read cursor -- so rows are marked delivered to a reader that never saw them.
 
-**Probe, in order.**
+**Probe, in order.** `adapters/probe/` is this procedure, runnable: arm it,
+run the runtime, read the verdict. The steps below are what those scripts do,
+and what to do by hand for a runtime whose hook config is not Claude-shaped.
 
 1. Install a `PostToolUse`-style hook, no matcher, that does two things: prints
    a well-formed envelope carrying a unique passphrase, and copies its own
@@ -169,8 +171,8 @@ for them to drift. The adapter is then a README plus an idempotent `install.sh`
 that wires that script into the runtime's own hook config, detects an existing
 entry, never clobbers unrelated settings, and honours an env override naming
 the target file so tests never touch the real one (`COMMS_SETTINGS`,
-`COMMS_CODEX_HOOKS`). The reusable probe kit and installer checklist are
-tracked as issue #28.
+`COMMS_CODEX_HOOKS`). `adapters/probe/INSTALLER-CHECKLIST.md` is that build as a
+tick-list, derived from `adapters/codex/`.
 
 ## Classifying your runtime, in order
 
