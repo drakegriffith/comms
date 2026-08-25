@@ -908,6 +908,44 @@ def test_pull_reads_as_an_observer_seat_so_no_real_seat_is_excluded(fake_ssh):
     assert sync.pull("test-ye")["mirrored"] == 1
 
 
+# ---- pull is a confirmed-delivery consumer (issue #30) --------------------
+
+
+def test_pull_holds_the_cursor_when_the_local_mirror_write_fails(fake_ssh, monkeypatch):
+    """The failed-delivery path, at the consumer: the hub answered and the
+    rows were taken, then the LOCAL write blew up. The cursor must not have
+    moved, or those rows are gone -- nothing re-reads a hub row once this side
+    has counted it. This is the case the shared helper's take/confirm split
+    exists to make unrepresentable-by-accident."""
+
+    def boom(*a, **k):
+        raise OSError("state dir went read-only mid-write")
+
+    remote_post(fake_ssh, "test-yf", "bravo", "comment", "must not be lost")
+    real_append = sync.swarm_mailbox.append_mirrored
+    monkeypatch.setattr(sync.swarm_mailbox, "append_mirrored", boom)
+    with pytest.raises(OSError):
+        sync.pull("test-yf")
+    assert not os.path.exists(sync._cursor_path("studio", "test-yf"))
+    # Restore only THIS patch (monkeypatch.undo() would also tear down
+    # fake_ssh's PATH shim, which this fixture installed on the same object).
+    monkeypatch.setattr(sync.swarm_mailbox, "append_mirrored", real_append)
+    # positive control: the row really is still deliverable, not just uncounted
+    assert sync.pull("test-yf")["mirrored"] == 1
+    assert [r["text"] for r in swarm_mailbox.read_siblings("test-yf", "alpha")] == [
+        "must not be lost",
+    ]
+
+
+def test_pull_keeps_its_cursor_in_the_shared_helper_not_a_private_copy(fake_ssh):
+    """Pins the migration itself: a future edit that re-grows a local
+    load/save pair here (the thing #30 collapsed) fails this."""
+    cursor = sync._delivery_cursor("studio", "test-yg")
+    assert isinstance(cursor, swarm_mailbox.DeliveryCursor)
+    assert cursor.path == sync._cursor_path("studio", "test-yg")
+    assert not hasattr(sync, "_save_cursor")
+
+
 # ---- round trip ----------------------------------------------------------
 
 

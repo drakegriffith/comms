@@ -309,6 +309,16 @@ machine authored) and `fresh_rows_by_seat` (the per-seat cursor arithmetic,
 lifted out of `adapters/discord/mirror.py` so the two adapters share one
 implementation instead of two that drift).
 
+`pull` no longer keeps its own load/save pair around that arithmetic either:
+its cursor is a `swarm_mailbox.DeliveryCursor` (issue #30), which hands back
+`(fresh_rows, confirm)` and writes nothing until `confirm()` runs. This module
+still owns the KEY -- one cursor per `(host, runid)`, at
+`$COMMS_STATE_DIR/remote-sync/<host>/<runid>.cursor.json` -- and now shares
+the rule: the cursor moves only after `append_mirrored` returns, so an
+unreachable hub or a rejected row leaves it exactly where it was and the next
+pull sees those rows again. Nothing about the file's location or format
+changed; an existing cursor is read as-is.
+
 `lib/comms_machine.py` holds `machine_label()`. It used to live in
 `adapters/discord/mirror.py`, which meant this adapter imported a *display*
 adapter for a chat service in order to learn its own machine's name -- and the

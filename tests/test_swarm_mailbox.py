@@ -308,6 +308,159 @@ class TestSubscriptions(unittest.TestCase):
         self.assertEqual(texts, {"in A", "hi all", "direct"})   # NOT "in B"
 
 
+class TestDeliveryCursor(unittest.TestCase):
+    """The shared confirmed-delivery cursor (issue #30).
+
+    The contract these pin is the ORDER: a consumer takes rows, delivers them,
+    and only then confirms. The failure mode they exist to catch is a
+    reimplementation that commits when the rows are TAKEN -- which turns every
+    failed delivery into a silently dropped row, and which is why three
+    adapters each carrying their own copy of this pair was worth collapsing.
+    """
+
+    def setUp(self):
+        self.state = os.environ["COMMS_STATE_DIR"]
+        self.path = os.path.join(self.state, "delivery", "consumer.json")
+
+    def _rows(self, seat, *texts):
+        return [{"seat": seat, "at": "2026-08-25T00:00:0%d" % i, "text": t}
+                for i, t in enumerate(texts)]
+
+    def _cursor(self):
+        return mb.DeliveryCursor(self.path)
+
+    # ---- the happy path: confirmed rows are never handed over twice --------
+
+    def test_take_returns_every_row_when_there_is_no_cursor_yet(self):
+        fresh, _confirm = self._cursor().take(self._rows("alpha", "one", "two"))
+        self.assertEqual([r["text"] for r in fresh], ["one", "two"])
+
+    def test_confirmed_rows_do_not_come_back(self):
+        rows = self._rows("alpha", "one")
+        _fresh, confirm = self._cursor().take(rows)
+        confirm()
+        fresh, _ = self._cursor().take(rows)
+        self.assertEqual(fresh, [])
+
+    def test_only_rows_added_after_the_confirm_come_back(self):
+        _fresh, confirm = self._cursor().take(self._rows("alpha", "one"))
+        confirm()
+        fresh, _ = self._cursor().take(self._rows("alpha", "one", "two"))
+        self.assertEqual([r["text"] for r in fresh], ["two"])
+
+    # ---- THE FAILED-DELIVERY PATH -----------------------------------------
+
+    def test_unconfirmed_rows_are_delivered_again(self):
+        """The whole point: delivery failed, so confirm was never called, so
+        the cursor did not move and the rows come back next pass."""
+        rows = self._rows("alpha", "one", "two")
+        fresh, _confirm = self._cursor().take(rows)          # never confirmed
+        self.assertEqual([r["text"] for r in fresh], ["one", "two"])
+        again, _ = self._cursor().take(rows)
+        self.assertEqual([r["text"] for r in again], ["one", "two"])
+
+    def test_take_writes_nothing_at_all(self):
+        """Not just 'the counts did not move' -- no file appears, so a crash
+        between take and confirm is indistinguishable from never having run."""
+        self._cursor().take(self._rows("alpha", "one"))
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(os.listdir(self.state), [])
+
+    def test_a_partial_batch_that_fails_re_delivers_the_whole_batch(self):
+        """Counts cannot express 'row 1 landed, row 2 did not', so a caller
+        that cannot confirm the batch re-delivers all of it. Pinned because
+        the alternative -- confirming what 'probably' landed -- drops rows."""
+        rows = self._rows("alpha", "one", "two")
+        try:
+            _fresh, confirm = self._cursor().take(rows)
+            raise RuntimeError("delivery blew up after row one")
+        except RuntimeError:
+            pass  # confirm deliberately not called
+        again, _ = self._cursor().take(rows)
+        self.assertEqual([r["text"] for r in again], ["one", "two"])
+
+    # ---- persistence and failure behavior ---------------------------------
+
+    def test_confirm_creates_the_cursor_under_the_state_dir(self):
+        _fresh, confirm = self._cursor().take(self._rows("alpha", "one"))
+        confirm()
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertTrue(self.path.startswith(self.state))
+        with open(self.path) as fh:
+            self.assertEqual(json.load(fh), {"alpha": 1})
+
+    def test_confirm_leaves_no_tmp_file_behind(self):
+        _fresh, confirm = self._cursor().take(self._rows("alpha", "one"))
+        confirm()
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), ["consumer.json"])
+
+    def test_confirm_is_idempotent(self):
+        _fresh, confirm = self._cursor().take(self._rows("alpha", "one"))
+        confirm()
+        confirm()
+        self.assertEqual(self._cursor().load(), {"alpha": 1})
+
+    def test_a_malformed_cursor_file_replays_rather_than_skips(self):
+        """Corruption must fail toward re-delivery: seeing a row twice is
+        recoverable, never seeing it is not."""
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as fh:
+            fh.write("{not json")
+        self.assertEqual(self._cursor().load(), {})
+        fresh, _ = self._cursor().take(self._rows("alpha", "one"))
+        self.assertEqual([r["text"] for r in fresh], ["one"])
+
+    def test_a_cursor_file_holding_the_wrong_type_replays(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w") as fh:
+            json.dump(["alpha", 1], fh)
+        self.assertEqual(self._cursor().load(), {})
+
+    def test_load_of_a_missing_cursor_is_empty_not_an_error(self):
+        self.assertEqual(self._cursor().load(), {})
+
+    def test_confirm_raises_oserror_when_the_path_is_unwritable(self):
+        """The caller decides whether an unwritable state dir is fatal (the
+        CLI says no, the rows already reached stdout), so this must surface as
+        OSError rather than being swallowed here."""
+        blocker = os.path.join(self.state, "blocker")
+        with open(blocker, "w") as fh:
+            fh.write("i am a file, not a directory")
+        cursor = mb.DeliveryCursor(os.path.join(blocker, "sub", "cursor.json"))
+        _fresh, confirm = cursor.take(self._rows("alpha", "one"))
+        with self.assertRaises(OSError):
+            confirm()
+
+    # ---- keys, filters, and who owns what ---------------------------------
+
+    def test_two_paths_are_two_independent_consumers(self):
+        """The key is the caller's business: one consumer confirming must not
+        mark another's stream delivered (the discord mirror's lanes and the
+        remote sync's hosts are exactly this)."""
+        rows = self._rows("alpha", "one")
+        _fresh, confirm = self._cursor().take(rows)
+        confirm()
+        other = mb.DeliveryCursor(os.path.join(self.state, "delivery", "other.json"))
+        fresh, _ = other.take(rows)
+        self.assertEqual([r["text"] for r in fresh], ["one"])
+
+    def test_the_cursor_advances_over_rows_the_keep_filter_rejected(self):
+        """A filtered row is SEEN, just not returned -- otherwise the consumer
+        re-scans it on every pass forever (the mirror's lane rule)."""
+        rows = self._rows("alpha", "keep", "drop")
+        fresh, confirm = self._cursor().take(rows, keep=lambda r: r["text"] == "keep")
+        self.assertEqual([r["text"] for r in fresh], ["keep"])
+        confirm()
+        self.assertEqual(self._cursor().load(), {"alpha": 2})
+
+    def test_per_seat_counts_so_one_seats_traffic_does_not_hide_anothers(self):
+        first = self._rows("alpha", "a1")
+        _fresh, confirm = self._cursor().take(first)
+        confirm()
+        fresh, _ = self._cursor().take(first + self._rows("beta", "b1"))
+        self.assertEqual([r["text"] for r in fresh], ["b1"])
+
+
 class TestReadCursor(unittest.TestCase):
     """The CLI read hands each row over ONCE (issue #33).
 
