@@ -255,6 +255,11 @@ run_suite() {  # one fully-isolated pass
     row_count=$(printf '%s\n' "$ctx" | grep -c '^- \[')
     ck "(e) exactly 10 rows surfaced" "10" "$row_count"
     ck_contains "(e) overflow pointer present" "2 more, read the full board" "$ctx"
+    # The pointer must name --replay: the beat just advanced this agent's
+    # cursor past those rows, and a plain `comms read` (which keeps a cursor of
+    # its own since issue #33) would show the overflow reader nothing.
+    ck_contains "(e) overflow pointer points at a command that still shows them" \
+        "<seat> --replay" "$ctx"
 
     # -----------------------------------------------------------------------
     # (h) TWO RUNS armed at once do not cross-contaminate. agentH is enrolled in

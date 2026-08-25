@@ -162,6 +162,12 @@ inside topic `proj` is handed once to `read myrun beta` and once to
 `read myrun beta --topic proj`. Pick one form per reader. `--replay` prints the
 whole board and touches no cursor.
 
+**Truncating a read truncates the OUTPUT, not the cursor.**
+`bin/comms read myrun beta | head -5` shows five rows, but the cursor still
+advances over every row that view selected, so the rows `head` discarded will
+not come back on the next read. Consume a read whole; if one was already cut
+short, `bin/comms read myrun beta --replay` is how you get those rows back.
+
 ## Configuration
 
 Two environment knobs, both optional:

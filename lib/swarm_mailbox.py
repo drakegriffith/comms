@@ -474,6 +474,14 @@ def fresh_rows_by_seat(rows, cursor, keep=None):
 #   `read RUN seat` and once to `read RUN seat --topic X`. Pick one view per
 #   reader and stay on it.
 #
+# TRUNCATING A READ TRUNCATES THE OUTPUT, NOT THE CURSOR:
+#   `comms read ... | head -5` prints 5 rows and still advances over every row
+#   the view selected, because the cursor commits once the rows are written to
+#   stdout and this process cannot know what the far end of the pipe kept.
+#   Making the cursor track consumption would need an acknowledgement the CLI
+#   does not have (that is issue #30's confirmed-delivery helper). Documented
+#   in README.md and bin/comms instead, with --replay as the recovery.
+#
 # THE SUBS VIEW IS KEYED ON THE SUBSCRIPTION SET ITSELF (a digest of it), so
 #   re-subscribing a seat to a different topic set starts that set's own
 #   cursor at zero and re-delivers its slice, rather than silently skipping
