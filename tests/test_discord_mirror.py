@@ -40,6 +40,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     monkeypatch.delenv("COMMS_AUDIENCE", raising=False)
+    monkeypatch.setattr(mirror, "_PINNED_AUDIENCE", None)
     yield tmp_path
 
 
@@ -248,6 +249,34 @@ def test_main_once_unknown_audience_exits_2_before_touching_the_webhook(monkeypa
     assert "COMMS_AUDIENCE" in capsys.readouterr().err
 
 
+def test_main_pins_the_audience_so_a_later_file_edit_cannot_stall_the_loop(monkeypatch, tmp_path):
+    # F2 (verifier, PR #62): audience() used to re-read the secrets file per
+    # row, so a typo written while a follower ran raised inside run_once,
+    # was swallowed, and delivered nothing forever.
+    (tmp_path / "comms.env").write_text("COMMS_AUDIENCE=everyone\n")
+    monkeypatch.setattr(mirror, "follow_all", lambda interval, lane: 0)
+    assert mirror.main(["mirror.py", "--follow-all"]) == 0
+    (tmp_path / "comms.env").write_text("COMMS_AUDIENCE=simple\n")
+    assert mirror.audience() == "everyone"
+    row = {"seat": "a", "kind": "finding", "text": "t", "topic": "default"}
+    assert mirror.build_content(row) == "✅ Found something: t"
+
+
+def test_audience_unpinned_reads_the_environment_each_call(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    assert mirror.audience() == "everyone"
+    monkeypatch.setenv("COMMS_AUDIENCE", "engineer")
+    assert mirror.audience() == "engineer"
+
+
+def test_run_once_logged_names_the_exception_text(monkeypatch, capsys):
+    def boom(runid, lane):
+        raise ValueError("COMMS_AUDIENCE must be one of: engineer, everyone (got 'simple')")
+    monkeypatch.setattr(mirror, "run_once", boom)
+    assert mirror._run_once_logged("r1", "all") == 1
+    assert "COMMS_AUDIENCE" in capsys.readouterr().err
+
+
 def test_everyone_content_kinds_read_as_plain_sentences(monkeypatch):
     monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
     cases = {
@@ -307,6 +336,13 @@ def test_everyone_bridge_row_to_a_seat(monkeypatch):
     assert mirror.build_content(row) == "\U0001f4ac Sent a note to worker: needs review"
 
 
+def test_everyone_bridge_row_is_one_verb_whatever_the_kind(monkeypatch):
+    # F3: "Found something: Sent a note to" stacked two verbs.
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {"seat": "dispatch", "kind": "finding", "text": "-> scout: check the lock path", "topic": "default"}
+    assert mirror.build_content(row) == "\U0001f4ac Sent a note to scout: check the lock path"
+
+
 def test_engineer_mode_rendering_is_byte_identical_to_before(monkeypatch):
     # The default audience changes NOTHING for existing installs.
     monkeypatch.setenv("COMMS_AUDIENCE", "engineer")
@@ -343,6 +379,8 @@ def test_everyone_thread_title_is_file_name_then_repo(monkeypatch):
     assert mirror.thread_title("doc:comms/adapters/discord/mirror.py") == "mirror.py · comms"
     assert mirror.thread_title("doc:pathway/README.md") == "README.md · pathway"
     assert mirror.thread_title("doc:comms") == "comms"
+    assert mirror.thread_title("doc:comms/") == "comms"  # F5: no " · comms"
+    assert mirror.thread_title("doc:comms/adapters/") == "adapters · comms"
 
 
 def test_engineer_thread_title_unchanged():

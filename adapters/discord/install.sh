@@ -67,7 +67,7 @@ audience="${COMMS_AUDIENCE:-}"
 if [ -z "$audience" ] && [ -f "$SECRETS" ]; then
   audience="$(grep '^COMMS_AUDIENCE=' "$SECRETS" | tail -1 | cut -d= -f2- | tr -d "\"' ")"
 fi
-audience="${audience:-engineer}"
+audience="$(printf '%s' "${audience:-engineer}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
 case "$audience" in
   engineer|everyone) ;;
   *) echo "install: FAILED: COMMS_AUDIENCE=$audience; must be engineer or everyone" >&2; exit 2 ;;

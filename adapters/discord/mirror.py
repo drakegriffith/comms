@@ -6,6 +6,8 @@ WHY: each machine runs its OWN local mailbox (no cross-machine file sync).
 Discord is the merge point and the dashboard: every machine's mirror posts into
 the same channel, so a human watching one channel sees the whole fleet's
 conversation, prefixed [machine/seat] so provenance survives the merge.
+(COMMS_AUDIENCE=everyone trades that machine prefix for readability on
+purpose; the default keeps it. The mailbox row still carries the source.)
 
 WHAT IS MIRRORED: every row in the run's mailbox, whatever its kind. The kind
 vocabulary is deliberately NOT enforced here -- lib/swarm_mailbox.VALID_KINDS
@@ -515,17 +517,38 @@ AUDIENCE_EVERYONE = "everyone"
 AUDIENCES = (AUDIENCE_ENGINEER, AUDIENCE_EVERYONE)
 
 
+# Set by pin_audience() once main() has validated the value; a follower then
+# never re-reads the secrets file per row (two opens per row otherwise), and
+# an edit to the file while it runs cannot raise mid-loop and stall every
+# delivery behind a swallowed ValueError. Restart to pick up a change, which
+# is what the README says. None = unpinned: library callers and tests read
+# the environment on every call.
+_PINNED_AUDIENCE = None
+
+
 def audience():
-    """The configured audience, one of AUDIENCES. in: COMMS_AUDIENCE from the
-    environment, else the secrets file (see _find_config_var), else
-    AUDIENCE_ENGINEER. errors: ValueError naming both legal values when the
-    configured one is neither."""
+    """The configured audience, one of AUDIENCES. in: the value pinned by
+    pin_audience() if any, else COMMS_AUDIENCE from the environment, else
+    the secrets file (see _find_config_var), else AUDIENCE_ENGINEER.
+    errors: ValueError naming both legal values when the configured one is
+    neither."""
+    if _PINNED_AUDIENCE is not None:
+        return _PINNED_AUDIENCE
     value = (_find_config_var(AUDIENCE_VAR) or AUDIENCE_ENGINEER).strip().lower()
     if value not in AUDIENCES:
         raise ValueError(
             "%s must be one of: %s (got %r)" % (AUDIENCE_VAR, ", ".join(AUDIENCES), value)
         )
     return value
+
+
+def pin_audience(value=None):
+    """Fix audience() for the rest of this process to `value` (default: the
+    value resolved now). Called by main() after validation; None unpins."""
+    global _PINNED_AUDIENCE
+    _PINNED_AUDIENCE = None
+    _PINNED_AUDIENCE = audience() if value is None else value
+    return _PINNED_AUDIENCE
 
 
 def _report_bad_audience(exc):
@@ -545,7 +568,7 @@ def resolve_audience():
     human running --once, never discovered as a follower silently
     rendering the engineer vocabulary."""
     try:
-        return audience()
+        return pin_audience()
     except ValueError as exc:
         _report_bad_audience(exc)
         sys.exit(2)
@@ -728,14 +751,16 @@ def _build_content_everyone(kind, topic, text):
     if topic.startswith("@"):
         return "\U0001f4e8 Message to %s: %s" % (topic[1:], text)
 
-    label = EVERYONE_KIND_LABEL.get(kind, _EVERYONE_UNKNOWN_LABEL)
     m = _BRIDGE_RE.match(text)
     if m:
+        # One verb, whatever the kind: "Found something: Sent a note to" is
+        # two clauses for one act.
         target, summary = m.group(1), m.group(2)
         if _AGENT_ID_RE.match(target):
-            return "%s Sent a note to a helper agent: %s" % (label, summary)
-        return "%s Sent a note to %s: %s" % (label, target, summary)
+            return "\U0001f4ac Sent a note to a helper agent: %s" % summary
+        return "\U0001f4ac Sent a note to %s: %s" % (target, summary)
 
+    label = EVERYONE_KIND_LABEL.get(kind, _EVERYONE_UNKNOWN_LABEL)
     return "%s %s" % (label, text)
 
 
@@ -1114,7 +1139,8 @@ def thread_title(key):
         # The map is keyed on `key`, never on this title, so flipping the
         # audience after a thread exists renames nothing and opens nothing.
         repo, _, rel = title.partition("/")
-        title = "%s · %s" % (rel.rsplit("/", 1)[-1], repo)
+        name = rel.rstrip("/").rsplit("/", 1)[-1]
+        title = "%s · %s" % (name, repo) if name else repo
     return title[:THREAD_NAME_CAP] or str(key)[:THREAD_NAME_CAP]
 
 
@@ -1351,8 +1377,8 @@ def _run_once_logged(runid, lane):
         return run_once(runid, lane)
     except Exception as exc:
         sys.stderr.write(
-            "discord mirror: run_once failed for run %r (%s); continuing\n"
-            % (runid, exc.__class__.__name__)
+            "discord mirror: run_once failed for run %r (%s: %s); continuing\n"
+            % (runid, exc.__class__.__name__, exc)
         )
         return 1
 
@@ -1437,7 +1463,7 @@ def follow_all(interval, lane=DEFAULT_LANE):
 def main(argv):
     args = list(argv[1:])
     try:
-        audience()  # a typo is a usage error: 2, before any webhook is touched
+        pin_audience()  # a typo is a usage error: 2, before any webhook is touched
     except ValueError as exc:
         _report_bad_audience(exc)
         return 2

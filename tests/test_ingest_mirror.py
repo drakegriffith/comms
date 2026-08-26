@@ -37,6 +37,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     monkeypatch.delenv("COMMS_AUDIENCE", raising=False)
+    monkeypatch.setattr(mirror, "_PINNED_AUDIENCE", None)
     yield tmp_path
 
 

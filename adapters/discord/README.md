@@ -77,12 +77,12 @@ read. Same shapes, same precedence, different words:
 | `blocker` | `🚧 <text>` | `🚧 Stuck: <text>` |
 | `status` / unknown kind | `ℹ️ <text>` | `ℹ️ Update: <text>` |
 | unicast | `📨 to <seat>: <text>` | `📨 Message to <seat>: <text>` |
-| bridge row, bare agent id | `📬💬 sent to a subagent (aecd8555): <s>` | `💬 Sent a note to a helper agent: <s>` |
+| bridge row, bare agent id (17 hex) | `📬💬 sent to a subagent (aecd8555): <s>` | `💬 Sent a note to a helper agent: <s>` (any kind; a target that is not a 17-hex id is shown as typed) |
 | heard from mailbox | `👁️ read 3 row(s) from a, b` | `👀 Read 3 new messages from a and b` |
 | forum thread title | `comms/adapters/discord/mirror.py` | `mirror.py · comms` |
 
-Reading the value happens per render, so a follower picks up a change only
-when restarted; rows already posted are never rewritten. The author-line
+`main()` pins the value for the life of the process, so a follower picks up
+a change only when restarted; rows already posted are never rewritten. The author-line
 80-char cap and the mention/zero-width sanitizing apply to both. The thread
 map is keyed on the thread key, not the title, so switching audiences after
 a thread exists neither renames it nor opens a second one. An unlisted value

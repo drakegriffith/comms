@@ -363,8 +363,8 @@ forum thread: comms/adapters/discord/mirror.py           forum thread: mirror.py
 
 What `everyone` changes: every kind gets a verb a lay reader knows ("Found
 something", "Stuck", "Taking this on"); the machine name leaves the author
-line; the birth row shows the folder, never the full path; a subagent id
-never appears (it is "a helper agent"); forum threads are titled file name
+line; the birth row shows the folder, never the full path; a bridged
+subagent id becomes "a helper agent"; forum threads are titled file name
 first. The envelope on a direct message stays, because it is the one glyph a
 demo audience already reads as "one agent talking to another". Nothing about
 which rows are mirrored, which lane they land in, or when a thread opens
