@@ -101,7 +101,8 @@
 #       holds the full reasoning and the discarded alternatives.
 #     * It HINTS THE REPLY (Drake, "option 1", the companion line). A beat that
 #       delivers a row carrying `thread` appends one fixed line naming
-#       `comms post reply --to <seat> --thread <key> "<text>"`, so the reply
+#       `COMMS_RUN=<runid> comms post reply --to <seat> --thread <key>
+#       "<text>"`, so the reply
 #       carries the key and lands in the same thread. A beat with no threaded
 #       row renders byte-identical to before (REPLY_HINT).
 #   It runs BEFORE the per-run row pass, so a key learned on this beat filters
@@ -503,7 +504,7 @@ def process_run(runid):
             )
         )
     if any(r.get("thread") for r in emitted):
-        row_lines.append(REPLY_HINT)
+        row_lines.append(REPLY_HINT % runid)
     if overflow > 0:
         # --replay, NOT a plain read (issue #33): this hint is aimed at an
         # agent whose heartbeat cursor just advanced past the rows it is being
@@ -537,10 +538,12 @@ FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 # Appended once per beat, only when a delivered row carries a thread key, so
 # a beat with no threaded row renders byte-identical to before.
 REPLY_HINT = (
-    'Reply inside a thread with: comms post reply --to <seat> --thread <key> '
-    '"<text>" (seat and key as shown on the row; the reply then lands in the '
-    'same forum thread)'
-)
+    'Reply inside a thread with: COMMS_RUN=%s comms post reply --to <seat> '
+    '--thread <key> "<text>" (seat and key as shown on the row; the reply then '
+    'lands in the same forum thread)'
+)  # %s = the run this beat came from; the short form defaults to machine-ops
+   # otherwise (bin/comms:148), which is the wrong run for any other beat
+   # (verify seat, PR #63).
 
 
 def _auto_claim(runid, key):
@@ -566,7 +569,12 @@ def _auto_claim(runid, key):
     exactly the seats the claim concerns. Discord's dashboard lane still
     mirrors every row regardless of topic, so visibility is not reduced.
 
-    ONCE PER (seat, document, run): it rides `changed`, which add_topics
+    ONCE PER (agent, document, run): it rides `changed`, which add_topics
+    decides per agent_id. Two agent_ids sharing one seat name would each post
+    (verify seat, PR #63); shipped conventions keep agent_id 1:1 with seat
+    (bin/comms-poll-driver defaults --agent-id to the seat), and alive() still
+    needs two DISTINCT seats, so no false thread follows, only a duplicate line.
+    It rides `changed`, which add_topics
     decides under its lock, so a re-Write of the same file posts nothing and
     two racing beats cannot both post. A seatless participant enrols but has
     no file to write, so it posts nothing (and says nothing on stderr: that

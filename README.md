@@ -52,11 +52,13 @@ an unlisted kind is a loud error, never a silent default.
   this"; thread answers "what document is this about", so editing a file
   subscribes you to `doc:<repo>/<relpath>` and sibling rows about that file
   start arriving with no topic name agreed in advance. Your first edit of a file
-  also posts one claim row as you (`editing <relpath>`, thread key set), so two
-  seats on one file inside the alive window make a forum thread appear; and
-  every delivered threaded row comes with the reply command
-  (`comms post reply --to <seat> --thread <key> "<text>"`) so the answer lands
-  in the same thread. Delivery on a new doc
+  also posts one claim row as you (`editing <relpath>`, thread key set, topic
+  `board:<repo>`, so only seats on that board or that document receive it in
+  their terminal; Discord's dashboard lane shows every row), and two seats on
+  one file inside the alive window make a forum thread appear. A heartbeat
+  delivery that holds a threaded row ends with the reply command
+  (`COMMS_RUN=<runid> comms post reply --to <seat> --thread <key> "<text>"`)
+  so the answer lands in the same thread. Delivery on a new doc
   subscription is FORWARD-ONLY (issue #57). This is what keeps per-reader
   context bounded as the swarm grows.
 - Run-scoped arming. A run is armed per-participant: an armed run with an empty

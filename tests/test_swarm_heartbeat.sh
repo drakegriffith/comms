@@ -644,17 +644,17 @@ run_suite() {  # one fully-isolated pass
     claims_for() {  # claims_for <relpath> ; rows in seatS.jsonl carrying that key
         grep -c "\"thread\": \"doc:$REPONAME/$1\"" "$SEATFILE" 2>/dev/null | tr -d ' '
     }
-    ck "(u) the first Write of a doc posts exactly one claim row" "1" "$(claims_for sub/a.py)"
-    ck "(u) a re-Write of the same doc posts no second claim" "1" "$(claims_for sub/c.py)"
-    ck "(u) MultiEdit's first enrol posts a claim too" "1" "$(claims_for sub/m.py)"
+    ck "(v) the first Write of a doc posts exactly one claim row" "1" "$(claims_for sub/a.py)"
+    ck "(v) a re-Write of the same doc posts no second claim" "1" "$(claims_for sub/c.py)"
+    ck "(v) MultiEdit's first enrol posts a claim too" "1" "$(claims_for sub/m.py)"
     claim_a="$(grep "\"thread\": \"doc:$REPONAME/sub/a.py\"" "$SEATFILE")"
-    ck_contains "(u) the claim is kind=claim (status rows never count toward alive)" \
+    ck_contains "(v) the claim is kind=claim (status rows never count toward alive)" \
         '"kind": "claim"' "$claim_a"
-    ck_contains "(u) the claim rides the repo board topic" \
+    ck_contains "(v) the claim rides the repo board topic" \
         "\"topic\": \"board:$REPONAME\"" "$claim_a"
-    ck_contains "(u) the claim text names the repo-relative path" \
+    ck_contains "(v) the claim text names the repo-relative path" \
         '"text": "editing sub/a.py"' "$claim_a"
-    ck_contains "(u) the claim is posted as the participant's own seat" \
+    ck_contains "(v) the claim is posted as the participant's own seat" \
         '"seat": "seatS"' "$claim_a"
 
     #     No seat, no claim: a participant enrolled without --seat has no file
@@ -662,9 +662,9 @@ run_suite() {  # one fully-isolated pass
     enroll_agent "$RS" agentNoSeat "projN"
     files_before="$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
     run_hook_raw "$(write_payload agentNoSeat Write "$REPO/sub/a.py")"
-    ck_contains "(u) a seatless participant still enrols the key" \
+    ck_contains "(v) a seatless participant still enrols the key" \
         "doc:$REPONAME/sub/a.py" "$(part_topics "$RS" agentNoSeat)"
-    ck "(u) a seatless participant posts no claim (no new mailbox file)" \
+    ck "(v) a seatless participant posts no claim (no new mailbox file)" \
         "$files_before" "$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
 
     #     Subscribe-all is not narrowed (above) AND posts no claim: add_topics
@@ -684,12 +684,14 @@ run_suite() {  # one fully-isolated pass
     post_row "$RS" seatU finding "HINT-THREAD-ROW" "2026-08-01T00:00:03+00:00" \
         "otherproj" "doc:$REPONAME/sub/a.py"
     run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
-    ck_contains "(u) a threaded delivery carries the reply hint" \
+    ck_contains "(v) a threaded delivery carries the reply hint" \
         "comms post reply --to <seat> --thread <key>" "$ctx"
+    ck_contains "(v) the reply hint names the run the beat came from" \
+        "COMMS_RUN=$RS comms post reply" "$ctx"
     post_row "$RS" seatU comment "PLAIN-ROW" "2026-08-01T00:00:04+00:00" "projS"
     run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
-    ck_contains "(u) control: the plain row is delivered" "PLAIN-ROW" "$ctx"
-    ck_absent "(u) an unthreaded delivery carries no reply hint" \
+    ck_contains "(v) control: the plain row is delivered" "PLAIN-ROW" "$ctx"
+    ck_absent "(v) an unthreaded delivery carries no reply hint" \
         "comms post reply" "$ctx"
 
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
