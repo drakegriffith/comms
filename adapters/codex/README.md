@@ -7,19 +7,27 @@ through Codex's own native hook surface. There is no Codex-specific heartbeat;
 
 ## What is proven
 
-Proven 2026-08-21 (recorded as claude-harness issue 129 in the origin harness):
+Measured 2026-08-26 on codex-cli 0.148.0:
 
-- codex 0.148.0 runs Claude-shaped hooks.json PostToolUse hooks with a
-  byte-compatible payload. The heartbeat script needs no changes to run under
-  Codex.
-- Codex injects `hookSpecificOutput.additionalContext` from the hook's stdout,
-  the same contract Claude Code honours, so mailbox rows reach the running
-  agent the same way.
+- Codex loads `~/.codex/hooks.json` only in the WRAPPED shape
+  `{"hooks": {"PostToolUse": [...]}}`. A flat top-level event map
+  `{"PostToolUse": [...]}` is rejected and the hook never fires (probe1 and
+  probe5: 0 fires, with matcher `"*"` and with matcher `".*"`).
+- The wrapped shape fires on every tool call (probe4: 3 fires with matcher
+  `".*"`; probe6: 1 fire with matcher `"*"`).
+- A file holding both keys fires nothing (probe3), so the installed config must
+  hold exactly one shape.
+- The 2026-08-21 proof (claude-harness issue 129, comment 2) used the wrapped
+  shape. The installer diverged from that evidence and wrote the flat shape,
+  so the wiring it installed on 2026-08-25 delivered zero rows.
 - Headless runs need `--dangerously-bypass-hook-trust`, because hook trust is
   hash-pinned and untrusted hooks are skipped SILENTLY. A skipped hook looks
   identical to a quiet one: if delivery seems dead under headless codex, check
-  trust before debugging the mailbox. The delivery oracle is the telemetry log
-  (`swarm-heartbeat.log` in the state dir), not the agent's self-report.
+  trust before debugging the mailbox.
+
+Failure signature: a flat `hooks.json` is skipped with no warning at all, so
+ the delivery oracle is the telemetry log (`swarm-heartbeat.log` in the state
+ dir), never the absence of an error.
 
 ## Install
 
