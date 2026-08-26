@@ -30,6 +30,11 @@ build_content, format_row.
            ingest_mirror.py from the heartbeat telemetry log, NOT this
            module's mailbox tail) round out the three visible verbs.
 
+  audience: COMMS_AUDIENCE picks the vocabulary all of the above speak,
+           "engineer" (default, everything described here) or "everyone"
+           (plain sentences, no machine names or paths). See the audience
+           section below; the mailbox rows never change.
+
 Because a single POST's Discord `username` is one value, rows batched into
 one message must share an author -- chunk_rows batches per (seat), never
 mixing two seats into the same POST even when they would fit under the
@@ -400,13 +405,15 @@ def _is_threaded_row(row):
     return bool(row.get(swarm_threads.THREAD_FIELD))
 
 
-def _find_webhook_url_for_var(var):
-    """Resolve VAR's webhook URL with NO side effects (no stderr, no exit):
-    returns the URL or None. Env var first, else parsed from the secrets
-    file. This is the one env-or-secrets-file resolution path in this
-    module -- _find_webhook_url (lane-keyed) and find_forum_webhook_url
-    (the forum board's non-lane var) both delegate here, so a NEW webhook
-    var resolves the same way as the lane vars without needing a lane."""
+def _find_config_var(var):
+    """Resolve VAR with NO side effects (no stderr, no exit): returns the
+    value or None. Env var first, else parsed from the secrets file. This
+    is the one env-or-secrets-file resolution path in this module -- every
+    webhook var and the audience switch (AUDIENCE_VAR) resolve through it.
+    The secrets file doubles as the install's only config file on purpose:
+    a launchd follower inherits no shell, so an `export` in a terminal
+    never reaches it, while a line in ~/.secrets/comms.env reaches every
+    follower on the machine."""
     url = os.environ.get(var)
     if url:
         return url
@@ -429,7 +436,7 @@ def _find_webhook_url_for_var(var):
 def _resolve_webhook_url_for_var(var):
     """Same as _find_webhook_url_for_var but exits 2 with the exact drop-in
     line for VAR when absent. Never prints the value."""
-    url = _find_webhook_url_for_var(var)
+    url = _find_config_var(var)
     if url:
         return url
     sys.stderr.write(
@@ -449,7 +456,7 @@ def _find_webhook_url(lane=DEFAULT_LANE):
     launchd-safety check, see module docstring LAUNCHD SAFETY -- can test
     for presence quietly instead of triggering the multi-line drop-in
     message once per poll."""
-    return _find_webhook_url_for_var(LANE_SECRET_VARS[lane])
+    return _find_config_var(LANE_SECRET_VARS[lane])
 
 
 def resolve_webhook_url(lane=DEFAULT_LANE):
@@ -467,7 +474,7 @@ def find_forum_webhook_url():
     stays because it says WHICH webhook without the caller knowing the lane
     vocabulary, and because callers outside this module already reach for
     it. There is still no lane named "forum": the lane is "board"."""
-    return _find_webhook_url_for_var(FORUM_SECRET_VAR)
+    return _find_config_var(FORUM_SECRET_VAR)
 
 
 def resolve_forum_webhook_url():
@@ -487,6 +494,63 @@ machine_label = comms_machine.machine_label
 
 # ---- author (Discord webhook `username`) ----------------------------------
 # Zero-width chars a seat/model name could smuggle in to make a rendered
+# ---- audience: who is reading the channel ----------------------------------
+# One binary switch, read once per render, that picks the VOCABULARY every
+# renderer in this adapter speaks (build_author, build_content, thread_title,
+# build_read_content; ingest_mirror.py reuses them). The mailbox rows and the
+# terminal output never change -- this is the window's language, not the
+# agents'. The system cannot compute who is reading a Discord channel, which
+# is the reason this is a parameter at all (design doctrine D7).
+#
+#   engineer  (default) the rendering every existing install already has
+#   everyone  plain sentences: "Found something:", "Message to <seat>:",
+#             no machine names, no full paths, no bare ids
+#
+# The vocabulary is CLOSED: an unlisted value raises here and exits 2 in
+# main() naming both values. A silent fallback would leave a person who
+# typed COMMS_AUDIENCE=simple wondering why nothing changed.
+AUDIENCE_VAR = "COMMS_AUDIENCE"
+AUDIENCE_ENGINEER = "engineer"
+AUDIENCE_EVERYONE = "everyone"
+AUDIENCES = (AUDIENCE_ENGINEER, AUDIENCE_EVERYONE)
+
+
+def audience():
+    """The configured audience, one of AUDIENCES. in: COMMS_AUDIENCE from the
+    environment, else the secrets file (see _find_config_var), else
+    AUDIENCE_ENGINEER. errors: ValueError naming both legal values when the
+    configured one is neither."""
+    value = (_find_config_var(AUDIENCE_VAR) or AUDIENCE_ENGINEER).strip().lower()
+    if value not in AUDIENCES:
+        raise ValueError(
+            "%s must be one of: %s (got %r)" % (AUDIENCE_VAR, ", ".join(AUDIENCES), value)
+        )
+    return value
+
+
+def _report_bad_audience(exc):
+    sys.stderr.write(
+        "discord mirror: %s\n"
+        "  set it in ~/.secrets/comms.env (or the environment):\n"
+        "  %s=%s   # plain-language rendering for non-engineers\n"
+        "  %s=%s   # the default\n"
+        % (exc, AUDIENCE_VAR, AUDIENCE_EVERYONE, AUDIENCE_VAR, AUDIENCE_ENGINEER)
+    )
+
+
+def resolve_audience():
+    """audience(), but exits 2 with the drop-in lines when the value is not
+    legal (the same contract as resolve_webhook_url). main() checks the
+    value first thing and returns 2 itself, so a typo is caught by the
+    human running --once, never discovered as a follower silently
+    rendering the engineer vocabulary."""
+    try:
+        return audience()
+    except ValueError as exc:
+        _report_bad_audience(exc)
+        sys.exit(2)
+
+
 # author line invisible-but-present; stripped before ever leaving this
 # process. @everyone/@here are stripped too -- Discord's webhook username
 # field is plain text, not a mention, but a seat literally named "@everyone"
@@ -523,6 +587,7 @@ def build_author(seat, identity, machine):
     identity = identity or {}
     model = identity.get("model")
     project = identity.get("project")
+    everyone = audience() == AUDIENCE_EVERYONE
     # Discord rejects a webhook `username` over AUTHOR_MAX_LEN with HTTP 400,
     # which the mirror does not retry, so the row would be skipped for good
     # (#59: 165 rows lost to 93-101 char lines). Shed the least identifying
@@ -532,8 +597,12 @@ def build_author(seat, identity, machine):
         if use_model and model:
             parts.append(str(model))
         if use_project and project:
-            parts.append("on %s" % project)
-        if parts:
+            parts.append(("working on %s" if everyone else "on %s") % project)
+        if everyone:
+            # "<seat> · <model>, working on <project>": no machine name, a
+            # lay reader has no use for which computer the seat sits on.
+            author = seat if not parts else "%s · %s" % (seat, ", ".join(parts))
+        elif parts:
             author = "%s · %s (%s)" % (seat, " ".join(parts), machine)
         else:
             author = "%s (%s)" % (seat, machine)
@@ -541,6 +610,25 @@ def build_author(seat, identity, machine):
         if len(author) <= AUTHOR_MAX_LEN:
             return author
     return author[:AUTHOR_MAX_LEN]
+
+
+def build_read_content(n, seats):
+    """The "heard from mailbox" verb's content (posted by ingest_mirror.py
+    from the heartbeat telemetry): `n` rows were injected into a seat's
+    context, sent by `seats` (first-seen order, may be empty when the
+    reconstruction found none). Lives here, beside the other verbs, so one
+    audience switch covers all three."""
+    if audience() == AUDIENCE_EVERYONE:
+        noun = "message" if n == 1 else "messages"
+        if not seats:
+            return "\U0001f440 Read %d new %s" % (n, noun)
+        if len(seats) == 1:
+            who = seats[0]
+        else:
+            who = "%s and %s" % (", ".join(seats[:-1]), seats[-1])
+        return "\U0001f440 Read %d new %s from %s" % (n, noun, who)
+    seats_label = ", ".join(seats) if seats else "unknown sender(s)"
+    return "\U0001f441️ read %d row(s) from %s" % (n, seats_label)
 
 
 # ---- content (kind -> emoji prefix) ----------------------------------------
@@ -569,6 +657,19 @@ _SESSION_STARTED_RE = re.compile(r"^session started in (.+)$")
 _BRIDGE_RE = re.compile(r"^-> ([^:]+): (.*)$")
 _AGENT_ID_RE = re.compile(r"^[0-9a-f]{17}$")
 
+# The "everyone" vocabulary: one emoji plus a plain verb phrase per kind, so
+# a reader who has never seen a mailbox row knows what happened. Kept as a
+# table beside KIND_EMOJI so adding a kind means adding one row to each.
+EVERYONE_KIND_LABEL = {
+    "finding": "✅ Found something:",
+    "comment": "\U0001f4ac",                # speech balloon, no verb: it IS the comment
+    "reply": "↩️ Replying:",
+    "claim": "\U0001f4cc Taking this on:",
+    "blocker": "\U0001f6a7 Stuck:",
+    "status": "ℹ️ Update:",
+}
+_EVERYONE_UNKNOWN_LABEL = EVERYONE_KIND_LABEL["status"]
+
 
 def build_content(row):
     """This row's Discord message CONTENT (no author -- that is the webhook
@@ -589,6 +690,8 @@ def build_content(row):
     text = str(row.get("text", ""))[:TEXT_CAP].replace("\n", " ")
     kind = row.get("kind", "?")
     topic = str(row.get("topic", ""))
+    if audience() == AUDIENCE_EVERYONE:
+        return _build_content_everyone(kind, topic, text)
 
     if kind == "status":
         m = _SESSION_STARTED_RE.match(text)
@@ -608,6 +711,32 @@ def build_content(row):
         return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), rendered)
 
     return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), text)
+
+
+def _build_content_everyone(kind, topic, text):
+    """build_content for AUDIENCE_EVERYONE: the same four shapes in the same
+    precedence, spoken plainly. No filesystem path (the born verb shows the
+    folder name), no bare agent id (a helper agent is "a helper agent"),
+    the envelope stays on direct messages because it is the one glyph a
+    demo audience already reads as "one agent talking to another"."""
+    if kind == "status":
+        m = _SESSION_STARTED_RE.match(text)
+        if m:
+            folder = os.path.basename(m.group(1).rstrip("/")) or m.group(1)
+            return "\U0001f44b Joined, working in %s" % folder
+
+    if topic.startswith("@"):
+        return "\U0001f4e8 Message to %s: %s" % (topic[1:], text)
+
+    label = EVERYONE_KIND_LABEL.get(kind, _EVERYONE_UNKNOWN_LABEL)
+    m = _BRIDGE_RE.match(text)
+    if m:
+        target, summary = m.group(1), m.group(2)
+        if _AGENT_ID_RE.match(target):
+            return "%s Sent a note to a helper agent: %s" % (label, summary)
+        return "%s Sent a note to %s: %s" % (label, target, summary)
+
+    return "%s %s" % (label, text)
 
 
 def format_row(row, machine, identity=None):
@@ -980,6 +1109,12 @@ def thread_title(key):
     title = str(key)
     if title.startswith(swarm_mailbox.THREAD_KEY_PREFIX):
         title = title[len(swarm_mailbox.THREAD_KEY_PREFIX):]
+    if audience() == AUDIENCE_EVERYONE and "/" in title:
+        # "mirror.py · comms": the file name first, the repository after.
+        # The map is keyed on `key`, never on this title, so flipping the
+        # audience after a thread exists renames nothing and opens nothing.
+        repo, _, rel = title.partition("/")
+        title = "%s · %s" % (rel.rsplit("/", 1)[-1], repo)
     return title[:THREAD_NAME_CAP] or str(key)[:THREAD_NAME_CAP]
 
 
@@ -1301,6 +1436,11 @@ def follow_all(interval, lane=DEFAULT_LANE):
 
 def main(argv):
     args = list(argv[1:])
+    try:
+        audience()  # a typo is a usage error: 2, before any webhook is touched
+    except ValueError as exc:
+        _report_bad_audience(exc)
+        return 2
     interval = float(os.environ.get("COMMS_MIRROR_INTERVAL", "5"))
     lane = DEFAULT_LANE
     if "--interval" in args:

@@ -39,6 +39,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
     monkeypatch.delenv("DISCORD_COMMS_FORUM_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
+    monkeypatch.delenv("COMMS_AUDIENCE", raising=False)
     yield tmp_path
 
 
@@ -204,6 +205,161 @@ def test_build_content_bridge_row_precedence_under_unicast():
         "topic": "@bravo",
     }
     assert mirror.build_content(row) == "\U0001f4e8 to bravo: -> aecd8555b8a274737: comment"
+
+
+# ---- audience: engineer (default) vs everyone -------------------------------
+
+
+def test_audience_defaults_to_engineer():
+    assert mirror.audience() == "engineer"
+
+
+def test_audience_reads_env_var(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    assert mirror.audience() == "everyone"
+
+
+def test_audience_reads_secrets_file_when_env_unset(tmp_path):
+    # launchd followers inherit no shell; the one file every install already
+    # edits is the config surface.
+    (tmp_path / "comms.env").write_text("COMMS_AUDIENCE=everyone\n")
+    assert mirror.audience() == "everyone"
+
+
+def test_audience_unknown_value_is_a_loud_error(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "simple")
+    with pytest.raises(ValueError) as exc:
+        mirror.audience()
+    assert "engineer" in str(exc.value) and "everyone" in str(exc.value)
+
+
+def test_resolve_audience_unknown_value_exits_2_naming_both_values(monkeypatch, capsys):
+    monkeypatch.setenv("COMMS_AUDIENCE", "simple")
+    with pytest.raises(SystemExit) as exc:
+        mirror.resolve_audience()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "COMMS_AUDIENCE" in err and "engineer" in err and "everyone" in err
+
+
+def test_main_once_unknown_audience_exits_2_before_touching_the_webhook(monkeypatch, capsys):
+    monkeypatch.setenv("COMMS_AUDIENCE", "simple")
+    assert mirror.main(["mirror.py", "--once", RUNID]) == 2
+    assert "COMMS_AUDIENCE" in capsys.readouterr().err
+
+
+def test_everyone_content_kinds_read_as_plain_sentences(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    cases = {
+        "finding": "✅ Found something: t",
+        "comment": "\U0001f4ac t",
+        "reply": "↩️ Replying: t",
+        "claim": "\U0001f4cc Taking this on: t",
+        "blocker": "\U0001f6a7 Stuck: t",
+        "status": "ℹ️ Update: t",
+    }
+    for kind, expected in cases.items():
+        row = {"seat": "a", "kind": kind, "text": "t", "topic": "default"}
+        assert mirror.build_content(row) == expected
+
+
+def test_everyone_unknown_kind_falls_back_to_update(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {"seat": "a", "kind": "mystery", "text": "t", "topic": "default"}
+    assert mirror.build_content(row) == "ℹ️ Update: t"
+
+
+def test_everyone_unicast_keeps_the_envelope_and_names_the_recipient(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {"seat": "alpha", "kind": "reply", "text": "derived, not typed", "topic": "@bravo"}
+    assert mirror.build_content(row) == "\U0001f4e8 Message to bravo: derived, not typed"
+
+
+def test_everyone_agent_born_shows_the_folder_name_not_the_path(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {
+        "seat": "alpha",
+        "kind": "status",
+        "text": "session started in /Users/drake/code/comms",
+        "topic": "default",
+    }
+    content = mirror.build_content(row)
+    assert content == "\U0001f44b Joined, working in comms"
+    assert "/Users/" not in content
+
+
+def test_everyone_bridge_row_never_shows_a_bare_agent_id(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {
+        "seat": "dispatch",
+        "kind": "comment",
+        "text": "-> aecd8555b8a274737: comment",
+        "topic": "default",
+    }
+    content = mirror.build_content(row)
+    assert "aecd8555b8a274737" not in content
+    assert content == "\U0001f4ac Sent a note to a helper agent: comment"
+
+
+def test_everyone_bridge_row_to_a_seat(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    row = {"seat": "dispatch", "kind": "comment", "text": "-> worker: needs review", "topic": "default"}
+    assert mirror.build_content(row) == "\U0001f4ac Sent a note to worker: needs review"
+
+
+def test_engineer_mode_rendering_is_byte_identical_to_before(monkeypatch):
+    # The default audience changes NOTHING for existing installs.
+    monkeypatch.setenv("COMMS_AUDIENCE", "engineer")
+    row = {"seat": "alpha", "kind": "finding", "text": "direct msg", "topic": "@bravo"}
+    assert mirror.build_content(row) == "\U0001f4e8 to bravo: direct msg"
+    row = {"seat": "a", "kind": "finding", "text": "t", "topic": "default"}
+    assert mirror.build_content(row) == "\U0001f4ec✅ t"
+
+
+def test_everyone_author_drops_the_machine_and_reads_as_prose(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    identity = {"model": "Kimi K3", "project": "agent-os", "area": "hooks/"}
+    assert mirror.build_author("kimi1", identity, "macbook") == "kimi1 · Kimi K3, working on agent-os"
+    assert mirror.build_author("kimi1", {"model": "Opus 5"}, "macbook") == "kimi1 · Opus 5"
+    assert mirror.build_author("kimi1", {"project": "agent-os"}, "macbook") == "kimi1 · working on agent-os"
+    assert mirror.build_author("alpha", None, "studio") == "alpha"
+
+
+def test_everyone_author_still_respects_the_80_char_cap(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    identity = {"model": "M" * 30, "project": "P" * 30}
+    author = mirror.build_author("s" * 30, identity, "studio")
+    assert len(author) <= mirror.AUTHOR_MAX_LEN
+    assert author.startswith("s" * 30)
+
+
+def test_everyone_author_is_still_sanitized(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    assert mirror.build_author("@everyone", None, "studio") == "everyone"
+
+
+def test_everyone_thread_title_is_file_name_then_repo(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    assert mirror.thread_title("doc:comms/adapters/discord/mirror.py") == "mirror.py · comms"
+    assert mirror.thread_title("doc:pathway/README.md") == "README.md · pathway"
+    assert mirror.thread_title("doc:comms") == "comms"
+
+
+def test_engineer_thread_title_unchanged():
+    assert mirror.thread_title("doc:comms/adapters/discord/mirror.py") == "comms/adapters/discord/mirror.py"
+
+
+def test_build_read_content_engineer_is_the_existing_line():
+    assert mirror.build_read_content(3, ["claude", "kimi"]) == "\U0001f441️ read 3 row(s) from claude, kimi"
+    assert mirror.build_read_content(2, []) == "\U0001f441️ read 2 row(s) from unknown sender(s)"
+
+
+def test_build_read_content_everyone_counts_messages_in_words(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    assert mirror.build_read_content(3, ["claude", "kimi"]) == "\U0001f440 Read 3 new messages from claude and kimi"
+    assert mirror.build_read_content(1, ["claude"]) == "\U0001f440 Read 1 new message from claude"
+    assert mirror.build_read_content(4, ["a", "b", "c"]) == "\U0001f440 Read 4 new messages from a, b and c"
+    assert mirror.build_read_content(2, []) == "\U0001f440 Read 2 new messages"
 
 
 # ---- build_author: identity roster, sanitization ---------------------------

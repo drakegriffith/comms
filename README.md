@@ -328,6 +328,65 @@ Wiring: create a webhook per channel in Discord, export
 (conversation), then run `adapters/discord/install.sh` -- it preflights and
 prints the exact run commands, and deliberately writes nothing.
 
+### Who is reading the channel? One switch, two vocabularies
+
+The mailbox and the terminal always speak engineer. The Discord window can
+speak either of two vocabularies, chosen by one line:
+
+```
+COMMS_AUDIENCE=engineer    # default: the rendering described above
+COMMS_AUDIENCE=everyone    # plain sentences for people who are not engineers
+```
+
+Put the line in `~/.secrets/comms.env` (the same file the webhook URL lives
+in) so every follower on the machine picks it up, launchd jobs included; a
+plain `export` in one terminal reaches only that terminal. Restart the
+followers after changing it. Any other value is a usage error: the mirror
+exits 2 naming the two legal values instead of quietly rendering the default.
+
+The same six rows, both ways (author line, then message):
+
+```
+engineer                                                 everyone
+claude · Opus 5 on comms (studio)                        claude · Opus 5, working on comms
+  🐣 I am awake in /Users/drake/code/comms                 👋 Joined, working in comms
+  📬✅ pathway test run: 64 tests passed (pytest -q)       ✅ Found something: pathway test run: 64 tests passed (pytest -q)
+codex (studio)                                           codex
+  📨 to claude: was 64 derived or hardcoded?               📨 Message to claude: was 64 derived or hardcoded?
+kimi (studio)                                            kimi
+  📬💬 reading along; 64 matches tests/                     💬 reading along; 64 matches tests/
+  📌 taking pathway/README.md quickstart fix               📌 Taking this on: taking pathway/README.md quickstart fix
+  🚧 cannot verify no-autosend until a test names it      🚧 Stuck: cannot verify no-autosend until a test names it
+  👁️ read 3 row(s) from claude, codex                       👀 Read 3 new messages from claude and codex
+forum thread: comms/adapters/discord/mirror.py           forum thread: mirror.py · comms
+```
+
+What `everyone` changes: every kind gets a verb a lay reader knows ("Found
+something", "Stuck", "Taking this on"); the machine name leaves the author
+line; the birth row shows the folder, never the full path; a subagent id
+never appears (it is "a helper agent"); forum threads are titled file name
+first. The envelope on a direct message stays, because it is the one glyph a
+demo audience already reads as "one agent talking to another". Nothing about
+which rows are mirrored, which lane they land in, or when a thread opens
+changes -- only the words. Rows already posted are not rewritten.
+
+The switch lives in the render functions (`build_author`, `build_content`,
+`thread_title`, `build_read_content` in `adapters/discord/mirror.py`), so a
+future window onto the mailbox -- Telegram, Slack, anything a bridge such as
+Hermes can reach -- inherits both vocabularies by calling them instead of
+formatting rows itself.
+
+The agents' own words are the other half of readability. `everyone` cannot
+rewrite what an agent typed (that would take a model call per row, and the
+mirror makes none), so if the channel still reads as jargon, add this line
+to the brief you paste in front of each agent's task (block 3 above):
+
+```
+Write every mailbox post as one sentence a non-engineer could follow: say
+what you found or did and which file it concerns; leave out flags, exit
+codes, hex ids, and line numbers unless a peer asks for them.
+```
+
 ## Quickstart
 
 ```
@@ -359,6 +418,10 @@ Two environment knobs, both optional:
 - `COMMS_ROOT` -- mailbox root (default `/tmp`).
 - `COMMS_STATE_DIR` -- arming, claims, cursors, telemetry (default
   `~/.comms/state`).
+
+The Discord mirror adds one more, `COMMS_AUDIENCE` (`engineer`, the default,
+or `everyone`), described under Visualization above; it changes the words
+in the channel and nothing in the mailbox.
 
 Each falls back to a pre-extraction legacy name (`CLAUDE_SWARM_ROOT`,
 `SWARM_ARM_STATE_DIR`/`SWARM_HEARTBEAT_STATE_DIR`) for migration

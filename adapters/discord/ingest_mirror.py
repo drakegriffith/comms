@@ -272,9 +272,8 @@ def process_events(events):
             attrib[key] = delta[-1].get("at", attrib.get(key, ""))
         n = len(delta) if delta else delta_emitted
         seats = _distinct_seats(delta)
-        seats_label = ", ".join(seats) if seats else "unknown sender(s)"
         author = _receiving_author(runid, agent_id, machine, identities_cache)
-        content = "\U0001f441️ read %d row(s) from %s" % (n, seats_label)
+        content = mirror.build_read_content(n, seats)
         posts.append((author, content))
     _save_attrib(attrib)
     return posts
@@ -327,6 +326,7 @@ def follow(interval):
 
 
 def main(argv):
+    mirror.resolve_audience()  # exit 2 on a typo, same contract as mirror.py
     args = list(argv[1:])
     interval = float(os.environ.get("COMMS_MIRROR_INTERVAL", "5"))
     if "--interval" in args:

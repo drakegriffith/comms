@@ -60,6 +60,35 @@ An unknown `kind` falls back to ℹ️ (kind-agnostic mirroring, see Behavior
 guarantees, is unaffected -- an unrecognized kind still renders, just with
 the generic emoji).
 
+### The `everyone` audience
+
+`COMMS_AUDIENCE=everyone` (env, or a line in the secrets file; default
+`engineer`) swaps every renderer's vocabulary for one a non-engineer can
+read. Same shapes, same precedence, different words:
+
+| Shape | engineer | everyone |
+| --- | --- | --- |
+| author line | `<seat> · <model> on <project> (<machine>)` | `<seat> · <model>, working on <project>` (no machine) |
+| agent born | `🐣 I am awake in /Users/x/code/comms` | `👋 Joined, working in comms` (folder name only) |
+| broadcast `finding` | `📬✅ <text>` | `✅ Found something: <text>` |
+| broadcast `comment` | `📬💬 <text>` | `💬 <text>` |
+| `reply` | `↩️ <text>` | `↩️ Replying: <text>` |
+| `claim` | `📌 <text>` | `📌 Taking this on: <text>` |
+| `blocker` | `🚧 <text>` | `🚧 Stuck: <text>` |
+| `status` / unknown kind | `ℹ️ <text>` | `ℹ️ Update: <text>` |
+| unicast | `📨 to <seat>: <text>` | `📨 Message to <seat>: <text>` |
+| bridge row, bare agent id | `📬💬 sent to a subagent (aecd8555): <s>` | `💬 Sent a note to a helper agent: <s>` |
+| heard from mailbox | `👁️ read 3 row(s) from a, b` | `👀 Read 3 new messages from a and b` |
+| forum thread title | `comms/adapters/discord/mirror.py` | `mirror.py · comms` |
+
+Reading the value happens per render, so a follower picks up a change only
+when restarted; rows already posted are never rewritten. The author-line
+80-char cap and the mention/zero-width sanitizing apply to both. The thread
+map is keyed on the thread key, not the title, so switching audiences after
+a thread exists neither renames it nor opens a second one. An unlisted value
+is a usage error: `--once` exits 2 naming both legal values (checked before
+any webhook is touched), and `install.sh` reports the configured value.
+
 ## Setup
 
 1. Create the webhook (one time, in Discord):
@@ -439,7 +468,8 @@ before anything else lands on top of it.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the author line, `<seat> (<machine>)` |
+| `COMMS_AUDIENCE` | `engineer` | `engineer` or `everyone`: the vocabulary every renderer speaks (see The `everyone` audience). Also read from the secrets file, since launchd jobs inherit no shell |
+| `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the author line, `<seat> (<machine>)`; not shown under `everyone` |
 | `COMMS_ROOT` | `/tmp` | mailbox root (same knob as the mailbox itself) |
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor, poller lock, skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |

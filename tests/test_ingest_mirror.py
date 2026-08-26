@@ -36,6 +36,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("COMMS_SECRETS_FILE", str(tmp_path / "comms.env"))
     monkeypatch.delenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
+    monkeypatch.delenv("COMMS_AUDIENCE", raising=False)
     yield tmp_path
 
 
@@ -214,6 +215,17 @@ def test_process_events_aggregates_one_beat_into_one_post_not_per_row():
     assert len(posts) == 1  # ONE post for a 3-row beat, not three
     author, content = posts[0]
     assert content == "\U0001f441️ read 3 row(s) from beta, gamma"
+
+
+def test_process_events_everyone_audience_reads_as_a_sentence(monkeypatch):
+    monkeypatch.setenv("COMMS_AUDIENCE", "everyone")
+    _enroll("agentA", "alpha", topics=[], model="Opus 5", project="comms")
+    swarm_mailbox.post(RUNID, "beta", "finding", "row1", topic="default")
+    swarm_mailbox.post(RUNID, "gamma", "comment", "row2", topic="default")
+    events = [{"agent_id": "agentA", "runid": RUNID, "delta_emitted": 2, "short_circuit": False}]
+    author, content = im.process_events(events)[0]
+    assert author == "alpha · Opus 5, working on comms"
+    assert content == "\U0001f440 Read 2 new messages from beta and gamma"
 
 
 def test_process_events_distinct_seats_preserve_first_seen_order():
