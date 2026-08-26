@@ -99,8 +99,11 @@ match, exactly:
     or kind in ("comment", "reply")  # a broadcast conversational row
 
 so the convo lane is not "findings vs. chatter" -- a `--to` unicast lands in
-convo even if it's kind `finding`. `lib/swarm_mailbox.CONVO_KINDS` is the
-kind-half of this predicate, defined next to `VALID_KINDS`:
+convo even if it's kind `finding`, unless the row carries a `thread`. One
+Discord message per row outside the all lane; a row carrying both `to` and
+`thread` appears in the document thread only, never also in convo.
+`lib/swarm_mailbox.CONVO_KINDS` is the kind-half of this predicate, defined
+next to `VALID_KINDS`:
 
     python3 adapters/discord/mirror.py --once <runid> --lane convo
     python3 adapters/discord/mirror.py --follow <runid> --lane convo

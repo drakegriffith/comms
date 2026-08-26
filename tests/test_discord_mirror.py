@@ -693,6 +693,36 @@ def test_convo_lane_mirrors_unicast_topic_rows(monkeypatch):
     assert posted and "direct msg" in posted[0][1]
 
 
+def test_convo_lane_threaded_unicast_is_skipped_and_cursor_advances(monkeypatch):
+    posted = []
+    _fake_post(monkeypatch, posted)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(
+        RUNID, "alpha", "reply", "threaded direct msg", to="bravo", thread="doc:x"
+    )
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert posted == []
+    assert _cursor_count(mirror._load_cursor(RUNID, "convo"), "alpha") == 1
+
+
+def test_convo_lane_unthreaded_unicast_still_posts(monkeypatch):
+    posted = []
+    _fake_post(monkeypatch, posted)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "reply", "unthreaded direct msg", to="bravo")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert posted and "to bravo: unthreaded direct msg" in posted[0][1]
+
+
+def test_convo_lane_threaded_reply_without_unicast_topic_is_skipped(monkeypatch):
+    posted = []
+    _fake_post(monkeypatch, posted)
+    monkeypatch.setenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", "http://127.0.0.1:1/convo")
+    swarm_mailbox.post(RUNID, "alpha", "reply", "threaded broadcast", thread="doc:x")
+    assert mirror.run_once(RUNID, lane="convo") == 0
+    assert posted == []
+
+
 def test_convo_lane_mirrors_comment_and_reply_kinds(monkeypatch):
     posted = []
     _fake_post(monkeypatch, posted)
@@ -752,6 +782,17 @@ def test_all_lane_is_unfiltered_mirrors_everything(monkeypatch):
     joined = "\n".join(c for _, c, _ in posted)
     assert "plain finding" in joined
     assert "a comment too" in joined
+
+
+def test_all_lane_still_mirrors_threaded_unicast(monkeypatch):
+    posted = []
+    _fake_post(monkeypatch, posted)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/all")
+    swarm_mailbox.post(
+        RUNID, "alpha", "reply", "threaded direct msg", to="bravo", thread="doc:x"
+    )
+    assert mirror.run_once(RUNID, lane="all") == 0
+    assert posted and "to bravo: threaded direct msg" in posted[0][1]
 
 
 # ---- CLI: --lane flag -------------------------------------------------
@@ -1641,6 +1682,15 @@ def test_board_second_seat_drains_the_WHOLE_backlog_in_at_order(board):
         "\U0001f4ec\U0001f4ac answering",
         "\U0001f4ec\U0001f4ac and again",
     ]
+
+
+def test_board_threaded_unicast_renders_target_seat_like_convo_lane(board):
+    swarm_mailbox.post(
+        RUNID, "alpha", "reply", "direct answer", to="bravo", thread=DOC
+    )
+    swarm_mailbox.post(RUNID, "bravo", "reply", "ack", thread=DOC)
+    assert mirror.run_once(RUNID, lane=BOARD) == 0
+    assert _texts(board.posted)[0] == "\U0001f4e8 to bravo: direct answer"
 
 
 def test_board_drain_spans_multiple_chunks_because_a_seat_change_forces_one(board):

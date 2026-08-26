@@ -358,10 +358,12 @@ def _lane_keep(lane):
     composed rather than merged, because they answer different questions --
     "is this row conversation" (a lane's taste) and "did some other machine's
     mirror already post this row" (a fleet-wide fact true in every lane).
-    Rows either one rejects are still counted against the cursor."""
+    The convo lane additionally excludes threaded rows because the board lane
+    owns their rendering. Rows any filter rejects are still counted against
+    the cursor."""
     lane_filter = None
     if lane == "convo":
-        lane_filter = _is_convo_row
+        lane_filter = lambda row: _is_convo_row(row) and not _is_threaded_row(row)
     elif lane == BOARD_LANE:
         lane_filter = _is_threaded_row
 
