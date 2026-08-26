@@ -71,8 +71,20 @@
 #   START REACHING YOU -- no seat has to guess a topic name, and the two seats
 #   editing one file never coordinate. A path outside any repo keys to None
 #   and enrols nothing; a fabricated key would be an invisible mis-grouping.
+#   Codex apply_patch beats take the same leg: every Add File and Update File
+#   header in tool_input.command is resolved against the payload cwd; Delete
+#   File is ignored because nobody is editing a deleted document.
 #
-#   Four properties this leg does NOT have, each load-bearing:
+#   A write-shaped Bash beat (heredoc, redirect, sed -i, tee, mv, cp, git apply
+#   or patch) asks git status for changed paths, bounded to two seconds, then
+#   accepts only paths whose BASENAME occurs in the command. Read-shaped Bash
+#   never spawns git. The basename gate is attribution, not discovery: if one
+#   week of measurement shows it rejects most true writes, fall back to
+#   enrol-only for every git-found path.
+#
+#   Every entry path keeps the same four load-bearing properties:
+#   it never enrols non-participants, never narrows subscribe-all, never blocks
+#   the beat, and stays silent when nothing changed. The detailed invariants:
 #     * It NEVER ENROLLS. add_topics on a non-participant returns [] and
 #       creates no roster row, so a bystander writing a file stays a bystander.
 #       Enrol-by-side-effect would be the machine-global contamination the ARM
@@ -243,6 +255,8 @@ exec python3 <<'PY'
 import datetime
 import json
 import os
+import re
+import subprocess
 import sys
 
 lib_dir = os.environ.get("HB_SWARM_LIB") or ""
@@ -598,38 +612,86 @@ def _auto_claim(runid, key):
 
 
 
+def _enrol_paths(paths):
+    """Feed every discovered path through the one enrol + claim pipeline."""
+    import swarm_mailbox
+
+    for file_path in paths:
+        key = swarm_mailbox.thread_key(file_path)
+        if not key:
+            continue  # outside any repo -- no thread, never a fabricated key
+        for runid in my_runs:
+            # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
+            # would race; the lock is the only place with one answer.
+            _topics, changed = swarm_arm.add_topics(
+                runid, agent_id, [key], state_dir=state_dir
+            )
+            if changed:
+                enrolled_this_beat.add(runid)
+                append_telemetry(runid, "doc-enrol " + key, 0, 0)
+                _auto_claim(runid, key)
+
+
+def _bash_changed_paths(command, cwd):
+    write_markers = ("<<", ">", "sed -i", "tee ", "mv ", "cp ", "git apply", "patch ")
+    if not any(marker in command for marker in write_markers):
+        return []  # fast path: a read-shaped command must not spawn git
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=cwd, check=False, capture_output=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write("swarm-heartbeat: doc-enrol git status failed: %s\n" % exc)
+        return []
+    if result.returncode != 0:
+        sys.stderr.write(
+            "swarm-heartbeat: doc-enrol git status failed: exit %s\n"
+            % result.returncode
+        )
+        return []
+
+    fields = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    paths = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, relpath = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1  # porcelain -z follows the destination with the source
+        if os.path.basename(relpath) in command:
+            paths.append(os.path.join(cwd, relpath))
+    return paths
+
+
 def doc_enrol():
-    if payload.get("tool_name") not in FILE_TOOLS:
-        return
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return
-    file_path = tool_input.get("file_path")
-    # Type guard, same reasoning as the identity gate: a non-string path is no
-    # path. MultiEdit/NotebookEdit take this leg only when they carry one.
-    if not isinstance(file_path, str) or not file_path:
-        return
-    # Imported HERE, not at the top: a failure to import swarm_mailbox must
-    # cost this leg only. At the top it would exit the whole beat, trading a
-    # missing subscription for a missing delivery.
-    import swarm_mailbox
-
-    key = swarm_mailbox.thread_key(file_path)
-    if not key:
-        return  # outside any repo -- no thread, never a fabricated key
-    for runid in my_runs:
-        # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
-        # -- read the topics, compare after the call -- would race: two beats
-        # adding the same key both see it absent beforehand and both report an
-        # enrolment that happened once. The lock is the only place with one
-        # answer, so the answer is returned from there.
-        _topics, changed = swarm_arm.add_topics(
-            runid, agent_id, [key], state_dir=state_dir
-        )
-        if changed:
-            enrolled_this_beat.add(runid)
-            append_telemetry(runid, "doc-enrol " + key, 0, 0)
-            _auto_claim(runid, key)
+    tool_name = payload.get("tool_name")
+    paths = []
+    if tool_name in FILE_TOOLS:
+        file_path = tool_input.get("file_path")
+        # Keep the established Write/Edit behavior: only a non-empty string.
+        if isinstance(file_path, str) and file_path:
+            paths = [file_path]
+    elif tool_name == "apply_patch":
+        command = tool_input.get("command")
+        cwd = payload.get("cwd")
+        if isinstance(command, str) and isinstance(cwd, str):
+            for relpath in re.findall(r"^\*\*\* (?:Add|Update) File: (.+)$", command, re.M):
+                paths.append(relpath if os.path.isabs(relpath) else os.path.join(cwd, relpath))
+    elif tool_name == "Bash":
+        command = tool_input.get("command")
+        cwd = payload.get("cwd")
+        if isinstance(command, str) and isinstance(cwd, str):
+            paths = _bash_changed_paths(command, cwd)
+    if paths:
+        # Import/thread-key failures cost this leg only via the outer wrapper.
+        _enrol_paths(paths)
 
 
 try:
