@@ -83,7 +83,7 @@ cat <<EOF
 Plist written. This script does NOT call launchctl -- run these by hand
 when ready (a fresh bootstrap fails harmlessly with "service already
 loaded" if it's already running; kickstart forces an immediate first run
-for testing without waiting for 18:00/01:00):
+for testing without waiting for the next hourly interval):
 
   launchctl bootstrap gui/\$(id -u) "$DEST"
   launchctl kickstart -k gui/\$(id -u)/$LABEL

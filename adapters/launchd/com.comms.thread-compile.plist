@@ -19,12 +19,14 @@
   real values below -- read the checked-out template for the placeholder
   names themselves.
 
-  StartCalendarInterval, not an interval timer: this is "run at these two
-  wall-clock times", not "run every N seconds" -- 18:00 is a mid-evening
-  check-in compile (see scripts/comms_compile_threads.py's docstring, WHY
-  THIS MAKES 18:00 AND 01:00 THE SAME CODE PATH: both invocations run the
-  identical watermark-driven pass), 01:00 is the close. Two dict entries in
-  one array run the job at BOTH times, not just the last one listed.
+  StartInterval (every 3600 s), not StartCalendarInterval. The calendar form
+  was the design (18:00 check-in, 23:00 close) but on studio, 2026-08-25,
+  two valid calendar slots (23:00 and 23:15) never fired while
+  `launchctl kickstart` and a StartInterval timer both ran the job within
+  seconds; launchd logged nothing. The compile is watermark-driven and
+  idempotent (notes_written=0 when nothing changed), so an hourly interval
+  is safe and the day's note simply refreshes through the evening. Revisit
+  the calendar form only with a fresh proof that it fires on this fleet.
 
   No KeepAlive: unlike the Discord mirror's --follow loops, this job is a
   one-shot compile that exits when done. KeepAlive would restart it in a
@@ -39,21 +41,8 @@
     <string>__PYTHON3__</string>
     <string>__SCRIPT__</string>
   </array>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict>
-      <key>Hour</key>
-      <integer>18</integer>
-      <key>Minute</key>
-      <integer>0</integer>
-    </dict>
-    <dict>
-      <key>Hour</key>
-      <integer>23</integer>
-      <key>Minute</key>
-      <integer>0</integer>
-    </dict>
-  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
   <key>StandardOutPath</key>
   <string>__STDOUT_LOG__</string>
   <key>StandardErrorPath</key>
