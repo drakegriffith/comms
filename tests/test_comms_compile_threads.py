@@ -132,7 +132,9 @@ def test_note_front_matter_and_body_shape():
     assert "board: repoA" in text
     assert "threads_inspected: 1" in text
     assert "threads_alive: 1" in text
+    assert "threads_exchange: 1" in text
     assert "## doc:repoA/x.md" in text
+    assert "exchange: yes" in text
     assert "- 10:00 a: hello" in text
     assert "- 10:05 b: hi back" in text
     # a rows in `at` order: a before b
@@ -145,6 +147,8 @@ def test_a_lone_seat_thread_is_compiled_but_not_alive():
     text = _note_text("repoA", "2026-08-25")
     assert "threads_inspected: 1" in text
     assert "threads_alive: 0" in text
+    assert "threads_exchange: 0" in text
+    assert "exchange: no" in text
 
 
 # ---- two boards, multiple threads -------------------------------------------

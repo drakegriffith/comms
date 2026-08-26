@@ -56,6 +56,10 @@ DEFAULT_MIN_SEATS = 2
 # The kind that announces a seat rather than saying anything in the thread.
 STATUS_KIND = "status"
 
+# The kind that announces a seat is taking a file ("editing <relpath>"),
+# auto-posted by the heartbeat's doc-enrol leg. It is a claim, not talk.
+CLAIM_KIND = "claim"
+
 THREAD_FIELD = "thread"
 
 # The env var NAMES for the two knobs above (issue #40's config table). Fixed
@@ -168,6 +172,30 @@ def alive(rows, window_s=DEFAULT_WINDOW_S, min_seats=DEFAULT_MIN_SEATS):
         if gap > datetime.timedelta(0) and gap <= window:
             return True
     return False
+
+
+def exchange(rows, window_s=DEFAULT_WINDOW_S, min_seats=DEFAULT_MIN_SEATS):
+    """True if `rows` contain an actual exchange: the same rule as alive(),
+    but ignoring rows whose kind is STATUS_KIND or CLAIM_KIND.
+
+    in: rows, a list of row dicts (any order, any mix of kinds); window_s,
+      seconds; min_seats, a count.
+    out: True/False. Never raises for ordinary input -- a row with a missing
+      or unparseable `at` is skipped, not fatal.
+    side effects: none. Pure: no clock, no files, no env, and the rows are
+      neither mutated nor reordered in place.
+
+    WHY CLAIMS ARE EXCLUDED: the heartbeat's doc-enrol leg auto-posts
+    kind=claim "editing <relpath>" on the first edit of a file. Two such
+    claims make a thread alive on co-presence (two seats on one file), but
+    they are not talk; exchange() is the predicate that asks whether anybody
+    actually answered anybody.
+    """
+    return alive(
+        [r for r in rows if r.get("kind") not in (STATUS_KIND, CLAIM_KIND)],
+        window_s=window_s,
+        min_seats=min_seats,
+    )
 
 
 # =============================================================================
@@ -321,14 +349,17 @@ def _extract_threads_flags(args):
 
 
 def _inspect_threads(swarm_mailbox, window_s, min_seats, run):
-    """(threads_inspected, threads_alive, results) for one CLI invocation.
+    """(threads_inspected, threads_alive, threads_exchange, results) for one
+    CLI invocation.
 
     results is a list of dicts, one per thread key, sorted by key for a
-    deterministic terminal (and test) output: {"thread", "alive", "seats",
-    "rows", "last_gap_s"}. `rows` counts every row group_by_thread bucketed
-    under that key (status rows included -- the row-count column answers "how
-    much traffic", not "how much counted toward liveness"); `seats` counts
-    only the non-status speakers, the same set alive() computes liveness over.
+    deterministic terminal (and test) output: {"thread", "alive", "exchange",
+    "seats", "rows", "last_gap_s"}. `rows` counts every row group_by_thread
+    bucketed under that key (status rows included -- the row-count column
+    answers "how much traffic", not "how much counted toward liveness");
+    `seats` counts only the non-status speakers, the same set alive() computes
+    liveness over; `exchange` is alive() run over the rows that are neither
+    status nor claim.
     """
     rows = full_board_rows(swarm_mailbox, run=run)
     groups = group_by_thread(rows)
@@ -343,13 +374,17 @@ def _inspect_threads(swarm_mailbox, window_s, min_seats, run):
             {
                 "thread": key,
                 "alive": alive(bucket, window_s=window_s, min_seats=min_seats),
+                "exchange": exchange(
+                    bucket, window_s=window_s, min_seats=min_seats
+                ),
                 "seats": len(seats),
                 "rows": len(bucket),
                 "last_gap_s": last_gap_s(bucket),
             }
         )
     threads_alive = sum(1 for r in results if r["alive"])
-    return threads_inspected, threads_alive, results
+    threads_exchange = sum(1 for r in results if r["exchange"])
+    return threads_inspected, threads_alive, threads_exchange, results
 
 
 def _run_threads(swarm_mailbox, args):
@@ -378,7 +413,7 @@ def _run_threads(swarm_mailbox, args):
         else env_int(ALIVE_SEATS_VAR, DEFAULT_MIN_SEATS)
     )
 
-    threads_inspected, threads_alive, results = _inspect_threads(
+    threads_inspected, threads_alive, threads_exchange, results = _inspect_threads(
         swarm_mailbox, window_s, min_seats, flags["run"]
     )
 
@@ -401,6 +436,7 @@ def _run_threads(swarm_mailbox, args):
                 {
                     "threads_inspected": threads_inspected,
                     "threads_alive": threads_alive,
+                    "threads_exchange": threads_exchange,
                 }
             )
         )
@@ -408,14 +444,21 @@ def _run_threads(swarm_mailbox, args):
             print(json.dumps(r))
     else:
         print(
-            "threads_inspected=%d threads_alive=%d"
-            % (threads_inspected, threads_alive)
+            "threads_inspected=%d threads_alive=%d threads_exchange=%d"
+            % (threads_inspected, threads_alive, threads_exchange)
         )
         for r in results:
             gap = "-" if r["last_gap_s"] is None else "%.0f" % r["last_gap_s"]
             print(
-                "%s: alive=%s seats=%d rows=%d last_gap_s=%s"
-                % (r["thread"], r["alive"], r["seats"], r["rows"], gap)
+                "%s: alive=%s exchange=%s seats=%d rows=%d last_gap_s=%s"
+                % (
+                    r["thread"],
+                    r["alive"],
+                    r["exchange"],
+                    r["seats"],
+                    r["rows"],
+                    gap,
+                )
             )
     return 0
 
