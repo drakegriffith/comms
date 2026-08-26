@@ -9,8 +9,8 @@ without a human remembering to run it by hand.
 
 - `com.comms.thread-compile.plist` -- a TEMPLATE (see its own header comment):
   `ProgramArguments` names `python3` and the absolute path to
-  `comms_compile_threads.py`; `StartCalendarInterval` fires the job at 18:00
-  and 01:00 daily; `StandardOutPath`/`StandardErrorPath` land under
+  `comms_compile_threads.py`; `StartInterval` fires the job every hour (calendar
+  slots did not fire on studio, 2026-08-25; see the template comment); `StandardOutPath`/`StandardErrorPath` land under
   `~/Library/Logs/comms/`. launchd cannot expand `$HOME` or resolve a
   checkout's own location, so four placeholders in the template are filled
   in at install time.
