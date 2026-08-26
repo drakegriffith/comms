@@ -63,6 +63,8 @@ else:
         v = data.pop(k)
         if isinstance(v, list):
             container[k] = v
+        else:
+            data[k] = v
     data["hooks"] = container
     migrated = True
 
@@ -78,16 +80,25 @@ present = any(
     for h in (entry.get("hooks") or [])
     if isinstance(h, dict)
 )
-if present:
+
+# Only write when something changed.
+written = False
+if migrated:
+    print("codex hook wiring: migrated flat hooks.json to wrapped shape in %s" % path)
+    if present:
+        print("codex hook wiring: heartbeat entry already present in %s" % path)
+    else:
+        ptu.append({"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
+        print("codex hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
+    written = True
+elif present:
     print("codex hook wiring: already present in %s, left untouched" % path)
 else:
     ptu.append({"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
     print("codex hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
+    written = True
 
-if migrated:
-    print("codex hook wiring: migrated flat hooks.json to wrapped shape in %s" % path)
-
-if migrated or not present:
+if written:
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)

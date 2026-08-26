@@ -11,8 +11,8 @@ Measured 2026-08-26 on codex-cli 0.148.0:
 
 - Codex loads `~/.codex/hooks.json` only in the WRAPPED shape
   `{"hooks": {"PostToolUse": [...]}}`. A flat top-level event map
-  `{"PostToolUse": [...]}` is rejected and the hook never fires (probe1 and
-  probe5: 0 fires, with matcher `"*"` and with matcher `".*"`).
+  `{"PostToolUse": [...]}` is rejected and the hook never fires (codex-probe and
+  codex-probe5: 0 fires, with matcher `"*"` and with matcher `".*"`).
 - The wrapped shape fires on every tool call (probe4: 3 fires with matcher
   `".*"`; probe6: 1 fire with matcher `"*"`).
 - A file holding both keys fires nothing (probe3), so the installed config must
@@ -26,8 +26,8 @@ Measured 2026-08-26 on codex-cli 0.148.0:
   trust before debugging the mailbox.
 
 Failure signature: a flat `hooks.json` is skipped with no warning at all, so
- the delivery oracle is the telemetry log (`swarm-heartbeat.log` in the state
- dir), never the absence of an error.
+the delivery oracle is the telemetry log (`swarm-heartbeat.log` in the state
+dir), never the absence of an error.
 
 ## Install
 
@@ -36,4 +36,5 @@ bash adapters/codex/install.sh
 ```
 
 Idempotent: re-running never duplicates the entry and never clobbers other
-hooks. `COMMS_CODEX_HOOKS=<path>` overrides the target file for testing.
+hooks. An existing flat file is migrated to the wrapped shape in place.
+`COMMS_CODEX_HOOKS=<path>` overrides the target file for testing.

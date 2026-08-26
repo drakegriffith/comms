@@ -151,6 +151,42 @@ print("yes" if any("swarm-heartbeat.sh" in c for c in cmds) else "no")
 ' "$COMMS_CODEX_HOOKS")"
 check "flat file adds heartbeat entry" "yes" "$heartbeat_added"
 
+# ---- (3b) flat file with non-list top-level keys keeps them -----------------
+export COMMS_CODEX_HOOKS="$TMP/flat-with-meta-hooks.json"
+cat > "$COMMS_CODEX_HOOKS" <<'JSON'
+{
+  "version": 1,
+  "meta": {"owner": "test", "tags": ["a", "b"]},
+  "PostToolUse": [
+    {"matcher": "*", "hooks": [{"type": "command", "command": "bash /existing.sh"}]}
+  ]
+}
+JSON
+out="$(bash "$INSTALL" 2>&1)"; rc=$?
+check "flat with meta exits 0" "0" "$rc" "$out" "migrated flat hooks.json to wrapped shape"
+version_kept="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("version", "MISSING"))
+' "$COMMS_CODEX_HOOKS")"
+check "flat with meta keeps version" "1" "$version_kept"
+meta_kept="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("yes" if d.get("meta", {}).get("owner") == "test" else "no")
+' "$COMMS_CODEX_HOOKS")"
+check "flat with meta keeps meta object" "yes" "$meta_kept"
+shape_ok="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+ok = isinstance(d.get("hooks"), dict)
+ok = ok and "PostToolUse" in d.get("hooks", {})
+ok = ok and "version" in d
+ok = ok and "meta" in d
+print("yes" if ok else json.dumps(d))
+' "$COMMS_CODEX_HOOKS")"
+check "flat with meta has wrapped hooks plus top-level keys" "yes" "$shape_ok"
+
 # ---- (4) re-run -> no duplicate ---------------------------------------------
 out2="$(bash "$INSTALL" 2>&1)"; rc2=$?
 check "re-run exits 0" "0" "$rc2" "$out2" "already present"
