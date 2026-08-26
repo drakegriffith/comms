@@ -502,6 +502,9 @@ def _sanitize_author(author):
     return author
 
 
+AUTHOR_MAX_LEN = 80  # Discord webhook `username` limit (HTTP 400 above it)
+
+
 def build_author(seat, identity, machine):
     """This message's Discord webhook `username` -- one seat's authorship per
     POST (see chunk_rows). With identity (swarm_arm seat_identities:
@@ -518,16 +521,26 @@ def build_author(seat, identity, machine):
     _sanitize_author.
     """
     identity = identity or {}
-    parts = []
-    if identity.get("model"):
-        parts.append(str(identity["model"]))
-    if identity.get("project"):
-        parts.append("on %s" % identity["project"])
-    if parts:
-        author = "%s · %s (%s)" % (seat, " ".join(parts), machine)
-    else:
-        author = "%s (%s)" % (seat, machine)
-    return _sanitize_author(author)
+    model = identity.get("model")
+    project = identity.get("project")
+    # Discord rejects a webhook `username` over AUTHOR_MAX_LEN with HTTP 400,
+    # which the mirror does not retry, so the row would be skipped for good
+    # (#59: 165 rows lost to 93-101 char lines). Shed the least identifying
+    # segment first: project, then model, then hard-truncate the seat line.
+    for use_model, use_project in ((True, True), (True, False), (False, False)):
+        parts = []
+        if use_model and model:
+            parts.append(str(model))
+        if use_project and project:
+            parts.append("on %s" % project)
+        if parts:
+            author = "%s · %s (%s)" % (seat, " ".join(parts), machine)
+        else:
+            author = "%s (%s)" % (seat, machine)
+        author = _sanitize_author(author)
+        if len(author) <= AUTHOR_MAX_LEN:
+            return author
+    return author[:AUTHOR_MAX_LEN]
 
 
 # ---- content (kind -> emoji prefix) ----------------------------------------
@@ -776,9 +789,13 @@ def post_content(url, content, username=None, allowed_mentions=None):
                 time.sleep(min(delay, 30))
                 attempt += 1
                 continue
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                detail = ""
             sys.stderr.write(
-                "discord mirror: webhook POST failed (HTTP %d) after %d attempt(s)\n"
-                % (exc.code, attempt + 1)
+                "discord mirror: webhook POST failed (HTTP %d) after %d attempt(s)%s\n"
+                % (exc.code, attempt + 1, (": " + detail) if detail else "")
             )
             return False
         except (urllib.error.URLError, OSError) as exc:
