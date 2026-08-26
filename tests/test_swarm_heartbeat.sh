@@ -635,6 +635,63 @@ run_suite() {  # one fully-isolated pass
     ck_contains "(s) NotebookEdit enrols the doc key" \
         "doc:$REPONAME/sub/n.ipynb" "$(part_topics "$RS" agentS)"
 
+    #     AUTO-CLAIM (2026-08-26, Drake's option 2): the FIRST enrol of a doc key
+    #     posts ONE claim row carrying that key, so two seats editing one file
+    #     inside the alive window make a thread the board lane can render.
+    #     kind=claim, never status: swarm_threads.alive() ignores status rows,
+    #     so a status row could never make a thread alive.
+    SEATFILE="$ROOT/comms-$RS/seatS.jsonl"
+    claims_for() {  # claims_for <relpath> ; rows in seatS.jsonl carrying that key
+        grep -c "\"thread\": \"doc:$REPONAME/$1\"" "$SEATFILE" 2>/dev/null | tr -d ' '
+    }
+    ck "(u) the first Write of a doc posts exactly one claim row" "1" "$(claims_for sub/a.py)"
+    ck "(u) a re-Write of the same doc posts no second claim" "1" "$(claims_for sub/c.py)"
+    ck "(u) MultiEdit's first enrol posts a claim too" "1" "$(claims_for sub/m.py)"
+    claim_a="$(grep "\"thread\": \"doc:$REPONAME/sub/a.py\"" "$SEATFILE")"
+    ck_contains "(u) the claim is kind=claim (status rows never count toward alive)" \
+        '"kind": "claim"' "$claim_a"
+    ck_contains "(u) the claim rides the repo board topic" \
+        "\"topic\": \"board:$REPONAME\"" "$claim_a"
+    ck_contains "(u) the claim text names the repo-relative path" \
+        '"text": "editing sub/a.py"' "$claim_a"
+    ck_contains "(u) the claim is posted as the participant's own seat" \
+        '"seat": "seatS"' "$claim_a"
+
+    #     No seat, no claim: a participant enrolled without --seat has no file
+    #     to write, so the enrol still happens and nothing is posted.
+    enroll_agent "$RS" agentNoSeat "projN"
+    files_before="$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
+    run_hook_raw "$(write_payload agentNoSeat Write "$REPO/sub/a.py")"
+    ck_contains "(u) a seatless participant still enrols the key" \
+        "doc:$REPONAME/sub/a.py" "$(part_topics "$RS" agentNoSeat)"
+    ck "(u) a seatless participant posts no claim (no new mailbox file)" \
+        "$files_before" "$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
+
+    #     Subscribe-all is not narrowed (above) AND posts no claim: add_topics
+    #     reports changed=False for it, and the claim rides on changed.
+    enroll_agent "$RS" agentAllSeat "" seatAllS
+    run_hook_raw "$(write_payload agentAllSeat Write "$REPO/sub/a.py")"
+    if [ -e "$ROOT/comms-$RS/seatAllS.jsonl" ]; then
+        fail=$((fail + 1)); echo "  FAIL (u) a subscribe-all seat posted a claim" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    #     REPLY HINT (Drake's option 1, the companion line): a beat that delivers
+    #     a threaded row also delivers ONE line naming the reply command, so the
+    #     reply carries --thread and lands in the same thread. A beat with only
+    #     unthreaded rows carries no hint.
+    post_row "$RS" seatU finding "HINT-THREAD-ROW" "2026-08-01T00:00:03+00:00" \
+        "otherproj" "doc:$REPONAME/sub/a.py"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(u) a threaded delivery carries the reply hint" \
+        "comms post reply --to <seat> --thread <key>" "$ctx"
+    post_row "$RS" seatU comment "PLAIN-ROW" "2026-08-01T00:00:04+00:00" "projS"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(u) control: the plain row is delivered" "PLAIN-ROW" "$ctx"
+    ck_absent "(u) an unthreaded delivery carries no reply hint" \
+        "comms post reply" "$ctx"
+
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
     #     file_path makes os.path.realpath raise ValueError -- the leg is
     #     wrapped, so the beat still emits its rows and exits 0.

@@ -87,6 +87,23 @@
 #       topic, writes no file (add_topics no-ops without touching the roster
 #       row) and appends no telemetry line, so the log records enrolments, not
 #       keystrokes.
+#     * It SPEAKS ONCE PER DOCUMENT (Drake, 2026-08-26, "option 2"). The first
+#       enrol of a doc key also posts ONE row as this seat: kind=claim,
+#       text "editing <relpath>", thread=<key>, topic=board:<repo>. Listening
+#       alone left the forum empty: no real session ever put a `thread` on a
+#       row (measured 2026-08-26: 0 of 196 real rows that day). Two seats
+#       editing one file inside the alive window now make a thread the board
+#       lane renders. kind=claim because swarm_threads.alive() ignores status
+#       rows; board:<repo> so the row reaches only seats on that board or
+#       document, never every terminal (~130 such rows/day measured). It rides
+#       `changed`, so a re-Write posts nothing; a seatless or subscribe-all
+#       participant enrols (or is left whole) and posts nothing. _auto_claim
+#       holds the full reasoning and the discarded alternatives.
+#     * It HINTS THE REPLY (Drake, "option 1", the companion line). A beat that
+#       delivers a row carrying `thread` appends one fixed line naming
+#       `comms post reply --to <seat> --thread <key> "<text>"`, so the reply
+#       carries the key and lands in the same thread. A beat with no threaded
+#       row renders byte-identical to before (REPLY_HINT).
 #   It runs BEFORE the per-run row pass, so a key learned on this beat filters
 #   this beat's rows -- and a run whose subscription grew this beat BYPASSES
 #   the mtime short-circuit below, for this beat only. That short-circuit asks
@@ -485,6 +502,8 @@ def process_run(runid):
                 suffix,
             )
         )
+    if any(r.get("thread") for r in emitted):
+        row_lines.append(REPLY_HINT)
     if overflow > 0:
         # --replay, NOT a plain read (issue #33): this hint is aimed at an
         # agent whose heartbeat cursor just advanced past the rows it is being
@@ -513,6 +532,62 @@ def process_run(runid):
 # python3 invocation would double interpreter startup on every file edit,
 # which is the one cost this hook's whole fast-path design exists to avoid.
 FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+# The one line an agent needs to answer INSIDE the thread it was just shown.
+# Appended once per beat, only when a delivered row carries a thread key, so
+# a beat with no threaded row renders byte-identical to before.
+REPLY_HINT = (
+    'Reply inside a thread with: comms post reply --to <seat> --thread <key> '
+    '"<text>" (seat and key as shown on the row; the reply then lands in the '
+    'same forum thread)'
+)
+
+
+def _auto_claim(runid, key):
+    """Post ONE claim row on the FIRST enrol of a doc key (Drake, 2026-08-26,
+    option 2): "editing <relpath>" carrying thread=<key> and topic=board:<repo>.
+
+    WHY A ROW AT ALL. Enrolling only LISTENS: before this, a seat that edited
+    a file heard about it and said nothing, so no real session ever put a
+    `thread` field on a row and the forum stayed at its seeded threads. This
+    row is the seat's own voice on the document; two seats editing one file
+    inside the alive window now make a thread the board lane can render.
+
+    WHY kind=claim, NOT status. swarm_threads.alive() ignores status rows by
+    contract (a status row is a birth, not a speaker), so a status row here
+    could never make a thread alive and the whole point would be lost.
+    "claim" is also the honest kind: the seat is taking the document on.
+
+    WHY topic=board:<repo>, NOT the run topic. The run topic ("ops") reaches
+    every enrolled session's context on its next beat; one row per (seat,
+    file) is ~130 rows/day on this machine (session-writes, 2026-08-25/26),
+    all injected into every terminal. board:<repo> reaches only seats that
+    subscribed to that board or, via the thread filter, to that document --
+    exactly the seats the claim concerns. Discord's dashboard lane still
+    mirrors every row regardless of topic, so visibility is not reduced.
+
+    ONCE PER (seat, document, run): it rides `changed`, which add_topics
+    decides under its lock, so a re-Write of the same file posts nothing and
+    two racing beats cannot both post. A seatless participant enrols but has
+    no file to write, so it posts nothing (and says nothing on stderr: that
+    is the documented shape of a seatless enrollment, not a failure).
+
+    Crash ordering: the subscription is written before this row, so a beat
+    killed in between loses the claim, never duplicates it; the next Write
+    of that file is a no-op (changed=False). A missing claim costs one
+    thread appearing later; a duplicate would be noise on every board."""
+    _topics, seat = swarm_arm.participant_sub(runid, agent_id, state_dir=state_dir)
+    if not seat:
+        return
+    import swarm_mailbox
+
+    body = key[len(swarm_mailbox.THREAD_KEY_PREFIX):]
+    repo, _, rel = body.partition("/")
+    swarm_mailbox.post(
+        runid, seat, "claim", "editing %s" % (rel or repo),
+        topic="board:%s" % repo, thread=key,
+    )
+
 
 
 def doc_enrol():
@@ -546,6 +621,7 @@ def doc_enrol():
         if changed:
             enrolled_this_beat.add(runid)
             append_telemetry(runid, "doc-enrol " + key, 0, 0)
+            _auto_claim(runid, key)
 
 
 try:
