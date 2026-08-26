@@ -537,6 +537,46 @@ def test_main_threads_text_output_includes_exchange(capsys):
     assert "exchange=True" in out
 
 
+def test_main_threads_claims_make_alive_but_not_exchange(capsys):
+    # Two kind=claim rows from two seats inside the window make a thread alive
+    # on co-presence, but they are not talk: exchange must stay False.
+    _post(
+        "test-r1",
+        "a",
+        "doc:x/a.md",
+        kind="claim",
+        text="editing a.md",
+        at="2026-08-25T12:00:00+00:00",
+    )
+    _post(
+        "test-r1",
+        "b",
+        "doc:x/a.md",
+        kind="claim",
+        text="editing a.md",
+        at="2026-08-25T12:01:00+00:00",
+    )
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1 threads_alive=1 threads_exchange=0" in out
+    assert "alive=True exchange=False" in out
+
+    rc = st.main(["swarm_threads.py", "threads", "--json"])
+    assert rc == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    summary = json.loads(lines[0])
+    assert summary == {
+        "threads_inspected": 1,
+        "threads_alive": 1,
+        "threads_exchange": 0,
+    }
+    detail = json.loads(lines[1])
+    assert detail["thread"] == "doc:x/a.md"
+    assert detail["alive"] is True
+    assert detail["exchange"] is False
+
+
 def test_main_threads_unexpected_positional_argument_exits_2(capsys):
     _post("test-r1", "a", "doc:x/a.md")
     rc = st.main(["swarm_threads.py", "threads", "extra"])

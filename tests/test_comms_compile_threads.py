@@ -134,11 +134,44 @@ def test_note_front_matter_and_body_shape():
     assert "threads_alive: 1" in text
     assert "threads_exchange: 1" in text
     assert "## doc:repoA/x.md" in text
-    assert "exchange: yes" in text
+    lines = text.splitlines()
+    h2_index = lines.index("## doc:repoA/x.md")
+    # The exchange line is pinned as the line directly under the H2; any
+    # continuation pointer would come after it, never before.
+    assert lines[h2_index + 1] == "exchange: yes"
     assert "- 10:00 a: hello" in text
     assert "- 10:05 b: hi back" in text
     # a rows in `at` order: a before b
     assert text.index("hello") < text.index("hi back")
+
+
+def test_note_claims_make_alive_but_not_exchange():
+    # Two kind=claim rows from two seats inside the window are co-presence,
+    # not talk: the note must report alive but not exchange.
+    _post_at(
+        "test-r1",
+        "a",
+        "doc:repoA/x.md",
+        "2026-08-25T10:00:00+00:00",
+        kind="claim",
+        text="editing x.md",
+    )
+    _post_at(
+        "test-r1",
+        "b",
+        "doc:repoA/x.md",
+        "2026-08-25T10:01:00+00:00",
+        kind="claim",
+        text="editing x.md",
+    )
+    cct.compile_once()
+    text = _note_text("repoA", "2026-08-25")
+    assert "threads_inspected: 1" in text
+    assert "threads_alive: 1" in text
+    assert "threads_exchange: 0" in text
+    lines = text.splitlines()
+    h2_index = lines.index("## doc:repoA/x.md")
+    assert lines[h2_index + 1] == "exchange: no"
 
 
 def test_a_lone_seat_thread_is_compiled_but_not_alive():
@@ -297,6 +330,12 @@ def test_a_cross_midnight_thread_gets_a_continues_pointer():
     day2 = _note_text("repoA", "2026-08-26")
     assert "continues" not in day1
     assert "continues: 2026-08-25.md" in day2
+    # The continues pointer must come after the exchange line, never before.
+    lines2 = day2.splitlines()
+    h2_index = lines2.index("## doc:repoA/x.md")
+    exchange_index = h2_index + 1
+    assert lines2[exchange_index].startswith("exchange: ")
+    assert lines2[exchange_index + 1] == "continues: 2026-08-25.md"
     # both dated rows land in their own day's section
     assert "23:50" in day1
     assert "00:30" in day2

@@ -269,17 +269,18 @@ def _render_note(board, date, groups, window_s, min_seats, thread_dates_before):
             ((_parsed_at(r), r) for r in rows if _parsed_at(r) is not None),
             key=lambda pair: pair[0],
         )
-        if swarm_threads.alive(rows, window_s=window_s, min_seats=min_seats):
+        is_alive = swarm_threads.alive(
+            rows, window_s=window_s, min_seats=min_seats
+        )
+        is_exchange = swarm_threads.exchange(
+            rows, window_s=window_s, min_seats=min_seats
+        )
+        if is_alive:
             threads_alive += 1
-        if swarm_threads.exchange(rows, window_s=window_s, min_seats=min_seats):
+        if is_exchange:
             threads_exchange += 1
         lines = ["## %s" % key]
-        lines.append(
-            "exchange: %s"
-            % ("yes" if swarm_threads.exchange(
-                rows, window_s=window_s, min_seats=min_seats
-            ) else "no")
-        )
+        lines.append("exchange: %s" % ("yes" if is_exchange else "no"))
         prev_date = thread_dates_before.get(key)
         if prev_date and prev_date != date:
             lines.append("continues: %s.md" % prev_date)
