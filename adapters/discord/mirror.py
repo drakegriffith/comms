@@ -363,7 +363,7 @@ def _lane_keep(lane):
     the cursor."""
     lane_filter = None
     if lane == "convo":
-        lane_filter = lambda row: _is_convo_row(row) and not _is_threaded_row(row)
+        lane_filter = _is_convo_lane_row
     elif lane == BOARD_LANE:
         lane_filter = _is_threaded_row
 
@@ -373,6 +373,14 @@ def _lane_keep(lane):
         return True if lane_filter is None else lane_filter(row)
 
     return keep
+
+
+def _is_convo_lane_row(row):
+    """The convo lane's filter: conversation (_is_convo_row) that carries no
+    `thread`. A threaded conversational row is still conversation, but the
+    board lane owns its rendering inside the document's forum thread, and one
+    row must not appear in two lanes outside `all`."""
+    return _is_convo_row(row) and not _is_threaded_row(row)
 
 
 def _is_convo_row(row):
