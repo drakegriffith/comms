@@ -2191,3 +2191,41 @@ def test_a_clean_roster_says_nothing(board, capsys):
     _append_thread_row("alpha", "a", at=_at(0))
     mirror.run_once(RUNID, lane=BOARD)
     assert "collision" not in capsys.readouterr().err.lower()
+
+
+# ---- build_author: Discord's 80-char username cap (#59) ---------------------
+# 165 status rows were lost on 2026-08-25 when a seat enrolled with a long
+# project name built a 93-101 char author line; Discord answered HTTP 400
+# and the rows were skipped for good.
+
+def test_build_author_caps_at_80_dropping_project_first():
+    seat = "2026-08-25-adr0001-topology-screening-tanuki-01"
+    identity = {"model": "Sonnet 5", "project": "adr0001-topology-screening-fleet"}
+    author = mirror.build_author(seat, identity, "studio")
+    assert len(author) <= mirror.AUTHOR_MAX_LEN == 80
+    assert author == "%s · Sonnet 5 (studio)" % seat
+
+
+def test_build_author_drops_model_when_project_drop_is_not_enough():
+    seat = "s" * 60
+    author = mirror.build_author(seat, {"model": "Sonnet 5", "project": "p"}, "studio-machine")
+    assert author == "%s (studio-machine)" % seat
+    assert len(author) <= 80
+
+
+def test_build_author_hard_truncates_when_seat_and_machine_alone_exceed_80():
+    author = mirror.build_author("s" * 90, None, "studio")
+    assert len(author) == 80
+
+
+def test_post_content_reports_400_body(monkeypatch, capsys):
+    import io
+    import urllib.error
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {}, io.BytesIO(b'{"username": ["Must be 80 or fewer in length."]}'))
+
+    monkeypatch.setattr(mirror.urllib.request, "urlopen", fake_urlopen)
+    assert mirror.post_content("https://discord.invalid/hook", "hi", username="x" * 90) is False
+    assert "Must be 80 or fewer" in capsys.readouterr().err
