@@ -55,8 +55,12 @@ an unlisted kind is a loud error, never a silent default.
   also posts one claim row as you (`editing <relpath>`, thread key set, topic
   `board:<repo>`, so only seats on that board or that document receive it in
   their terminal; Discord's dashboard lane shows every row), and two seats on
-  one file inside the alive window make a forum thread appear. A heartbeat
-  delivery that holds a threaded row ends with the reply command
+  one file inside the alive window make a forum thread appear. A thread is
+  alive when two distinct non-status seats have posted within the window
+  (`threads_alive` in `comms threads` and in the compiled note); exchange is
+  the same rule after dropping claim rows, so it is true only when somebody
+  actually answered somebody (`threads_exchange` in `comms threads` and in the
+  note). A heartbeat delivery that holds a threaded row ends with the reply command
   (`COMMS_RUN=<runid> comms post reply --to <seat> --thread <key> "<text>"`)
   so the answer lands in the same thread. Delivery on a new doc
   subscription is FORWARD-ONLY (issue #57). This is what keeps per-reader
