@@ -88,6 +88,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
 sys.path.insert(0, SELF_DIR)
 import swarm_arm  # noqa: E402
 import swarm_mailbox  # noqa: E402
+import comms_render  # noqa: E402
 import mirror  # noqa: E402  (post_content, build_author, machine_label, lane state dir, secret handling)
 
 LANE = "convo"
@@ -273,7 +274,7 @@ def process_events(events):
         n = len(delta) if delta else delta_emitted
         seats = _distinct_seats(delta)
         author = _receiving_author(runid, agent_id, machine, identities_cache)
-        content = mirror.build_read_content(n, seats)
+        content = comms_render.build_read_content(n, seats, mirror.audience())
         posts.append((author, content))
     _save_attrib(attrib)
     return posts

@@ -42,10 +42,12 @@ verbatim. If none appeared, answer exactly NOTHING-APPEARED.
 `arm-probe.sh --help` lists the flags. The two that matter for an unfamiliar
 runtime: `--event` (which event to hook, default `PostToolUse`) and `--format`
 (`flat` for a `hooks.json`-shaped file, `wrapped` for a `settings.json`-shaped
-one, `auto` to guess from the file). Codex reads `hooks.json` only in the
-wrapped shape, so pass `--format wrapped` for Codex. With no `--config`, it
-writes an isolated `hooks.json` inside the probe dir that reaches no runtime --
-useful for inspecting the shape before you point it at anything real.
+one, `auto` to guess from the file, `none` for a config outside both shapes --
+see "Hand-wiring a non-Claude-shaped config" below). Codex reads `hooks.json`
+only in the wrapped shape, so pass `--format wrapped` for Codex. With no
+`--config`, it writes an isolated `hooks.json` inside the probe dir that
+reaches no runtime -- useful for inspecting the shape before you point it at
+anything real.
 
 ## Reading the result
 
@@ -75,6 +77,30 @@ The positive control is four checks, in this order:
    `--expect-event` / `--expect-tool` (the hook fired on the RIGHT thing);
 4. `hook-stdout.json` exists and carries THIS run's passphrase (the stimulus was
    emitted, and the evidence is not left over from an earlier arm).
+
+## Hand-wiring a non-Claude-shaped config
+
+`arm-probe.sh` edits exactly one JSON shape: `{"EVENT": [...]}` (flat) or
+`{"hooks": {"EVENT": [...]}}` (wrapped). Report B found five runtimes whose
+hook config is neither -- Gemini, Cline, Crush, Hermes, and an OpenCode
+plugin each use YAML, TOML, JS, or an in-process registration the kit cannot
+parse or write. `--format none` is for those: it writes NO config file
+anywhere, and instead writes `<probe-dir>/hand-wiring.txt` naming the exact
+hook command line (`bash <abs path to push-probe-hook.sh> <probe dir>`), the
+event to wire it on, and the envelope this run's hook will print (passphrase
+already substituted). Paste those three facts into the runtime's own config
+by hand, in whatever syntax it uses.
+
+Use `--format none` when a runtime's own docs, or a first look at its config
+file, show a schema outside the two JSON shapes above -- do not try to force
+`auto`, `flat`, or `wrapped` onto a config they cannot represent.
+
+What still makes the run count is unchanged: the positive control (the
+hook's stdin copy) is what proves the hook loaded and fired, exactly as it
+does for a config `arm-probe.sh` wrote itself. Hand-wiring changes how the
+hook command reaches the runtime's config, not what counts as evidence.
+`probe-verdict.sh` reads the same probe dir either way and does not know or
+care whether the config was written by the kit or by hand.
 
 ## Known-answer cases
 
