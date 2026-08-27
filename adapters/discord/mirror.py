@@ -23,9 +23,9 @@ build_content, format_row.
   author:  "<seat> · <model> on <project> (<machine>)", or, without
            enrollment identity (lib/swarm_arm --model/--project/--area),
            "<seat> (<machine>)". Sanitized against @everyone/@here and
-           zero-width characters (see _sanitize_author) -- identity is
+           zero-width characters (see comms_render) -- identity is
            display-only prose and never gates anything.
-  content: one leading emoji chosen by the row's shape (see KIND_EMOJI and
+  content: one leading emoji chosen by the row's shape (see comms_render and
            build_content's docstring) -- the "posted to mailbox" verb. The
            "agent born" verb (the ambient session-started status row) and
            the "heard from mailbox" verb (posted by adapters/discord/
@@ -178,6 +178,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "lib"))
 sys.path.insert(0, SELF_DIR)  # so `import threads` works however this is loaded
 import comms_machine  # noqa: E402  (machine_label, re-exported below)
+import comms_render  # noqa: E402  (runtime-agnostic audience vocabulary)
 import swarm_arm  # noqa: E402  (one roster reader; see IDENTITY below)
 import swarm_mailbox  # noqa: E402  (one parser; see READ PATH above)
 import swarm_threads  # noqa: E402  (the alive predicate; shared with bin/comms)
@@ -584,21 +585,6 @@ def resolve_audience():
         sys.exit(2)
 
 
-# author line invisible-but-present; stripped before ever leaving this
-# process. @everyone/@here are stripped too -- Discord's webhook username
-# field is plain text, not a mention, but a seat literally named "@everyone"
-# must never render as one in a human's eye.
-_ZERO_WIDTH_CHARS = "​‌‍﻿"  # ZWSP, ZWNJ, ZWJ, BOM/ZWNBSP
-_ZERO_WIDTH_RE = re.compile("[" + _ZERO_WIDTH_CHARS + "]")
-_MENTION_RE = re.compile(r"@(everyone|here)", re.IGNORECASE)
-
-
-def _sanitize_author(author):
-    author = _ZERO_WIDTH_RE.sub("", author)
-    author = _MENTION_RE.sub(lambda m: m.group(0).replace("@", ""), author)
-    return author
-
-
 AUTHOR_MAX_LEN = 80  # Discord webhook `username` limit (HTTP 400 above it)
 
 
@@ -614,32 +600,22 @@ def build_author(seat, identity, machine):
 
         <seat> (<machine>)
 
-    Sanitized against @everyone/@here and zero-width characters -- see
-    _sanitize_author.
+    Sanitized against @everyone/@here and zero-width characters by the shared
+    renderer.
     """
     identity = identity or {}
-    model = identity.get("model")
-    project = identity.get("project")
-    everyone = audience() == AUDIENCE_EVERYONE
+    selected_audience = audience()
     # Discord rejects a webhook `username` over AUTHOR_MAX_LEN with HTTP 400,
     # which the mirror does not retry, so the row would be skipped for good
     # (#59: 165 rows lost to 93-101 char lines). Shed the least identifying
     # segment first: project, then model, then hard-truncate the seat line.
     for use_model, use_project in ((True, True), (True, False), (False, False)):
-        parts = []
-        if use_model and model:
-            parts.append(str(model))
-        if use_project and project:
-            parts.append(("working on %s" if everyone else "on %s") % project)
-        if everyone:
-            # "<seat> · <model>, working on <project>": no machine name, a
-            # lay reader has no use for which computer the seat sits on.
-            author = seat if not parts else "%s · %s" % (seat, ", ".join(parts))
-        elif parts:
-            author = "%s · %s (%s)" % (seat, " ".join(parts), machine)
-        else:
-            author = "%s (%s)" % (seat, machine)
-        author = _sanitize_author(author)
+        reduced = dict(identity)
+        if not use_model:
+            reduced.pop("model", None)
+        if not use_project:
+            reduced.pop("project", None)
+        author = comms_render.build_author(seat, reduced, machine, selected_audience)
         if len(author) <= AUTHOR_MAX_LEN:
             return author
     return author[:AUTHOR_MAX_LEN]
@@ -651,57 +627,7 @@ def build_read_content(n, seats):
     context, sent by `seats` (first-seen order, may be empty when the
     reconstruction found none). Lives here, beside the other verbs, so one
     audience switch covers all three."""
-    if audience() == AUDIENCE_EVERYONE:
-        noun = "message" if n == 1 else "messages"
-        if not seats:
-            return "\U0001f440 Read %d new %s" % (n, noun)
-        if len(seats) == 1:
-            who = seats[0]
-        else:
-            who = "%s and %s" % (", ".join(seats[:-1]), seats[-1])
-        return "\U0001f440 Read %d new %s from %s" % (n, noun, who)
-    seats_label = ", ".join(seats) if seats else "unknown sender(s)"
-    return "\U0001f441️ read %d row(s) from %s" % (n, seats_label)
-
-
-# ---- content (kind -> emoji prefix) ----------------------------------------
-# Values are the literal emoji this event kind renders with in Discord (Drake's
-# explicit ask -- content only, never in a comment describing them, so this
-# dict is the one place their glyphs appear in this file).
-KIND_EMOJI = {
-    "finding": "\U0001f4ec✅",       # mailbox-with-mail + check mark: broadcast finding
-    "comment": "\U0001f4ec\U0001f4ac",   # mailbox-with-mail + speech balloon: broadcast comment
-    "reply": "↩️",             # leftwards arrow with hook: reply
-    "claim": "\U0001f4cc",               # pushpin: claim
-    "blocker": "\U0001f6a7",             # construction sign: blocker
-    "status": "ℹ️",            # information source: status (non-ambient)
-}
-
-# The ambient "session started" status row's exact text shape (see
-# adapters/claude-code's ambient status post); parsed out so it can render as
-# the "agent born" verb instead of the generic status emoji.
-_SESSION_STARTED_RE = re.compile(r"^session started in (.+)$")
-
-# The sendmessage-bridge's row shape: "-> <target>: <summary>". <target> is
-# either a real seat name or a bare agent_id (the complaint this feature
-# exists to fix -- see PR description). Agent ids observed in this run's
-# roster are 17 lowercase-hex characters; matched generically so any future
-# id of the same shape is caught, not just ones seen so far.
-_BRIDGE_RE = re.compile(r"^-> ([^:]+): (.*)$")
-_AGENT_ID_RE = re.compile(r"^[0-9a-f]{17}$")
-
-# The "everyone" vocabulary: one emoji plus a plain verb phrase per kind, so
-# a reader who has never seen a mailbox row knows what happened. Kept as a
-# table beside KIND_EMOJI so adding a kind means adding one row to each.
-EVERYONE_KIND_LABEL = {
-    "finding": "✅ Found something:",
-    "comment": "\U0001f4ac",                # speech balloon, no verb: it IS the comment
-    "reply": "↩️ Replying:",
-    "claim": "\U0001f4cc Taking this on:",
-    "blocker": "\U0001f6a7 Stuck:",
-    "status": "ℹ️ Update:",
-}
-_EVERYONE_UNKNOWN_LABEL = EVERYONE_KIND_LABEL["status"]
+    return comms_render.build_read_content(n, seats, audience())
 
 
 def build_content(row):
@@ -717,33 +643,12 @@ def build_content(row):
          rendered readably; a bare agent_id target is NEVER the bare object
          of the sentence (a raw 17-hex id means nothing to a human) --
          shortened to its first 8 chars and phrased as "a subagent (<short>)"
-      4. otherwise: kind's emoji (KIND_EMOJI, default the info-source emoji)
+      4. otherwise: kind's emoji (shared vocabulary, default info-source)
          + text
     """
-    text = str(row.get("text", ""))[:TEXT_CAP].replace("\n", " ")
-    kind = row.get("kind", "?")
-    topic = str(row.get("topic", ""))
-    if audience() == AUDIENCE_EVERYONE:
-        return _build_content_everyone(kind, topic, text)
-
-    if kind == "status":
-        m = _SESSION_STARTED_RE.match(text)
-        if m:
-            return "\U0001f423 I am awake in %s" % m.group(1)
-
-    if topic.startswith("@"):
-        return "\U0001f4e8 to %s: %s" % (topic[1:], text)
-
-    m = _BRIDGE_RE.match(text)
-    if m:
-        target, summary = m.group(1), m.group(2)
-        if _AGENT_ID_RE.match(target):
-            rendered = "sent to a subagent (%s): %s" % (target[:8], summary)
-        else:
-            rendered = "sent to %s: %s" % (target, summary)
-        return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), rendered)
-
-    return "%s %s" % (KIND_EMOJI.get(kind, "ℹ️"), text)
+    adapted = dict(row)
+    adapted["text"] = str(row.get("text", ""))[:TEXT_CAP]
+    return comms_render.build_content(adapted, audience())
 
 
 def _build_content_everyone(kind, topic, text):
@@ -752,26 +657,9 @@ def _build_content_everyone(kind, topic, text):
     folder name), no bare agent id (a helper agent is "a helper agent"),
     the envelope stays on direct messages because it is the one glyph a
     demo audience already reads as "one agent talking to another"."""
-    if kind == "status":
-        m = _SESSION_STARTED_RE.match(text)
-        if m:
-            folder = os.path.basename(m.group(1).rstrip("/")) or m.group(1)
-            return "\U0001f44b Joined, working in %s" % folder
-
-    if topic.startswith("@"):
-        return "\U0001f4e8 Message to %s: %s" % (topic[1:], text)
-
-    m = _BRIDGE_RE.match(text)
-    if m:
-        # One verb, whatever the kind: "Found something: Sent a note to" is
-        # two clauses for one act.
-        target, summary = m.group(1), m.group(2)
-        if _AGENT_ID_RE.match(target):
-            return "\U0001f4ac Sent a note to a helper agent: %s" % summary
-        return "\U0001f4ac Sent a note to %s: %s" % (target, summary)
-
-    label = EVERYONE_KIND_LABEL.get(kind, _EVERYONE_UNKNOWN_LABEL)
-    return "%s %s" % (label, text)
+    return comms_render._build_content_everyone(
+        kind, topic, text[:TEXT_CAP], AUDIENCE_EVERYONE
+    )
 
 
 def format_row(row, machine, identity=None):
@@ -1141,16 +1029,7 @@ def thread_title(key):
     without its "doc:" prefix ("doc:comms/a.md" -> "comms/a.md"), capped at
     Discord's THREAD_NAME_CAP. The prefix is a namespace for machines; a
     person reading a forum sidebar wants the path."""
-    title = str(key)
-    if title.startswith(swarm_mailbox.THREAD_KEY_PREFIX):
-        title = title[len(swarm_mailbox.THREAD_KEY_PREFIX):]
-    if audience() == AUDIENCE_EVERYONE and "/" in title:
-        # "mirror.py · comms": the file name first, the repository after.
-        # The map is keyed on `key`, never on this title, so flipping the
-        # audience after a thread exists renames nothing and opens nothing.
-        repo, _, rel = title.partition("/")
-        name = rel.rstrip("/").rsplit("/", 1)[-1]
-        title = "%s · %s" % (name, repo) if name else repo
+    title = comms_render.thread_title(key, audience())
     return title[:THREAD_NAME_CAP] or str(key)[:THREAD_NAME_CAP]
 
 
