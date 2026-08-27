@@ -167,7 +167,6 @@ Exit: 0 mirrored (or nothing new) | 1 some rows skipped after retries |
 import fcntl
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -635,6 +634,7 @@ def build_content(row):
     adapted = dict(row)
     adapted["text"] = str(row.get("text", ""))[:TEXT_CAP]
     return comms_render.build_content(adapted, audience())
+
 
 def format_row(row, machine, identity=None):
     """(author, content) for one row -- author is this row's seat's Discord
