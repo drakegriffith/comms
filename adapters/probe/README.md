@@ -42,9 +42,10 @@ verbatim. If none appeared, answer exactly NOTHING-APPEARED.
 `arm-probe.sh --help` lists the flags. The two that matter for an unfamiliar
 runtime: `--event` (which event to hook, default `PostToolUse`) and `--format`
 (`flat` for a `hooks.json`-shaped file, `wrapped` for a `settings.json`-shaped
-one, `auto` to guess from the file). With no `--config`, it writes an isolated
-`hooks.json` inside the probe dir that reaches no runtime -- useful for
-inspecting the shape before you point it at anything real.
+one, `auto` to guess from the file). Codex reads `hooks.json` only in the
+wrapped shape, so pass `--format wrapped` for Codex. With no `--config`, it
+writes an isolated `hooks.json` inside the probe dir that reaches no runtime --
+useful for inspecting the shape before you point it at anything real.
 
 ## Reading the result
 

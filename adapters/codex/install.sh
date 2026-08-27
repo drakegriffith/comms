@@ -8,6 +8,12 @@
 # its own heartbeat: this installer points Codex at the SAME script the
 # claude-code adapter ships. One implementation, two runtimes.
 #
+# Codex loads hooks.json only in the WRAPPED shape
+# ({"hooks": {"PostToolUse": [...]}}). A flat top-level event map is rejected
+# silently at runtime, so this installer always emits and preserves the wrapped
+# shape. An existing flat file is migrated, moving every top-level event list
+# under "hooks" so the result holds exactly one shape.
+#
 # Idempotent: an entry whose command mentions swarm-heartbeat.sh is detected
 # and left alone; other entries are never clobbered; the file is created if
 # absent. Override the target with COMMS_CODEX_HOOKS=<path> for testing.
@@ -34,18 +40,34 @@ try:
     with open(path) as fh:
         data = json.load(fh)
 except FileNotFoundError:
-    data = {}
+    data = {"hooks": {"PostToolUse": []}}
 except json.JSONDecodeError as exc:
     # Refusing beats clobbering: a rewrite of an unparseable file would
     # silently destroy whatever the broken bytes were.
     sys.stderr.write("refusing to edit %s: not valid JSON (%s)\n" % (path, exc))
     sys.exit(1)
 
-# hooks.json shape: tolerate both a top-level event map ({"PostToolUse": [...]})
-# and a settings-style wrapper ({"hooks": {"PostToolUse": [...]}}). An existing
-# "hooks" dict is honoured; a fresh file gets the top-level event map, matching
-# the file's own name.
-container = data["hooks"] if isinstance(data.get("hooks"), dict) else data
+if not isinstance(data, dict):
+    sys.stderr.write("refusing to edit %s: top level is not an object\n" % path)
+    sys.exit(1)
+
+migrated = False
+if isinstance(data.get("hooks"), dict):
+    # Existing wrapped shape: add the entry under the existing "hooks" dict.
+    container = data["hooks"]
+else:
+    # Flat shape: Codex rejects it, so migrate every top-level event list into
+    # the wrapped shape. Non-list keys stay at the top level.
+    container = {}
+    for k in list(data.keys()):
+        v = data.pop(k)
+        if isinstance(v, list):
+            container[k] = v
+        else:
+            data[k] = v
+    data["hooks"] = container
+    migrated = True
+
 ptu = container.setdefault("PostToolUse", [])
 if not isinstance(ptu, list):
     sys.stderr.write("refusing to edit %s: PostToolUse is not a list\n" % path)
@@ -58,10 +80,25 @@ present = any(
     for h in (entry.get("hooks") or [])
     if isinstance(h, dict)
 )
-if present:
+
+# Only write when something changed.
+written = False
+if migrated:
+    print("codex hook wiring: migrated flat hooks.json to wrapped shape in %s" % path)
+    if present:
+        print("codex hook wiring: heartbeat entry already present in %s" % path)
+    else:
+        ptu.append({"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
+        print("codex hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
+    written = True
+elif present:
     print("codex hook wiring: already present in %s, left untouched" % path)
 else:
     ptu.append({"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
+    print("codex hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
+    written = True
+
+if written:
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -70,7 +107,6 @@ else:
         json.dump(data, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, path)
-    print("codex hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
 PY
 
 echo "note: headless codex runs need --dangerously-bypass-hook-trust (hook trust"
