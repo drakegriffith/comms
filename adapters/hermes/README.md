@@ -14,7 +14,7 @@ Nothing yet. This adapter ships the shim and the wiring recipe; both the poll
 test and push probe are owed. Hermes is not on PATH on the Mac where this was
 written, so no live run could prove either category.
 
-Documentation measurement: **doc read 2026-08-27, version unstated**.
+Documentation measurement: **doc read 2026-08-27, version unstated** (hermes-agent.nousresearch.com/docs/user-guide/features/hooks).
 
 What the Hermes docs claim:
 
@@ -45,10 +45,24 @@ hooks:
     - command: "<repo>/adapters/hermes/hook.sh"
 ```
 
-To prove push before switching to it, run the probe. For non-JSON configs like
-Hermes's YAML, `adapters/probe/arm-probe.sh --format none` prints the probe
-hook command and probe dir so you can paste the same command into the stanza
-above by hand.
+To prove push before switching to it, run the probe, with one translation.
+`adapters/probe/arm-probe.sh --format none --dir <d>` (on master since PR #68)
+writes `<d>/hand-wiring.txt` with the probe hook command and the envelope it
+prints. That envelope is the Claude shape (`hookSpecificOutput.additionalContext`),
+which Hermes ignores on a shell hook: it reads stdout as JSON and injects only
+`{"context": ...}`, so pasting the probe command unmodified yields a hook that
+fires (stdin copy present) and an agent that sees nothing, and
+`probe-verdict.sh` would record NOT-PUSH for the wrong reason. Wire the probe
+through this two-line translation instead:
+
+```yaml
+  pre_llm_call:
+    - command: "sh -c 'bash <repo>/adapters/probe/push-probe-hook.sh <d> | python3 -c \"import json,sys; o=json.load(sys.stdin); print(json.dumps({\\\"context\\\": o[\\\"hookSpecificOutput\\\"][\\\"additionalContext\\\"]}))\"'"
+```
+
+Read the stdin copy first (positive control), then the answer, then run
+`probe-verdict.sh <d>` as the kit documents. Doc: the Hermes hooks page,
+`hermes-agent.nousresearch.com/docs/user-guide/features/hooks`, read 2026-08-27.
 
 Then, in the seat's brief, enroll explicitly on line one with the Hermes
 session id as the agent id:
