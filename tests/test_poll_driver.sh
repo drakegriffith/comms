@@ -463,6 +463,18 @@ eq "--cursor with --subs is refused as a usage error" 2 "$rc"
 case "$REFUSE_OUT" in *"--cursor cannot be combined with --subs"*) ok "--cursor with --subs names the reason" ;; *) bad "--cursor with --subs names the reason (got: $REFUSE_OUT)" ;; esac
 assert "--cursor with --subs writes no cursor file" "$([ ! -e "$WORK/fixed.json" ]; echo $?)"
 
+# The kimi adapter derives a digest at startup too: same loud decline, no traceback.
+KNOMAIL_TREE="$WORK/knomail-tree"
+mkdir -p "$KNOMAIL_TREE/bin" "$KNOMAIL_TREE/lib" "$KNOMAIL_TREE/adapters/kimi"
+cp "$COMMS" "$KNOMAIL_TREE/bin/comms"; cp "$DRIVER" "$KNOMAIL_TREE/bin/comms-poll-driver"
+cp "$KIMI_DRIVER" "$KNOMAIL_TREE/adapters/kimi/poll-driver.sh"
+chmod +x "$KNOMAIL_TREE/bin/comms" "$KNOMAIL_TREE/bin/comms-poll-driver" "$KNOMAIL_TREE/adapters/kimi/poll-driver.sh"
+KNOMAIL_ERR="$WORK/knomail.err"
+"$KNOMAIL_TREE/adapters/kimi/poll-driver.sh" "$NOMAIL_RUN" alpha sess-x "$WORK" --once >/dev/null 2>"$KNOMAIL_ERR"; rc=$?
+eq "kimi adapter missing swarm_mailbox: exits 1" 1 "$rc"
+eq "kimi adapter missing swarm_mailbox: one adapter-owned stderr line" 1 "$(grep -c "^kimi poll-driver: cannot derive the subscription view" "$KNOMAIL_ERR")"
+eq "kimi adapter missing swarm_mailbox: no raw traceback" 0 "$(grep -c "Traceback" "$KNOMAIL_ERR")"
+
 # ---- 16. isolation control: nothing leaked outside the temp dirs -----------
 if [ -e "$HOME/.comms/state/poll-driver/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \
    || [ -e "$HOME/.comms/state/kimi-cursor/$RUN-zeta" ]; then

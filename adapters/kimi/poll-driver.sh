@@ -61,7 +61,10 @@ done
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 CURSOR_DIR="$STATE_DIR/kimi-cursor"
 OLD_CURSOR="$CURSOR_DIR/$RUNID-$SEAT"        # pre-#30: a last-delivered `at`
-SUBS_DIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../../lib" "$RUNID" "$SEAT")" || exit 1
+SUBS_DIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../../lib" "$RUNID" "$SEAT" 2>/dev/null)" || {
+  echo "kimi poll-driver: cannot derive the subscription view (swarm_mailbox unavailable under $SELF_DIR/../../lib); declining delivery" >&2
+  exit 1
+}
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._@-' '_'; }
 DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
 CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").subs-$SUBS_DIGEST.json"
