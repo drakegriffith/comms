@@ -10,7 +10,7 @@ terminal/seat). Send ONE mailbox row, confirm it landed, report in one line.
 No exploration, no reading the comms repo first.
 
 <!-- Canonical source: adapters/claude-code/skills/comms-say/SKILL.md in the
-     comms repo. install.sh renders __COMMS_ROOT__ to the checkout path and
+     comms repo. install.sh renders the repo-path placeholder and
      copies this file into ~/.claude/skills/; edit it there, not here. -->
 
 ## Send
