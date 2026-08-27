@@ -7,7 +7,9 @@
 #   1. returns a context containing a peer row posted after enrollment,
 #   2. returns {} with rc 0 when there are no new rows,
 #   3. returns {} with rc 0 on malformed stdin (never block the host),
-#   4. advances the heartbeat cursor at $COMMS_STATE_DIR/swarm-cursor/<runid>/<agent_id>.
+#   4. advances the heartbeat cursor at $COMMS_STATE_DIR/swarm-cursor/<runid>/<agent_id>,
+#   5. reports a missing heartbeat on stderr while returning {} with rc 0,
+#   6. keeps its subprocess timeout below Hermes's 60-second default.
 #
 # All state is isolated: COMMS_ROOT and COMMS_STATE_DIR are mktemp dirs.
 
@@ -108,6 +110,30 @@ assert "cursor file exists at swarm-cursor/<runid>/<agent_id>" "$([ -f "$CURSOR"
 case "$(cat "$CURSOR" 2>/dev/null || echo "")" in
   2026-*) ok "cursor holds an ISO timestamp" ;;
   *) bad "cursor does not hold a timestamp (got: $(cat "$CURSOR" 2>/dev/null))" ;;
+esac
+
+# ---- 5. missing heartbeat is loud but never blocks --------------------------
+MISSING_REPO="$(mktemp -d)"
+mkdir -p "$MISSING_REPO/adapters/hermes"
+cp "$HOOK" "$MISSING_REPO/adapters/hermes/hook.sh"
+chmod +x "$MISSING_REPO/adapters/hermes/hook.sh"
+missing_err="$MISSING_REPO/stderr"
+out="$(hermes_payload | "$MISSING_REPO/adapters/hermes/hook.sh" 2>"$missing_err")"; rc=$?
+eq "missing heartbeat exits 0" 0 "$rc"
+eq "missing heartbeat stdout is {}" '{}' "$out"
+assert "missing heartbeat reports one stderr line" "$(grep -qx 'hermes hook: heartbeat file missing' "$missing_err"; echo $?)"
+eq "missing heartbeat stderr has exactly one line" 1 "$(wc -l < "$missing_err" | tr -d ' ')"
+rm -rf "$MISSING_REPO"
+
+# ---- 6. shim timeout stays below Hermes's 60-second default -----------------
+# A grep assertion is deliberate: this is a source-level collision invariant.
+timeout_seconds="$(sed -n 's/^[[:space:]]*timeout=\([0-9][0-9]*\),$/\1/p' "$HOOK")"
+case "$timeout_seconds" in
+  ''|*[!0-9]*) bad "subprocess timeout constant is a readable integer" ;;
+  *)
+    ok "subprocess timeout constant is a readable integer"
+    assert "subprocess timeout is below Hermes default 60 seconds" "$([ "$timeout_seconds" -lt 60 ]; echo $?)"
+    ;;
 esac
 
 echo

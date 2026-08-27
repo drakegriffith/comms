@@ -212,6 +212,7 @@ tick-list, derived from `adapters/codex/`.
 | Kimi | resume-driver | push (a) by ASSERTED ABSENCE: no hook surface, so nothing can run after a tool call and the push probe cannot be installed. Poll test fails too -- no in-session way to read the mailbox. (b) passes: `kimi -r <id> -p` delivers into a live session | pre-extraction |
 | grok (xAI) | poll | hooks load and fire (stdin copy present) and stdout is discarded (`NOTHING-APPEARED`) -- a measured push negative | 2026-08-25, grok 0.2.106 |
 | pi (badlogic) | poll | no hook surface; runs shell commands in its own turn | pre-extraction |
+| Hermes (NousResearch) | UNVERIFIED | adapter present, no probe run; `pre_llm_call` is once per turn, not a tool boundary | 2026-08-27, doc version unstated |
 
 Everything else is UNVERIFIED until probed. Gemini CLI, Qwen Code, Copilot CLI
 and Cursor get poll if and only if they pass the poll test, which nobody has

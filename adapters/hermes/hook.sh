@@ -93,17 +93,19 @@ heartbeat_payload = {
     "cwd": cwd,
 }
 
-# Run the one heartbeat, capturing stdout. Any failure is a silent no-op.
+# Run the one heartbeat, capturing stdout. Any failure is a no-op.
 heartbeat_stdout = ""
 try:
     if not HEARTBEAT or not os.path.isfile(HEARTBEAT):
+        sys.stderr.write("hermes hook: heartbeat file missing\n")
         emit_empty()
     proc = subprocess.run(
         ["bash", HEARTBEAT],
         input=json.dumps(heartbeat_payload),
         capture_output=True,
         text=True,
-        timeout=60,
+        # Stay below Hermes's default 60 s timeout so the shim resolves first.
+        timeout=45,
     )
     heartbeat_stdout = proc.stdout or ""
 except Exception:
