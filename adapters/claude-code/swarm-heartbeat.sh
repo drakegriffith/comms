@@ -195,6 +195,24 @@
 #   (`comms post reply --to <seat> --thread <key> "<text>"`). A row with
 #   neither renders exactly as before.
 #
+# DELIVERY ORDER
+#   Rows FOR THIS SEAT -- its "@<seat>" unicast or a subscribed thread -- are
+#   emitted first in `at` order and never consume the ordinary-row CAP. The CAP
+#   remains 10 for everything else. Status rows older than the configured alive
+#   window are consumed without emission or overflow. Measured incident,
+#   2026-08-27: a fresh Codex seat on machine-ops had a cursor at 2026-08-24 and
+#   1,397 unread rows, including 663 stale status rows; a unicast posted at
+#   01:06 sat behind about 1,370 unread rows delivered 10 per beat. Starting the
+#   cursor at enrol time was discarded because it drops pending rows meant for
+#   the seat; raising CAP loses the context bound. Advancing the cursor past the
+#   whole pass and leaving ordinary overflow reachable only through --replay was
+#   also discarded: silent loss from push on a busy board costs more than one
+#   extra forwarded-set state file. The cursor therefore stops at the last
+#   emitted ordinary row during overflow, while the per-seat forwarded set keeps
+#   already-emitted priority rows from repeating on later beats. If FOR-YOU rows
+#   alone ever exceed about 10 in one beat on a real run, this uncapped lane
+#   needs its own ceiling.
+#
 # ISOLATION KNOBS (tests set these; production uses the defaults)
 #   COMMS_STATE_DIR   swarm-arm/ registry + cursor dir + telemetry log
 #                     (falls back to the pre-extraction SWARM_HEARTBEAT_STATE_DIR,
@@ -250,7 +268,8 @@ fi
 export HB_PAYLOAD="$input"
 export HB_STATE_DIR="$STATE_DIR"
 # The participant registry (swarm_arm) is IMPORTED, one implementation, never
-# re-derived here. Resolved from this checkout's own lib/, nowhere else.
+# re-derived here. Resolved from this checkout's own lib/, nowhere else: a test
+# that needs a different lib/ copies the adapter into a tree of its own.
 export HB_SWARM_LIB="$HB_REPO_ROOT/lib"
 # COMMS_ROOT / CLAUDE_SWARM_ROOT are inherited if set; python defaults the root
 # to /tmp otherwise, matching swarm_mailbox.py's own resolution order.
@@ -270,6 +289,13 @@ try:
 except Exception:
     # Cannot load the registry -> behave like no-armed-run: silent, no output.
     sys.exit(0)
+try:
+    import swarm_threads
+except Exception as exc:
+    # Older live-shim checkouts can lack this optional stale-status helper.
+    # Keep delivery live and disable only stale skipping.
+    swarm_threads = None
+    sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)
 
 payload_raw = os.environ.get("HB_PAYLOAD", "")
 state_dir = os.environ.get("HB_STATE_DIR") or os.path.expanduser("~/.comms/state")
@@ -374,6 +400,7 @@ def append_telemetry(runid, topic_label, rows_inspected, delta_emitted, short_ci
 
 row_lines = []                 # emitted rows across every participating run
 deferred_cursor = []           # (cursor_dir, cursor_file, new_cursor)
+deferred_forwarded = []        # (cursor_dir, forwarded_file, keys)
 deferred_mtime = []            # (cursor_dir, mtime_file, "set"|"clear", val)
 enrolled_this_beat = set()     # runids whose subscription GREW on this beat
 
@@ -395,6 +422,7 @@ def process_run(runid):
 
     cursor_dir = os.path.join(state_dir, "swarm-cursor", runid)
     cursor_file = os.path.join(cursor_dir, safe_agent)
+    forwarded_file = cursor_file + ".forwarded"
     mtime_file = cursor_file + ".mtime"
     mailbox_dir = os.path.join(swarm_root, "comms-%s" % runid)
 
@@ -403,6 +431,16 @@ def process_run(runid):
             cursor = fh.read().strip()
     except OSError:
         cursor = ""
+
+    forwarded = set()
+    try:
+        with open(forwarded_file) as fh:
+            for line in fh:
+                key = line.rstrip("\n").split("\t", 1)
+                if len(key) == 2 and key[0]:
+                    forwarded.add((key[0], key[1]))
+    except OSError:
+        pass
 
     if not os.path.isdir(mailbox_dir):
         append_telemetry(runid, topic_label, 0, 0)
@@ -487,21 +525,71 @@ def process_run(runid):
     delta = [r for r in rows if (r.get("at") or "") > cursor]
     delta.sort(key=lambda r: r.get("at", ""))
 
+    # Ambient session births stop being useful after the same alive window the
+    # thread model uses. A malformed timestamp is deliberately retained: bad
+    # input must not become silent message loss. Keep the original delta for
+    # the cursor edge, so skipped stale rows are consumed exactly like emitted
+    # rows even when every deliverable row was filtered away.
+    alive_window_s = None
+    if swarm_threads is not None:
+        alive_window_s = swarm_threads.env_int(
+            swarm_threads.ALIVE_SECONDS_VAR, swarm_threads.DEFAULT_WINDOW_S
+        )
+    beat_now = datetime.datetime.now(datetime.timezone.utc)
+    deliverable = []
+    for r in delta:
+        row_at = swarm_threads.parsed_at(r) if swarm_threads is not None else None
+        stale_status = (
+            alive_window_s is not None
+            and r.get("kind") == swarm_threads.STATUS_KIND
+            and row_at is not None
+            and (beat_now - row_at).total_seconds() > alive_window_s
+        )
+        if not stale_status:
+            deliverable.append(r)
+
     if not delta:
         deferred_mtime.append((cursor_dir, mtime_file, "set", newest))
         append_telemetry(runid, topic_label, rows_inspected, 0)
         return
 
-    emitted = delta[:CAP]
-    overflow = len(delta) - len(emitted)
-    new_cursor = emitted[-1].get("at", "")
+    for_you_topic = ("@" + seat) if seat else None
+    priority_all = [
+        r for r in deliverable
+        if (for_you_topic and (r.get("topic") or "default") == for_you_topic)
+        or (subs is not None and (r.get("thread") or "") in subs)
+    ]
+    priority = [
+        r for r in priority_all
+        if not r.get("at") or (r.get("at"), r.get("seat") or "") not in forwarded
+    ]
+    ordinary = [r for r in deliverable if r not in priority_all]
+    emitted = priority + ordinary[:CAP]
+    overflow = max(0, len(ordinary) - CAP)
+    # Preserve ordinary push continuity under overflow. Priority rows beyond
+    # this edge are remembered separately so they do not repeat next beat.
+    new_cursor = (
+        ordinary[CAP - 1].get("at", "")
+        if overflow > 0
+        else delta[-1].get("at", "")
+    )
+    # Keys are timestamps; a corrupt line whose key does not start with a
+    # digit would sort above every cursor and pin itself forever, so drop it.
+    forwarded = {
+        key for key in forwarded
+        if key[0] > new_cursor and key[0][:1].isdigit()
+    }
+    forwarded.update(
+        (r.get("at"), r.get("seat") or "")
+        for r in priority
+        if r.get("at") and r.get("at") > new_cursor
+    )
 
     # FOR-YOU FLAG + THREAD SUFFIX (issue #41): a row riding this agent's own
     # unicast topic "@<seat>" is addressed to it specifically, and a `thread`
     # field names the document/conversation a reply belongs in -- both are
     # purely additive to the line format, so a row with neither renders
     # BYTE-IDENTICAL to before.
-    for_you_topic = ("@" + seat) if seat else None
     for r in emitted:
         prefix = ""
         if for_you_topic and (r.get("topic") or "default") == for_you_topic:
@@ -537,6 +625,7 @@ def process_run(runid):
         )
 
     deferred_cursor.append((cursor_dir, cursor_file, new_cursor))
+    deferred_forwarded.append((cursor_dir, forwarded_file, forwarded))
     # overflow un-surfaced => force next beat to parse (clear); else short-circuit
     deferred_mtime.append(
         (cursor_dir, mtime_file, "clear" if overflow > 0 else "set", newest)
@@ -731,6 +820,15 @@ for cursor_dir, cursor_file, new_cursor in deferred_cursor:
         os.makedirs(cursor_dir, exist_ok=True)
         with open(cursor_file, "w") as fh:
             fh.write(new_cursor)
+    except OSError:
+        pass
+
+for cursor_dir, forwarded_file, forwarded in deferred_forwarded:
+    try:
+        os.makedirs(cursor_dir, exist_ok=True)
+        with open(forwarded_file, "w") as fh:
+            for at, seat in sorted(forwarded):
+                fh.write("%s\t%s\n" % (at, seat))
     except OSError:
         pass
 
