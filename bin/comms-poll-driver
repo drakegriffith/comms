@@ -30,9 +30,12 @@
 #   CLI's, because a row in topic X belongs to both the plain view and the
 #   --topic X view and would be delivered once per view. A subscription view is
 #   re-derived every poll; a changed set starts a fresh cursor and replays,
-#   loudly. --cursor/--log override those derived paths.
+#   loudly. --log overrides the derived log path. --cursor overrides the cursor
+#   path and is REFUSED together with --subs: a fixed cursor file cannot follow
+#   a view whose name changes, so it would restore the very drop the digest
+#   prevents while still announcing a replay.
 #
-# KNOWN LIMIT, issue #73: append_mirrored can add a row with an old `at`, which
+# KNOWN LIMIT, issue #76: append_mirrored can add a row with an old `at`, which
 #   inserts mid-view; a per-poster count cursor can then skip that row. That
 #   pre-existing ordering problem is out of scope here.
 #
@@ -133,6 +136,8 @@ LOG_OVERRIDE="$LOG_FILE"
 [ "$HAVE_CMD" -eq 1 ] || { echo "$PROG: no delivery command (it goes after --)" >&2; usage; }
 [ "$SUBS" -eq 1 ] && [ -n "$TOPIC" ] && {
   echo "$PROG: pass either --topic or --subs, not both" >&2; exit 2; }
+[ "$SUBS" -eq 1 ] && [ -n "$CURSOR_FILE" ] && {
+  echo "$PROG: --cursor cannot be combined with --subs: the subscription view names its own cursor (<seat>.subs-<digest>.json) and a fixed file would skip rows after a subscription change" >&2; exit 2; }
 [ -z "$CWD" ] || [ -d "$CWD" ] || {
   echo "$PROG: cwd does not exist: $CWD" >&2; exit 1; }
 
@@ -247,7 +252,13 @@ run_once() {
   # than applying narrow-view counts to a wider board.
   next_view="$VIEW"
   if [ "$SUBS" -eq 1 ]; then
-    next_view="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT")" || return 0
+    # A checkout whose lib/ cannot supply the digest cannot name its view: decline
+    # delivery LOUDLY and stop, never poll forever reporting success (the same
+    # rule the heartbeat applies when swarm_mailbox is missing).
+    next_view="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT" 2>/dev/null)" || {
+      echo "$PROG: cannot derive the subscription view (swarm_mailbox unavailable under $SELF_DIR/../lib); declining delivery" >&2
+      exit 1
+    }
   fi
   if [ -n "$PREVIOUS_VIEW" ] && [ "$next_view" != "$PREVIOUS_VIEW" ]; then
     echo "$PROG: subscription view changed $PREVIOUS_VIEW -> $next_view; replaying the subscribed board" >&2

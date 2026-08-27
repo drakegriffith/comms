@@ -437,6 +437,32 @@ case "$out" in *migration-before-subscribed*|*migration-before-unsubscribed*)
   bad "kimi migration excludes pre-timestamp rows (got: $out)" ;;
   *) ok "kimi migration excludes pre-timestamp rows" ;; esac
 
+# ---- 15b. loud decline when lib/ cannot supply the digest; --cursor refused with --subs
+# The heartbeat declines loudly when swarm_mailbox is missing (x-12); the driver
+# must do the same instead of polling forever and reporting success.
+NOMAIL_RUN="nomail-$$"
+"$COMMS" init "$NOMAIL_RUN" >/dev/null
+"$COMMS" subscribe "$NOMAIL_RUN" alpha proj >/dev/null
+"$COMMS" post "$NOMAIL_RUN" gamma finding "NOMAIL-ROW" --topic proj >/dev/null
+NOMAIL_TREE="$WORK/nomail-tree"
+mkdir -p "$NOMAIL_TREE/bin" "$NOMAIL_TREE/lib"
+cp "$COMMS" "$NOMAIL_TREE/bin/comms"
+cp "$DRIVER" "$NOMAIL_TREE/bin/comms-poll-driver"
+cp "$REPO/lib/swarm_arm.py" "$NOMAIL_TREE/lib/swarm_arm.py" 2>/dev/null || true
+chmod +x "$NOMAIL_TREE/bin/comms" "$NOMAIL_TREE/bin/comms-poll-driver"
+NOMAIL_ERR="$WORK/nomail.err"
+NOMAIL_OUT="$("$NOMAIL_TREE/bin/comms-poll-driver" "$NOMAIL_RUN" alpha --subs --once -- /usr/bin/true 2>"$NOMAIL_ERR")"; rc=$?
+eq "missing swarm_mailbox: driver exits 1, never 0" 1 "$rc"
+eq "missing swarm_mailbox: exactly one driver-owned stderr line" 1 "$(grep -c "^comms-poll-driver: cannot derive the subscription view" "$NOMAIL_ERR")"
+eq "missing swarm_mailbox: no raw traceback reaches stderr" 0 "$(grep -c "Traceback" "$NOMAIL_ERR")"
+# Positive control: the real tree delivers the same row.
+CTRL_OUT="$("$DRIVER" "$NOMAIL_RUN" alpha --subs --once --dry-run -- /usr/bin/true 2>&1)"
+case "$CTRL_OUT" in *NOMAIL-ROW*) ok "missing swarm_mailbox control: the real tree previews the row" ;; *) bad "missing swarm_mailbox control: the real tree previews the row (got: $CTRL_OUT)" ;; esac
+REFUSE_OUT="$("$DRIVER" "$NOMAIL_RUN" alpha --subs --cursor "$WORK/fixed.json" --once -- /usr/bin/true 2>&1)"; rc=$?
+eq "--cursor with --subs is refused as a usage error" 2 "$rc"
+case "$REFUSE_OUT" in *"--cursor cannot be combined with --subs"*) ok "--cursor with --subs names the reason" ;; *) bad "--cursor with --subs names the reason (got: $REFUSE_OUT)" ;; esac
+assert "--cursor with --subs writes no cursor file" "$([ ! -e "$WORK/fixed.json" ]; echo $?)"
+
 # ---- 16. isolation control: nothing leaked outside the temp dirs -----------
 if [ -e "$HOME/.comms/state/poll-driver/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \
    || [ -e "$HOME/.comms/state/kimi-cursor/$RUN-zeta" ]; then
