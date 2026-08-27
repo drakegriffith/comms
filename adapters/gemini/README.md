@@ -77,8 +77,11 @@ Gemini's AfterTool field names already match the heartbeat: `session_id`,
 | `replace` | `Edit` |
 | `read_file` | `Read` |
 
-These are the four of Gemini CLI's seven migration mappings that have heartbeat
-branches. `Glob`, `Grep`, and `LS` have no heartbeat branch. The migration
+Three of Gemini CLI's seven migration mappings reach a heartbeat branch
+(`Bash`, `Write`, `Edit`: `FILE_TOOLS` and the Bash leg in
+`adapters/claude-code/swarm-heartbeat.sh`). `read_file` -> `Read` is mapped for
+vocabulary consistency ahead of any future Read branch; the heartbeat has none
+today. `Glob`, `Grep`, and `LS` have no heartbeat branch and are not mapped. The migration
 names `grep` and `ls` are also stale relative to current `grep_search` and
 `list_directory`, at commit `3c311beac2e7`.
 Unknown names pass through untouched. The input `hook_event_name` also passes
@@ -94,7 +97,8 @@ Gemini treats hook exit codes 2 and above as a denied tool result, using stderr
 as the denial reason when stdout is empty. The shim therefore never propagates
 the heartbeat's exit status. On heartbeat failure it returns 0, emits empty
 stdout so no hook context is added, suppresses shim stderr, and appends the
-diagnostic to `$COMMS_STATE_DIR/gemini-hook.log`.
+diagnostic to `$COMMS_STATE_DIR/gemini-hook.log` (with the variable unset:
+`${TMPDIR:-/tmp}/comms-state/gemini-hook.log`).
 
 The heartbeat cursor is separate from the poll cursor. It is keyed by run and
 `session_id` here, because Gemini supplies no `agent_id`, and advances only
