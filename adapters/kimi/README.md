@@ -28,10 +28,10 @@ Constraints worth knowing before debugging:
 `poll-driver.sh` used to contain the read/format/invoke/remember loop. That
 loop had nothing kimi-specific in it except the invocation, so it lives once in
 `bin/comms-poll-driver` (issue #29) and this script is the kimi-shaped part:
-the resume command, the directory-bound cwd, and the cursor key. It expands to
+the resume command and the directory-bound cwd. It expands to
 
 ```
-bin/comms-poll-driver <runid> <seat> --subs --cursor <cursor> --cwd <cwd> \
+bin/comms-poll-driver <runid> <seat> --subs --cwd <cwd> \
     -- kimi -r <session-id> -p '{}' --output-format text
 ```
 
@@ -48,15 +48,16 @@ sees the whole board, preserving the mailbox's backward-compatible contract.
 **Cursor format and key changed.** The old cursor was the `at` of the last row
 delivered, at `$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>`; the current
 subscription-view cursor is per-poster counts at
-`$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>.subs-<digest>.json`, where the
+`$COMMS_STATE_DIR/poll-driver/<runid>/<seat>.subs-<digest>.json`, where the
 digest names the effective sorted subscription set by the same rule as the CLI
-read cursor. The shared helper stores the counts in that file. Both formats mean "everything
+read cursor. The view is re-derived on every loop poll, so a mid-run change
+selects a fresh digest path, reports the change on stderr, and replays the
+subscribed board. The shared helper stores the counts in that file. Both formats mean "everything
 up to here is delivered", so the driver TRANSLATES an existing timestamp cursor
 on its first run -- a seat's count is how many of its rows are at or before
 that timestamp -- and leaves the old file as `<runid>-<seat>.pre-counts`. A
 live seat with the former view-less `.subs.json` count cursor replays its
-subscription board once on upgrade, and again whenever its subscription set
-changes; that old `.json` is left behind. If the timestamp
+subscription board once on upgrade; that old `.json` is left behind. If the timestamp
 translation cannot be done the driver says so on stderr and starts from zero,
 which costs one replay and loses nothing.
 

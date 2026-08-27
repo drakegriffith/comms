@@ -28,8 +28,13 @@
 #
 # ONE READER, ONE VIEW. The cursor is keyed on (runid, seat, view) like the
 #   CLI's, because a row in topic X belongs to both the plain view and the
-#   --topic X view and would be delivered once per view. Pick a view at start
-#   and stay on it; --cursor overrides the path if you need two streams.
+#   --topic X view and would be delivered once per view. A subscription view is
+#   re-derived every poll; a changed set starts a fresh cursor and replays,
+#   loudly. --cursor/--log override those derived paths.
+#
+# KNOWN LIMIT, issue #73: append_mirrored can add a row with an old `at`, which
+#   inserts mid-view; a per-poster count cursor can then skip that row. That
+#   pre-existing ordering problem is out of scope here.
 #
 # usage: comms-poll-driver <runid> <seat> [options] -- <command> [arg ...]
 #
@@ -99,6 +104,8 @@ AGENT_ID=""
 CWD=""
 CURSOR_FILE=""
 LOG_FILE=""
+CURSOR_OVERRIDE=""
+LOG_OVERRIDE=""
 HAVE_CMD=0
 DELIVER_CMD=""
 
@@ -119,6 +126,9 @@ while [ "$#" -gt 0 ]; do
     *)          echo "$PROG: unknown option: $1" >&2; usage ;;
   esac
 done
+
+CURSOR_OVERRIDE="$CURSOR_FILE"
+LOG_OVERRIDE="$LOG_FILE"
 
 [ "$HAVE_CMD" -eq 1 ] || { echo "$PROG: no delivery command (it goes after --)" >&2; usage; }
 [ "$SUBS" -eq 1 ] && [ -n "$TOPIC" ] && {
@@ -160,17 +170,9 @@ if [ "$ENROLL" -eq 1 ]; then
   fi
 fi
 
-# A subscription view is mutable: widening it can insert older rows before a
-# count cursor. Key each effective set separately, using the CLI's one digest
-# implementation. This must follow --topics so it names the set now in force.
-if [ "$SUBS" -eq 1 ]; then
-  VIEW="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT")" || exit 1
-fi
-
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
-[ -n "$CURSOR_FILE" ] || CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.json"
-[ -n "$LOG_FILE" ]    || LOG_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.log"
+PREVIOUS_VIEW=""
 
 # ---- one poll --------------------------------------------------------------
 
@@ -238,7 +240,22 @@ deliver() {
 }
 
 run_once() {
-  local out receipt rows count msg rc
+  local out receipt rows count msg rc next_view
+
+  # A subscription file may change while loop mode is running. Name the view
+  # now in force on every pass so a widening gets a fresh counts cursor rather
+  # than applying narrow-view counts to a wider board.
+  next_view="$VIEW"
+  if [ "$SUBS" -eq 1 ]; then
+    next_view="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT")" || return 0
+  fi
+  if [ -n "$PREVIOUS_VIEW" ] && [ "$next_view" != "$PREVIOUS_VIEW" ]; then
+    echo "$PROG: subscription view changed $PREVIOUS_VIEW -> $next_view; replaying the subscribed board" >&2
+  fi
+  VIEW="$next_view"
+  PREVIOUS_VIEW="$VIEW"
+  CURSOR_FILE="${CURSOR_OVERRIDE:-$DRIVER_DIR/$(slug "$SEAT").$VIEW.json}"
+  LOG_FILE="${LOG_OVERRIDE:-$DRIVER_DIR/$(slug "$SEAT").$VIEW.log}"
 
   # --replay reads the board without touching the CLI's cursor; `cursor take`
   # prints the receipt line then the rows this driver has not confirmed, and

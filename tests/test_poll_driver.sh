@@ -74,6 +74,14 @@ LOG="$COMMS_STATE_DIR/poll-driver/$RUN/beta.all.log"
 # reason -- caught while writing this suite).
 deliveries() { local n; n="$(grep -c -- '--- delivery ---' "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
 handed()     { local n; n="$(grep -c -F -- "$1" "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
+wait_handed() {
+  local needle="$1" want="$2" pid="$3" cap="$4" start="$SECONDS"
+  while [ "$(handed "$needle")" -lt "$want" ]; do
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ $((SECONDS - start)) -lt "$cap" ] || return 1
+    sleep 1
+  done
+}
 
 # ---- 1. empty board: nothing new, and NOTHING is written -------------------
 "$COMMS" init "$RUN" >/dev/null
@@ -208,6 +216,33 @@ case "$out" in *"nothing new"*) ok "third widened-subscription poll has nothing 
                *) bad "third widened-subscription poll has nothing new (got: $out)" ;; esac
 eq "third widened-subscription poll delivers nothing" "$before" "$(deliveries)"
 
+# A long-running driver must re-derive a mutable subscription view every poll.
+# Every wait is capped and also fails immediately if the background driver dies.
+LOOP_RUN="driver-subs-loop-$$"
+: > "$INBOX"
+"$COMMS" init "$LOOP_RUN" >/dev/null
+"$COMMS" subscribe "$LOOP_RUN" alpha proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "LATER-1" --topic later >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "LATER-2" --topic later >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-3" --topic proj >/dev/null
+"$DRIVER" "$LOOP_RUN" alpha --subs --topics proj --interval 1 -- "$WORK/fake-runtime" \
+  >"$WORK/direct-loop.out" 2>"$WORK/direct-loop.err" &
+LOOP_PID=$!
+if wait_handed PROJ- 3 "$LOOP_PID" 8; then
+  "$COMMS" subscribe "$LOOP_RUN" alpha proj later >/dev/null
+  wait_handed LATER- 2 "$LOOP_PID" 8
+  LOOP_WAIT_RC=$?
+else
+  LOOP_WAIT_RC=1
+fi
+kill "$LOOP_PID" 2>/dev/null || true
+wait "$LOOP_PID" 2>/dev/null || true
+eq "loop-mode widening delivers both older later rows" 0 "$LOOP_WAIT_RC"
+eq "loop-mode widening announces one subscription view change" 1 \
+  "$(grep -c 'subscription view changed .* -> .*; replaying the subscribed board' "$WORK/direct-loop.err" 2>/dev/null || true)"
+
 # ---- 13. usage / argument errors --------------------------------------------
 out="$("$DRIVER" "$RUN" beta --once -- 2>&1)"; rc=$?
 eq "-- with no command is a usage error" 2 "$rc"
@@ -298,8 +333,8 @@ KWIDE_RUN="kimi-subs-widen-$$"
 "$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-2" --topic proj >/dev/null
 "$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-3" --topic proj >/dev/null
 KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
-KCURSOR="$COMMS_STATE_DIR/kimi-cursor/$KWIDE_RUN-alpha.subs-$KDIGEST.json"
-"$DRIVER" "$KWIDE_RUN" alpha --subs --cursor "$KCURSOR" --once -- /usr/bin/true >/dev/null 2>&1
+KCURSOR="$COMMS_STATE_DIR/poll-driver/$KWIDE_RUN/alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --once -- /usr/bin/true >/dev/null 2>&1
 "$COMMS" subscribe "$KWIDE_RUN" alpha proj later >/dev/null
 out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
 eq "kimi widened-subscription preview exits 0" 0 "$rc"
@@ -310,11 +345,46 @@ case "$out" in *"would deliver 5 row(s)"*K-PROJ-1*K-PROJ-2*K-PROJ-3*)
   ok "kimi widened-subscription preview explicitly replays the project rows" ;;
   *) bad "kimi widened-subscription preview explicitly replays the project rows (got: $out)" ;; esac
 KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
-KCURSOR="$COMMS_STATE_DIR/kimi-cursor/$KWIDE_RUN-alpha.subs-$KDIGEST.json"
-"$DRIVER" "$KWIDE_RUN" alpha --subs --cursor "$KCURSOR" --once -- /usr/bin/true >/dev/null 2>&1
+KCURSOR="$COMMS_STATE_DIR/poll-driver/$KWIDE_RUN/alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --once -- /usr/bin/true >/dev/null 2>&1
 out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"
 case "$out" in *"nothing new"*) ok "kimi third widened-subscription preview has nothing new" ;;
                *) bad "kimi third widened-subscription preview has nothing new (got: $out)" ;; esac
+
+# The adapter's real loop follows the same widening contract. A fake kimi is
+# the oracle and records the prompt argument it received.
+KLOOP_RUN="kimi-subs-loop-$$"
+KIMI_BIN="$WORK/kimi-bin"
+mkdir -p "$KIMI_BIN"
+cat > "$KIMI_BIN/kimi" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$INBOX_PATH"
+exit 0
+EOF
+chmod +x "$KIMI_BIN/kimi"
+: > "$INBOX"
+"$COMMS" init "$KLOOP_RUN" >/dev/null
+"$COMMS" subscribe "$KLOOP_RUN" alpha proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-LATER-1" --topic later >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-LATER-2" --topic later >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-3" --topic proj >/dev/null
+PATH="$KIMI_BIN:$PATH" "$KIMI_DRIVER" "$KLOOP_RUN" alpha sess-loop "$WORK" --interval 1 \
+  >"$WORK/kimi-loop.out" 2>"$WORK/kimi-loop.err" &
+KLOOP_PID=$!
+if wait_handed KLOOP-PROJ- 3 "$KLOOP_PID" 8; then
+  "$COMMS" subscribe "$KLOOP_RUN" alpha proj later >/dev/null
+  wait_handed KLOOP-LATER- 2 "$KLOOP_PID" 8
+  KLOOP_WAIT_RC=$?
+else
+  KLOOP_WAIT_RC=1
+fi
+kill "$KLOOP_PID" 2>/dev/null || true
+wait "$KLOOP_PID" 2>/dev/null || true
+eq "kimi loop-mode widening delivers both older later rows" 0 "$KLOOP_WAIT_RC"
+eq "kimi loop-mode widening announces one subscription view change" 1 \
+  "$(grep -c 'subscription view changed .* -> .*; replaying the subscribed board' "$WORK/kimi-loop.err" 2>/dev/null || true)"
 
 # A whole-board counts cursor cannot be reused for the narrower subscription
 # view: its per-poster count can silently skip that poster's first visible row.
