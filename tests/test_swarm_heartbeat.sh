@@ -142,6 +142,13 @@ write_payload() {  # write_payload <agent_id> <tool_name> <file_path>
         "$2" "$1" "$3"
 }
 
+command_payload() {  # command_payload <agent_id> <tool_name> <cwd> <command>
+    python3 -c 'import json,sys
+print(json.dumps({"hook_event_name":"PostToolUse", "tool_name":sys.argv[2],
+ "session_id":"sess-1", "agent_id":sys.argv[1], "cwd":sys.argv[3],
+ "tool_input":{"command":sys.argv[4]}}))' "$1" "$2" "$3" "$4"
+}
+
 # This agent's current subscription, comma-joined (empty => subscribe-all).
 part_topics() {  # part_topics <runid> <agent_id>
     COMMS_STATE_DIR="$STATE" python3 -c '
@@ -693,6 +700,164 @@ run_suite() {  # one fully-isolated pass
     ck_contains "(v) control: the plain row is delivered" "PLAIN-ROW" "$ctx"
     ck_absent "(v) an unthreaded delivery carries no reply hint" \
         "comms post reply" "$ctx"
+
+    # -----------------------------------------------------------------------
+    # (w) AGENT-AGNOSTIC DOC ENROL: Codex apply_patch paths and write-shaped
+    #     Bash beats feed the same subscription + auto-claim path as Write/Edit.
+    RW2="hbtestw2$$x$RANDOM"
+    arm_run "$RW2"
+    enroll_agent "$RW2" agentPatch "projW2" seatPatch
+    enroll_agent "$RW2" agentBash "projW2" seatBash
+    enroll_agent "$RW2" agentMismatch "projW2" seatMismatch
+    enroll_agent "$RW2" agentOutside "projW2" seatOutside
+    enroll_agent "$RW2" agentSlow "projW2" seatSlow
+    enroll_agent "$RW2" agentRead "projW2" seatRead
+    enroll_agent "$RW2" agentRedirect "projW2" seatRedirect
+    enroll_agent "$RW2" agentHeredoc "projW2" seatHeredoc
+    enroll_agent "$RW2" agentSeatless "projW2"
+    REPO2="$(mktemp -d)" || exit 1
+    REPONAME2="$(basename "$REPO2")"
+    mkdir -p "$REPO2/sub"
+    git -C "$REPO2" init -q
+    : > "$REPO2/tracked.py"
+    git -C "$REPO2" add tracked.py
+
+    patch_add='*** Begin Patch
+*** Add File: sub/n.py
++hi
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_add")"
+    PATCHFILE="$ROOT/comms-$RW2/seatPatch.jsonl"
+    patch_claims="$(grep -c "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+    ck "(w-a) apply_patch Add File posts one claim" "1" "$patch_claims"
+    patch_row="$(grep "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null)"
+    ck_contains "(w-a) apply_patch claim text names the relative path" '"text": "editing sub/n.py"' "$patch_row"
+    ck_contains "(w-a) apply_patch claim uses the repo board topic" "\"topic\": \"board:$REPONAME2\"" "$patch_row"
+
+    patch_update='*** Begin Patch
+*** Update File: sub/n.py
+@@
+-hi
++bye
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update")"
+    ck "(w-b) apply_patch Update File does not duplicate a claim" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+
+    patch_update_fresh='*** Begin Patch
+*** Update File: sub/u.py
+@@
+-old
++new
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update_fresh")"
+    ck "(w-b2) apply_patch Update File enrols on its own" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/u.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+
+    before_patch_topics="$(part_topics "$RW2" agentPatch)"
+    patch_delete='*** Begin Patch
+*** Delete File: sub/gone.py
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_delete")"
+    ck "(w-c) apply_patch Delete File enrols nothing" "$before_patch_topics" \
+        "$(part_topics "$RW2" agentPatch)"
+
+    GIT_REAL="$(command -v git)"
+    SHIM="$(mktemp -d)" || exit 1
+    GIT_CALLS="$SHIM/git.calls"
+    cat > "$SHIM/git" <<EOF
+#!/bin/sh
+printf 'git %s\n' "\$*" >> "$GIT_CALLS"
+exec "$GIT_REAL" "\$@"
+EOF
+    chmod +x "$SHIM/git"
+    bash_command="cat <<'EOF' > sub/b.py
+bash write
+EOF"
+    (cd "$REPO2" && /bin/bash -c "$bash_command")
+    HOOK_OUT="$(command_payload agentBash Bash "$REPO2" "$bash_command" | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    BASHFILE="$ROOT/comms-$RW2/seatBash.jsonl"
+    ck "(w-d) Bash heredoc beat exits 0" "0" "$HOOK_RC"
+    ck "(w-d) Bash heredoc posts one claim" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$BASHFILE" 2>/dev/null | tr -d ' ')"
+
+    write_git_calls="$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentBash Bash "$REPO2" 'cat sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-e) read-shaped Bash spawns no git process" "0" \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+    printf 'git-spawn-proof read=%s write=%s\n' \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')" "$write_git_calls"
+
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRead Bash "$REPO2" 'grep -n "def" sub/b.py 2>/dev/null' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) fd redirect on a read-shaped Bash command posts no claim" "0" \
+        "$(grep "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRead.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+    ck "(w-j) fd redirect on a read-shaped Bash command spawns no git" "0" \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRedirect Bash "$REPO2" 'printf x > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRedirect.jsonl" 2>/dev/null | tr -d ' ')"
+    HOOK_OUT="$(command_payload agentHeredoc Bash "$REPO2" 'cat <<EOF > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) heredoc plus output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatHeredoc.jsonl" 2>/dev/null | tr -d ' ')"
+
+    before_mismatch="$(part_topics "$RW2" agentMismatch)"
+    run_hook_raw "$(command_payload agentMismatch Bash "$REPO2" 'printf x > unrelated.py')"
+    ck "(w-f) basename gate rejects an unrelated dirty path" "$before_mismatch" \
+        "$(part_topics "$RW2" agentMismatch)"
+
+    OUTSIDE2="$(mktemp -d)" || exit 1
+    OUTSIDE_ERR="$STATE/outside-repo.err"
+    HOOK_OUT="$(command_payload agentOutside Bash "$OUTSIDE2" 'printf x > loose.py' | \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$OUTSIDE_ERR")"
+    HOOK_RC=$?
+    ck "(w-g) write-shaped Bash outside a repo exits 0" "0" "$HOOK_RC"
+    ck "(w-g) write-shaped Bash outside a repo enrols nothing" "projW2" \
+        "$(part_topics "$RW2" agentOutside)"
+    ck "(w-g) write-shaped Bash outside a repo is silent" "" "$(cat "$OUTSIDE_ERR")"
+
+    SLOW_SHIM="$(mktemp -d)" || exit 1
+    cat > "$SLOW_SHIM/git" <<'EOF'
+#!/bin/sh
+exec sleep 5
+EOF
+    chmod +x "$SLOW_SHIM/git"
+    post_row "$RW2" seatOther finding "SLOW-BEAT-DELIVERS" \
+        "2026-08-03T00:00:01+00:00" "projW2"
+    started="$(date +%s)"
+    HOOK_OUT="$(command_payload agentSlow Bash "$REPO2" 'printf x > slow.py' | \
+        PATH="$SLOW_SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>/dev/null)"
+    HOOK_RC=$?
+    elapsed=$(( $(date +%s) - started ))
+    ck "(w-h) timed-out git beat exits 0" "0" "$HOOK_RC"
+    if [ "$elapsed" -lt 4 ]; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "  FAIL (w-h) git timeout took ${elapsed}s" >&2; fi
+    ck_contains "(w-h) timed-out git still delivers ordinary rows" \
+        "SLOW-BEAT-DELIVERS" "$(addl_ctx "$HOOK_OUT")"
+
+    run_hook_raw "$(command_payload agentSeatless apply_patch "$REPO2" "$patch_add")"
+    ck_contains "(w-i) seatless apply_patch participant enrols" \
+        "doc:$REPONAME2/sub/n.py" "$(part_topics "$RW2" agentSeatless)"
+    if [ -e "$ROOT/comms-$RW2/agentSeatless.jsonl" ]; then
+        fail=$((fail + 1)); echo "  FAIL (w-i) seatless apply_patch posted a claim" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    rm -rf "$REPO2" "$OUTSIDE2" "$SHIM" "$SLOW_SHIM"
 
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
     #     file_path makes os.path.realpath raise ValueError -- the leg is
