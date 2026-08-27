@@ -45,9 +45,11 @@ session when their topic or thread is in the seat's subscription set, including
 the implicit `@<seat>` unicast topic. A seat with no subscription file still
 sees the whole board, preserving the mailbox's backward-compatible contract.
 
-**Cursor format changed, once.** The old cursor was the `at` of the last row
-delivered, at `$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>`; the shared helper
-counts rows per seat, at `<runid>-<seat>.json` beside it. Both mean "everything
+**Cursor format and key changed.** The old cursor was the `at` of the last row
+delivered, at `$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>`; the current
+subscription-view cursor is per-poster counts at
+`$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>.subs.json`. The shared helper
+stores the counts in that file. Both formats mean "everything
 up to here is delivered", so the driver TRANSLATES an existing timestamp cursor
 on its first run -- a seat's count is how many of its rows are at or before
 that timestamp -- and leaves the old file as `<runid>-<seat>.pre-counts`. A

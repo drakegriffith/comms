@@ -286,14 +286,19 @@ lib_dir = os.environ.get("HB_SWARM_LIB") or ""
 sys.path.insert(0, lib_dir)
 try:
     import swarm_arm
-    import swarm_mailbox
 except Exception:
-    # Cannot load the registry -> behave like no-armed-run: silent, no output.
+    # Cannot load the registry: behave like no-armed-run, silent with no output.
+    sys.exit(0)
+try:
+    import swarm_mailbox
+except Exception as exc:
+    # Cannot load the mailbox: decline delivery loudly, but never block the hook.
+    sys.stderr.write("swarm-heartbeat: swarm_mailbox unavailable: %s\n" % exc)
     sys.exit(0)
 try:
     import swarm_threads
 except Exception as exc:
-    # Older live-shim checkouts can lack this optional stale-status helper.
+    # Cannot load the optional stale-status helper: disable only stale skipping.
     # Keep delivery live and disable only stale skipping.
     swarm_threads = None
     sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)

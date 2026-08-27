@@ -61,7 +61,7 @@ done
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 CURSOR_DIR="$STATE_DIR/kimi-cursor"
 OLD_CURSOR="$CURSOR_DIR/$RUNID-$SEAT"        # pre-#30: a last-delivered `at`
-CURSOR_FILE="$CURSOR_DIR/$RUNID-$SEAT.json"  # now: per-seat row counts
+CURSOR_FILE="$CURSOR_DIR/$RUNID-$SEAT.subs.json"  # per-seat counts for --subs
 
 # ---- one-time cursor migration ---------------------------------------------
 # The shared helper counts rows per seat; this driver used to store the `at` of

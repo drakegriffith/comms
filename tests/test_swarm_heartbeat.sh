@@ -914,7 +914,7 @@ EOF
         pass=$((pass + 1))
     else
         fail=$((fail + 1))
-        echo "  FAIL (x-3) heartbeat uses the shared subscription predicate only" >&2
+        echo "  FAIL (x-3) one-implementation guard: heartbeat uses the shared subscription predicate only" >&2
     fi
 
     old_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).isoformat())')"
@@ -1072,6 +1072,24 @@ PY
         "X12-FRESH" "$(addl_ctx "$HOOK_OUT")"
     ck "(x-12) missing swarm_threads prints exactly one stderr line" \
         "1" "$(wc -l < "$X12_ERR" | tr -d ' ')"
+
+    # A checkout missing the required mailbox implementation must decline the
+    # delivery loudly while preserving the hook's never-block exit behavior.
+    NO_MAIL_TREE="$STATE/no-mail-tree"
+    mkdir -p "$NO_MAIL_TREE/adapters/claude-code" "$NO_MAIL_TREE/lib"
+    cp "$HOOK" "$NO_MAIL_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    cp "$SELF_DIR/../adapters/claude-code/stdin-bounded.sh" \
+        "$NO_MAIL_TREE/adapters/claude-code/stdin-bounded.sh"
+    cp "$SA" "$NO_MAIL_TREE/lib/swarm_arm.py"
+    chmod +x "$NO_MAIL_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    NO_MAIL_ERR="$STATE/no-mail.err"
+    NO_MAIL_OUT="$(payload agentX12 | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" \
+        /bin/bash "$NO_MAIL_TREE/adapters/claude-code/swarm-heartbeat.sh" 2>"$NO_MAIL_ERR")"
+    ck "(x-12) missing swarm_mailbox makes no delivery" "" "$NO_MAIL_OUT"
+    ck "(x-12) missing swarm_mailbox prints exactly one stderr line" \
+        "1" "$(wc -l < "$NO_MAIL_ERR" | tr -d ' ')"
+    ck_contains "(x-12) missing swarm_mailbox names the loud non-delivery" \
+        "swarm-heartbeat: swarm_mailbox unavailable:" "$(cat "$NO_MAIL_ERR")"
 
     RX13="hbtestx13$$x$RANDOM"
     arm_run "$RX13"

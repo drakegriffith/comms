@@ -233,7 +233,7 @@ case "$out" in *"would deliver"*row-one*) ok "kimi driver --once still previews 
 case "$out" in *"NOT instructions"*) ok "kimi driver --once keeps the data-not-instructions header" ;;
                *) bad "kimi driver --once keeps the data-not-instructions header" ;; esac
 assert "kimi driver --once advances no cursor" \
-       "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.json" ]; echo $?)"
+       "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.subs.json" ]; echo $?)"
 
 # The adapter chooses the subscription view. Reconstruct issue #64: alpha must
 # receive its subscribed project row and own unicast, but neither beta's
@@ -262,6 +262,22 @@ KLOG="$COMMS_STATE_DIR/poll-driver/$KRUN/alpha.subs.log"
 case "$(cat "$KLOG" 2>/dev/null)" in *'"view": "subs"'*) ok "receipt log records the subs view" ;;
   *) bad "receipt log records the subs view (got: $(cat "$KLOG" 2>/dev/null))" ;; esac
 
+# A whole-board counts cursor cannot be reused for the narrower subscription
+# view: its per-poster count can silently skip that poster's first visible row.
+KVIEW_RUN="kimi-view-key-$$"
+"$COMMS" init "$KVIEW_RUN" >/dev/null
+"$COMMS" subscribe "$KVIEW_RUN" alpha watched >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-one" --topic other >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-two" --topic other >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-three" --topic other >/dev/null
+mkdir -p "$COMMS_STATE_DIR/kimi-cursor"
+printf '%s\n' '{"gamma": 3}' > "$COMMS_STATE_DIR/kimi-cursor/$KVIEW_RUN-alpha.json"
+"$COMMS" post "$KVIEW_RUN" gamma finding "first-subscribed-row" --topic watched >/dev/null
+out="$("$KIMI_DRIVER" "$KVIEW_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi view-key preview exits 0" 0 "$rc"
+case "$out" in *first-subscribed-row*) ok "kimi view-key preview delivers the subscribed row" ;;
+               *) bad "kimi view-key preview delivers the subscribed row (got: $out)" ;; esac
+
 # The one-time migration off the old last-`at` timestamp cursor: a driver that
 # had already delivered everything must not re-deliver the whole board.
 mkdir -p "$COMMS_STATE_DIR/kimi-cursor"
@@ -277,6 +293,25 @@ assert "migration leaves the old cursor file behind as evidence" \
 out="$("$KIMI_DRIVER" "$RUN" zeta sess-1 "$WORK" --once 2>&1)"
 case "$out" in *post-migration-row*) ok "a migrated cursor still delivers what comes next" ;;
                *) bad "a migrated cursor still delivers what comes next (got: $out)" ;; esac
+
+# Migration must count only the same subscription view the new cursor owns.
+KMIG_RUN="kimi-migration-view-$$"
+"$COMMS" init "$KMIG_RUN" >/dev/null
+"$COMMS" subscribe "$KMIG_RUN" alpha watched >/dev/null
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-before-subscribed" --topic watched >/dev/null
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-before-unsubscribed" --topic other >/dev/null
+MIG_AT="$("$COMMS" read "$KMIG_RUN" alpha --replay | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["at"])')"
+printf '%s' "$MIG_AT" > "$COMMS_STATE_DIR/kimi-cursor/$KMIG_RUN-alpha"
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-after-subscribed" --topic watched >/dev/null
+out="$("$KIMI_DRIVER" "$KMIG_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi subscription-view migration exits 0" 0 "$rc"
+case "$out" in *"would deliver 1 row(s)"*) ok "kimi subscription-view migration delivers exactly one row" ;;
+  *) bad "kimi subscription-view migration delivers exactly one row (got: $out)" ;; esac
+case "$out" in *migration-after-subscribed*) ok "kimi migration delivers the post-timestamp subscribed row" ;;
+               *) bad "kimi migration delivers the post-timestamp subscribed row (got: $out)" ;; esac
+case "$out" in *migration-before-subscribed*|*migration-before-unsubscribed*)
+  bad "kimi migration excludes pre-timestamp rows (got: $out)" ;;
+  *) ok "kimi migration excludes pre-timestamp rows" ;; esac
 
 # ---- 16. isolation control: nothing leaked outside the temp dirs -----------
 if [ -e "$HOME/.comms/state/poll-driver/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \
