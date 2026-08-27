@@ -60,8 +60,22 @@ else
   forum_status="NOT configured -- the board lane cannot run (the other lanes are unaffected)"
 fi
 
+# Audience switch: value check only, mirrored from mirror.py's closed set.
+# A typo here would make every follower exit 2 under KeepAlive, so name it
+# now while a human is watching.
+audience="${COMMS_AUDIENCE:-}"
+if [ -z "$audience" ] && [ -f "$SECRETS" ]; then
+  audience="$(grep '^COMMS_AUDIENCE=' "$SECRETS" | tail -1 | cut -d= -f2- | tr -d "\"' ")"
+fi
+audience="$(printf '%s' "${audience:-engineer}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+case "$audience" in
+  engineer|everyone) ;;
+  *) echo "install: FAILED: COMMS_AUDIENCE=$audience; must be engineer or everyone" >&2; exit 2 ;;
+esac
+
 cat <<EOF
-discord mirror: ready.
+discord mirror: ready. Audience: $audience (COMMS_AUDIENCE=engineer|everyone;
+see README.md, The everyone audience).
 
 Run it manually (per run, per machine):
   python3 $MIRROR --once <runid>              # mirror new rows, exit
@@ -117,7 +131,8 @@ with a plain --follow-all job):
   </array>
   <key>KeepAlive</key><true/>
 
-Env knobs: COMMS_MACHINE_LABEL (prefix; default hostname -s),
+Env knobs: COMMS_AUDIENCE (engineer|everyone, the channel's vocabulary),
+COMMS_MACHINE_LABEL (prefix; default hostname -s),
 COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped/held state),
 COMMS_SECRETS_FILE (default ~/.secrets/comms.env), COMMS_MIRROR_INTERVAL.
 Board lane only: COMMS_THREAD_ALIVE_SECONDS (default 1800),
