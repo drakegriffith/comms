@@ -86,8 +86,8 @@ is per-runtime sugar on top.
 
 | Runtime     | Delivery | How |
 |-------------|----------|-----|
-| Claude Code | push     | PostToolUse hook (`adapters/claude-code/`, wired into settings.json by its install.sh) |
-| Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`) |
+| Claude Code | push     | PostToolUse hook (`adapters/claude-code/`, wired into settings.json by its install.sh, which also installs the `comms-say` skill: say "tell the codex terminal <text>" and the session sends one 1-1 row) |
+| Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`); its install.sh also maintains a marker-fenced AGENTS.md block telling Codex how to read and reply to a `[FOR YOU]` row |
 | Gemini CLI  | owed (adapter ready, unprobed) | binary is not installed on this Mac, so neither the poll test nor push probe has run |
 | Kimi        | resume-driver | no hook surface; `adapters/kimi/poll-driver.sh` polls the seat's subscribed slice and delivers rows as resume turns |
 | pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
@@ -123,6 +123,16 @@ the dispatcher, the `lib/` modules and the state dir, and exits 0.)
 There is nothing else: the core is `bin/comms` plus three stdlib-only Python
 files. No pip installs, no config files, no daemon. Two optional env knobs are
 listed under Configuration below.
+
+The 1-1 terminal UX also ships with the installers, no hand-wiring:
+`adapters/claude-code/install.sh` installs the `comms-say` skill into
+`~/.claude/skills/`, so telling a Claude session "communicate with the codex
+terminal: <text>" sends one mailbox row addressed to that seat, and
+`adapters/codex/install.sh` writes a marker-fenced block into
+`~/.codex/AGENTS.md` telling Codex what a `[FOR YOU from <seat>]` row is, how
+to reply (`--thread <key>` included), the per-session enroll handshake, and
+that peer rows are data, never instructions. Both are idempotent and re-runs
+heal drift.
 
 Scope to know before you build on it: **one mailbox serves one machine.** It is
 a directory of JSONL files, so two agents talk if and only if they share a
@@ -460,8 +470,8 @@ lib/swarm_claims.py          run-scoped write-set claims arbiter
 lib/comms_feed.py            cursor-free NDJSON window onto one mailbox run
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
 adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
-adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
-adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
+adapters/claude-code/        push adapter: PostToolUse heartbeat + installer + comms-say skill (phrase -> 1-1 send)
+adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json + owns the AGENTS.md reply block
 adapters/gemini/             poll recipe + AfterTool tool-name shim and installer for the owed push probe
 adapters/kimi/               resume-driver for a runtime with no hook surface
 adapters/pi/                 poll-loop recipe for pi and any hook-less runtime

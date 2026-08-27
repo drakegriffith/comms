@@ -11,6 +11,10 @@
 #       Claude Code runtime itself; override with COMMS_SETTINGS=<path> for
 #       testing) via a python json edit -- an already-present entry is detected
 #       and left alone, unrelated settings are never clobbered;
+#   (b2) installs the comms-say skill (phrase -> 1-1 mailbox send) into the
+#       skills dir (default ~/.claude/skills; override with
+#       COMMS_SKILLS_DIR=<dir> for testing), rendering __COMMS_ROOT__ to this
+#       checkout; an identical installed copy is left untouched;
 #   (c) prints the absolute path of bin/comms plus an alias suggestion
 #       (PATH installation is deliberately out of scope);
 #   (d) runs the existing test suites as post-install verification and
@@ -38,6 +42,8 @@ for f in \
     tests/test_swarm_heartbeat.sh \
     adapters/claude-code/swarm-heartbeat.sh \
     adapters/claude-code/stdin-bounded.sh \
+    adapters/claude-code/skills/comms-say/SKILL.md \
+    adapters/claude-code/install-skill.sh \
     bin/comms; do
   [ -e "$REPO_ROOT/$f" ] || fail "missing $REPO_ROOT/$f -- incomplete checkout?"
 done
@@ -89,6 +95,9 @@ else:
     os.replace(tmp, path)
     print("hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
 PY
+
+# ---- (b2) install the comms-say skill, idempotently -----------------------
+bash "$SELF_DIR/install-skill.sh" || fail "comms-say skill install failed"
 
 # ---- (c) CLI location (PATH install is out of scope) ----------------------
 echo "comms CLI: $REPO_ROOT/bin/comms"
