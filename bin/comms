@@ -57,6 +57,8 @@ mailbox (lib/swarm_mailbox.py; exit 0 ok, 1 bad args, 2 usage):
              Piping through head/tail truncates the OUTPUT, not the cursor:
              it advances over every row the view selected, so rows you cut
              off come back only via --replay. Consume a read whole.)
+  feed      <runid> [--seat S] [--audience engineer|everyone] [--since AT] [--follow]
+            (cursor-free NDJSON window; --follow polls without moving a cursor)
   subs      <runid> <seat>          (this seat's subscribed slice; = read --subs)
   cursor take    <path>             (rows as JSONL on stdin; prints a receipt
                                      line then the fresh rows, writes NOTHING)
@@ -157,6 +159,9 @@ case "$sub" in
     ;;
   init|subscribe|read|cursor)
     exec python3 "$LIB/swarm_mailbox.py" "$sub" "$@"
+    ;;
+  feed)
+    exec python3 "$LIB/comms_feed.py" "$@"
     ;;
   subs)
     # The one aliased spelling: the mailbox module expresses this as a flag on
