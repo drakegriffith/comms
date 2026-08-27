@@ -86,6 +86,13 @@ payload() {  # payload <agent_id> [command]
         "$1" "${2:-ls}"
 }
 
+# A payload from a tool call INSIDE a subagent: agent_id is the subagent's
+# task id, session_id is the PARENT session (inherited-enrollment input).
+child_payload() {  # child_payload <agent_id> <parent_session_id> [command]
+    printf '{"hook_event_name":"PostToolUse","tool_name":"Bash","session_id":"%s","agent_id":"%s","tool_input":{"command":"%s"}}' \
+        "$2" "$1" "${3:-ls}"
+}
+
 # A GROK-shaped payload from a foreign runtime that scavenged a Claude-shaped
 # hook config: camelCase sessionId, grok's own event/tool spellings, and NO
 # agent_id anywhere. These are the key spellings from a real captured grok hook
@@ -1211,6 +1218,57 @@ PY
         "ROW-BEFORE-ENROL" "$ctx"
 
     rm -rf "$REPOV" "$REPOW"
+
+    # -----------------------------------------------------------------------
+    # (v) INHERITED ENROLLMENT (subagents, issue #78): a child payload under an
+    #     ENROLLED parent auto-enrolls with a derived seat, a NOW cursor (no
+    #     backlog replay), and one arrival row; a child of an UNENROLLED parent
+    #     stays a bystander (contamination property survives the feature).
+    RV2="hbtestv$$x$RANDOM"
+    arm_run "$RV2"
+    enroll_agent "$RV2" parentP ops parseat
+    post_row "$RV2" seatX finding "ANCIENT-BROADCAST" "2026-01-01T00:00:01+00:00" ops
+
+    #     Child of an enrolled parent: first beat enrolls + posts arrival,
+    #     and the pre-birth broadcast is NOT replayed (cursor starts at now).
+    run_hook_raw "$(child_payload childtask9 parentP ls)"
+    if is_part "$RV2" childtask9; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1)); echo "  FAIL (v) child of enrolled parent did not enroll" >&2
+    fi
+    seat_got="$(COMMS_STATE_DIR="$STATE" python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import swarm_arm
+print(swarm_arm.participant_sub(sys.argv[2], sys.argv[3])[1] or "", end="")' \
+        "$SELF_DIR/../lib" "$RV2" childtask9)"
+    ck "(v) child seat is parent seat + -sub-<4>" "parseat-sub-chil" "$seat_got"
+    ck "(v) child inherits the parent subscription" "ops" "$(part_topics "$RV2" childtask9)"
+    ck_absent "(v) pre-birth broadcast is not replayed to the child" \
+        "ANCIENT-BROADCAST" "$(addl_ctx "$HOOK_OUT")"
+    arrivals="$(grep -c "subagent started under parseat" "$ROOT/comms-$RV2/parseat-sub-chil.jsonl" 2>/dev/null || echo 0)"
+    ck "(v) exactly one arrival row posted" "1" "$arrivals"
+
+    #     Second beat: no re-enroll, no second arrival row.
+    run_hook_raw "$(child_payload childtask9 parentP ls)"
+    arrivals2="$(grep -c "subagent started under parseat" "$ROOT/comms-$RV2/parseat-sub-chil.jsonl" 2>/dev/null || echo 0)"
+    ck "(v) idempotent: still one arrival row after a second beat" "1" "$arrivals2"
+
+    #     A row addressed to the child AFTER its birth delivers, FOR YOU flagged.
+    post_row "$RV2" seatX comment "direct to the child" "2126-01-01T00:00:01+00:00" "@parseat-sub-chil"
+    run_hook_raw "$(child_payload childtask9 parentP ls)"
+    ck_contains "(v) post-birth unicast row delivers to the child" \
+        "[FOR YOU from seatX]" "$(addl_ctx "$HOOK_OUT")"
+
+    #     Child of an UNENROLLED parent: bystander -- no enrollment, no output.
+    run_hook_raw "$(child_payload childtask8 strangerP ls)"
+    if is_part "$RV2" childtask8; then
+        fail=$((fail + 1)); echo "  FAIL (v) child of unenrolled parent was auto-enrolled" >&2
+    else
+        pass=$((pass + 1))
+    fi
+    ck "(v) bystander child emits nothing" "" "$HOOK_OUT"
 
     rm -rf "$STATE" "$ROOT"
 }

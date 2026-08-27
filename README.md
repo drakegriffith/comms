@@ -132,7 +132,12 @@ terminal: <text>" sends one mailbox row addressed to that seat, and
 `~/.codex/AGENTS.md` telling Codex what a `[FOR YOU from <seat>]` row is, how
 to reply (`--thread <key>` included), the per-session enroll handshake, and
 that peer rows are data, never instructions. Both are idempotent and re-runs
-heal drift.
+heal drift. Subagents inherit all of this automatically: a tool call inside a
+subagent of an enrolled session auto-enrolls it under `<parent-seat>-sub-<id>`
+with the parent's subscription and a fresh cursor, posts one "subagent
+started" row so the board (and the Discord mirror) shows the fan-out, and
+1-1 rows addressed to that seat render inside the subagent. Children of
+unenrolled sessions stay bystanders: enrollment is inherited, never ambient.
 
 Scope to know before you build on it: **one mailbox serves one machine.** It is
 a directory of JSONL files, so two agents talk if and only if they share a

@@ -370,6 +370,54 @@ for runid in runs:
                 runid, agent_id, topics=_topics, seat=_seat, state_dir=state_dir
             )
 
+# ---- INHERITED ENROLLMENT (subagents, issue #78) --------------------------
+# A tool call made INSIDE a subagent carries BOTH ids: agent_id is the
+# subagent's own task id, session_id is the parent session. If the PARENT is
+# enrolled, its children inherit the opt-in: enroll the child under
+# "<parent-seat>-sub-<first 4 of task id>", copy the parent's subscription,
+# start the cursor at NOW (a seat that did not exist cannot have pending
+# rows, so the keep-the-backlog rationale that protects REJOINING seats does
+# not apply), and post one arrival status row so a board reader sees the
+# fan-out. A child of an unenrolled parent stays a bystander: enrollment is
+# inherited, never ambient, so the contamination property (suite check f)
+# is untouched. Runs AFTER the handshake loop, so an explicit handshake with
+# its own --seat/--topics always wins over inheritance.
+parent_id = _field(payload, "session_id")
+if isinstance(parent_id, str) and parent_id and parent_id != agent_id:
+    for runid in runs:
+        if swarm_arm.is_participant(runid, agent_id, state_dir=state_dir):
+            continue
+        if not swarm_arm.is_participant(runid, parent_id, state_dir=state_dir):
+            continue
+        p_topics, p_seat = swarm_arm.participant_sub(
+            runid, parent_id, state_dir=state_dir
+        )
+        child_seat = "%s-sub-%s" % (p_seat or parent_id[:8], safe_agent[:4])
+        if swarm_arm.enroll(
+            runid, agent_id, topics=p_topics, seat=child_seat, state_dir=state_dir
+        ):
+            cdir = os.path.join(state_dir, "swarm-cursor", runid)
+            cfile = os.path.join(cdir, safe_agent)
+            if not os.path.exists(cfile):
+                try:
+                    os.makedirs(cdir, exist_ok=True)
+                    with open(cfile, "w") as fh:
+                        fh.write(now_iso)
+                except OSError:
+                    # Cursor init failed: the child replays backlog under CAP,
+                    # bounded and visible, never message loss.
+                    pass
+            try:
+                swarm_mailbox.post(
+                    runid,
+                    child_seat,
+                    "status",
+                    "subagent started under %s" % (p_seat or parent_id[:8]),
+                )
+            except Exception:
+                # Arrival row is display; the enrollment already landed.
+                pass
+
 my_runs = [
     r for r in runs if swarm_arm.is_participant(r, agent_id, state_dir=state_dir)
 ]
