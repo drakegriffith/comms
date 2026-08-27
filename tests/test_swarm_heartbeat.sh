@@ -988,6 +988,98 @@ EOF
         "$base_control" "$current_control"
     ROOT="${CUR_ROOT%/control-current}"
 
+    RX10="hbtestx10$$x$RANDOM"
+    arm_run "$RX10"
+    enroll_agent "$RX10" agentX10 "projX" seatX10
+    for n in $(seq -w 1 25); do
+        post_row "$RX10" seatPeer finding "X10-TOPIC-$n" \
+            "2026-08-27T05:00:$n+00:00" "projX"
+    done
+    post_row "$RX10" seatPeer finding "X10-UNICAST-LAST" \
+        "2026-08-27T05:01:00+00:00" "@seatX10"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-10) beat 1 delivers FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 1 delivers first ten ordinary rows" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-10) beat 1 reports fifteen held rows" \
+        "15 more, read the full board" "$ctx"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(x-10) beat 2 does not repeat FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 2 delivers next ten ordinary rows" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-10) beat 2 reports five held rows" \
+        "5 more, read the full board" "$ctx"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(x-10) beat 3 does not repeat FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 3 delivers final five ordinary rows" "5" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_absent "(x-10) beat 3 has no overflow hint" \
+        "more, read the full board" "$ctx"
+    run_hook agentX10
+    ck "(x-10) beat 4 is empty" "" "$(addl_ctx "$HOOK_OUT")"
+    FORWARDED="$STATE/swarm-cursor/$RX10/agentX10.forwarded"
+    if [ ! -e "$FORWARDED" ] || [ ! -s "$FORWARDED" ]; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "  FAIL (x-10) forwarded set is empty after beat 3" >&2
+    fi
+
+    RX11="hbtestx11$$x$RANDOM"
+    arm_run "$RX11"
+    enroll_agent "$RX11" agentX11 "projX" seatX11
+    X11_TEXT='X11 sentence one names @name, includes "double quotes", a | pipe, a <tag>, and a \ backslash. Sentence two preserves every byte while making this message deliberately long. Sentence three keeps going so truncation or reconstruction is visible. Sentence four repeats the contract in plain text: priority delivery must retain the complete finding. Sentence five adds enough material to cross the requested threshold without relying on rendering width. Sentence six says that punctuation, spacing, and symbols all belong to the payload. Sentence seven makes this exact string longer than six hundred characters. Sentence eight continues with stable prose for a byte-for-byte equality assertion. Sentence nine closes the message after another deliberately verbose clause whose only job is to make accidental shortening immediately observable in the emitted row.'
+    python3 - "$ROOT/comms-$RX11/seatPeer.jsonl" "$X11_TEXT" <<'PY'
+import json
+import os
+import sys
+path, text = sys.argv[1:]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "a") as fh:
+    fh.write(json.dumps({"seat": "seatPeer", "at": "2026-08-27T06:00:00+00:00",
+                         "kind": "finding", "text": text, "topic": "@seatX11"}) + "\n")
+PY
+    run_hook agentX11; ctx="$(addl_ctx "$HOOK_OUT")"
+    first_x11="$(printf '%s\n' "$ctx" | sed -n '2p')"
+    expected_x11="- [FOR YOU from seatPeer] [seatPeer | finding | @seatX11 | 2026-08-27T06:00:00+00:00] $X11_TEXT"
+    ck "(x-11) full priority text is verbatim on the first row" \
+        "$expected_x11" "$first_x11"
+
+    RX12="hbtestx12$$x$RANDOM"
+    arm_run "$RX12"
+    enroll_agent "$RX12" agentX12 "projX" seatX12
+    post_row "$RX12" seatPeer finding "X12-FRESH" \
+        "2026-08-27T07:00:00+00:00" "projX"
+    LIB_ONLY_ARM="$STATE/lib-only-arm"
+    mkdir -p "$LIB_ONLY_ARM"
+    cp "$SA" "$LIB_ONLY_ARM/swarm_arm.py"
+    X12_ERR="$STATE/x12.err"
+    HOOK_OUT="$(payload agentX12 | HB_SWARM_LIB="$LIB_ONLY_ARM" \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$X12_ERR")"
+    ck_contains "(x-12) missing swarm_threads still delivers a fresh row" \
+        "X12-FRESH" "$(addl_ctx "$HOOK_OUT")"
+    ck "(x-12) missing swarm_threads prints exactly one stderr line" \
+        "1" "$(wc -l < "$X12_ERR" | tr -d ' ')"
+
+    RX13="hbtestx13$$x$RANDOM"
+    arm_run "$RX13"
+    enroll_agent "$RX13" agentX13A "projX" seatX13A
+    enroll_agent "$RX13" agentX13B "projX" seatX13B
+    for n in $(seq -w 1 11); do
+        post_row "$RX13" seatPeer finding "X13-TOPIC-$n" \
+            "2026-08-27T08:00:$n+00:00" "projX"
+    done
+    post_row "$RX13" seatPeer finding "X13-FOR-A" \
+        "2026-08-27T08:01:00+00:00" "@seatX13A"
+    post_row "$RX13" seatPeer finding "X13-FOR-B" \
+        "2026-08-27T08:01:00+00:00" "@seatX13B"
+    run_hook agentX13A
+    ck_contains "(x-13) seat A receives its FOR YOU row" \
+        "X13-FOR-A" "$(addl_ctx "$HOOK_OUT")"
+    run_hook agentX13B
+    ck_contains "(x-13) seat A forwarded state does not suppress seat B" \
+        "X13-FOR-B" "$(addl_ctx "$HOOK_OUT")"
+
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
     #     file_path makes os.path.realpath raise ValueError -- the leg is
     #     wrapped, so the beat still emits its rows and exits 0.

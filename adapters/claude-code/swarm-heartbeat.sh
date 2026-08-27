@@ -204,9 +204,14 @@
 #   1,397 unread rows, including 663 stale status rows; a unicast posted at
 #   01:06 sat behind about 1,370 unread rows delivered 10 per beat. Starting the
 #   cursor at enrol time was discarded because it drops pending rows meant for
-#   the seat; raising CAP loses the context bound; a separate priority queue
-#   adds a second cursor that can drift. If FOR-YOU rows alone ever exceed about
-#   10 in one beat on a real run, this uncapped lane needs its own ceiling.
+#   the seat; raising CAP loses the context bound. Advancing the cursor past the
+#   whole pass and leaving ordinary overflow reachable only through --replay was
+#   also discarded: silent loss from push on a busy board costs more than one
+#   extra forwarded-set state file. The cursor therefore stops at the last
+#   emitted ordinary row during overflow, while the per-seat forwarded set keeps
+#   already-emitted priority rows from repeating on later beats. If FOR-YOU rows
+#   alone ever exceed about 10 in one beat on a real run, this uncapped lane
+#   needs its own ceiling.
 #
 # ISOLATION KNOBS (tests set these; production uses the defaults)
 #   COMMS_STATE_DIR   swarm-arm/ registry + cursor dir + telemetry log
@@ -263,8 +268,9 @@ fi
 export HB_PAYLOAD="$input"
 export HB_STATE_DIR="$STATE_DIR"
 # The participant registry (swarm_arm) is IMPORTED, one implementation, never
-# re-derived here. Resolved from this checkout's own lib/, nowhere else.
-export HB_SWARM_LIB="$HB_REPO_ROOT/lib"
+# re-derived here. Production resolves this checkout's own lib/; tests may
+# override HB_SWARM_LIB to exercise compatibility with older live shims.
+export HB_SWARM_LIB="${HB_SWARM_LIB:-$HB_REPO_ROOT/lib}"
 # COMMS_ROOT / CLAUDE_SWARM_ROOT are inherited if set; python defaults the root
 # to /tmp otherwise, matching swarm_mailbox.py's own resolution order.
 
@@ -280,10 +286,16 @@ lib_dir = os.environ.get("HB_SWARM_LIB") or ""
 sys.path.insert(0, lib_dir)
 try:
     import swarm_arm
-    import swarm_threads
 except Exception:
     # Cannot load the registry -> behave like no-armed-run: silent, no output.
     sys.exit(0)
+try:
+    import swarm_threads
+except Exception as exc:
+    # Older live-shim checkouts can lack this optional stale-status helper.
+    # Keep delivery live and disable only stale skipping.
+    swarm_threads = None
+    sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)
 
 payload_raw = os.environ.get("HB_PAYLOAD", "")
 state_dir = os.environ.get("HB_STATE_DIR") or os.path.expanduser("~/.comms/state")
@@ -388,6 +400,7 @@ def append_telemetry(runid, topic_label, rows_inspected, delta_emitted, short_ci
 
 row_lines = []                 # emitted rows across every participating run
 deferred_cursor = []           # (cursor_dir, cursor_file, new_cursor)
+deferred_forwarded = []        # (cursor_dir, forwarded_file, keys)
 deferred_mtime = []            # (cursor_dir, mtime_file, "set"|"clear", val)
 enrolled_this_beat = set()     # runids whose subscription GREW on this beat
 
@@ -409,6 +422,7 @@ def process_run(runid):
 
     cursor_dir = os.path.join(state_dir, "swarm-cursor", runid)
     cursor_file = os.path.join(cursor_dir, safe_agent)
+    forwarded_file = cursor_file + ".forwarded"
     mtime_file = cursor_file + ".mtime"
     mailbox_dir = os.path.join(swarm_root, "comms-%s" % runid)
 
@@ -417,6 +431,16 @@ def process_run(runid):
             cursor = fh.read().strip()
     except OSError:
         cursor = ""
+
+    forwarded = set()
+    try:
+        with open(forwarded_file) as fh:
+            for line in fh:
+                key = line.rstrip("\n").split("\t", 1)
+                if len(key) == 2 and key[0]:
+                    forwarded.add((key[0], key[1]))
+    except OSError:
+        pass
 
     if not os.path.isdir(mailbox_dir):
         append_telemetry(runid, topic_label, 0, 0)
@@ -506,15 +530,18 @@ def process_run(runid):
     # input must not become silent message loss. Keep the original delta for
     # the cursor edge, so skipped stale rows are consumed exactly like emitted
     # rows even when every deliverable row was filtered away.
-    alive_window_s = swarm_threads.env_int(
-        swarm_threads.ALIVE_SECONDS_VAR, swarm_threads.DEFAULT_WINDOW_S
-    )
+    alive_window_s = None
+    if swarm_threads is not None:
+        alive_window_s = swarm_threads.env_int(
+            swarm_threads.ALIVE_SECONDS_VAR, swarm_threads.DEFAULT_WINDOW_S
+        )
     beat_now = datetime.datetime.now(datetime.timezone.utc)
     deliverable = []
     for r in delta:
-        row_at = swarm_threads.parsed_at(r)
+        row_at = swarm_threads.parsed_at(r) if swarm_threads is not None else None
         stale_status = (
-            r.get("kind") == swarm_threads.STATUS_KIND
+            alive_window_s is not None
+            and r.get("kind") == swarm_threads.STATUS_KIND
             and row_at is not None
             and (beat_now - row_at).total_seconds() > alive_window_s
         )
@@ -527,18 +554,31 @@ def process_run(runid):
         return
 
     for_you_topic = ("@" + seat) if seat else None
-    priority = [
+    priority_all = [
         r for r in deliverable
         if (for_you_topic and (r.get("topic") or "default") == for_you_topic)
         or (subs is not None and (r.get("thread") or "") in subs)
     ]
-    ordinary = [r for r in deliverable if r not in priority]
+    priority = [
+        r for r in priority_all
+        if not r.get("at") or (r.get("at"), r.get("seat") or "") not in forwarded
+    ]
+    ordinary = [r for r in deliverable if r not in priority_all]
     emitted = priority + ordinary[:CAP]
     overflow = max(0, len(ordinary) - CAP)
-    # The overflow contract points readers at --replay because advancing past
-    # the pass is intentional. It also lets stale-only passes consume their
-    # rows without producing output.
-    new_cursor = delta[-1].get("at", "")
+    # Preserve ordinary push continuity under overflow. Priority rows beyond
+    # this edge are remembered separately so they do not repeat next beat.
+    new_cursor = (
+        ordinary[CAP - 1].get("at", "")
+        if overflow > 0
+        else delta[-1].get("at", "")
+    )
+    forwarded = {key for key in forwarded if key[0] > new_cursor}
+    forwarded.update(
+        (r.get("at"), r.get("seat") or "")
+        for r in priority
+        if r.get("at") and r.get("at") > new_cursor
+    )
 
     # FOR-YOU FLAG + THREAD SUFFIX (issue #41): a row riding this agent's own
     # unicast topic "@<seat>" is addressed to it specifically, and a `thread`
@@ -580,6 +620,7 @@ def process_run(runid):
         )
 
     deferred_cursor.append((cursor_dir, cursor_file, new_cursor))
+    deferred_forwarded.append((cursor_dir, forwarded_file, forwarded))
     # overflow un-surfaced => force next beat to parse (clear); else short-circuit
     deferred_mtime.append(
         (cursor_dir, mtime_file, "clear" if overflow > 0 else "set", newest)
@@ -774,6 +815,15 @@ for cursor_dir, cursor_file, new_cursor in deferred_cursor:
         os.makedirs(cursor_dir, exist_ok=True)
         with open(cursor_file, "w") as fh:
             fh.write(new_cursor)
+    except OSError:
+        pass
+
+for cursor_dir, forwarded_file, forwarded in deferred_forwarded:
+    try:
+        os.makedirs(cursor_dir, exist_ok=True)
+        with open(forwarded_file, "w") as fh:
+            for at, seat in sorted(forwarded):
+                fh.write("%s\t%s\n" % (at, seat))
     except OSError:
         pass
 
