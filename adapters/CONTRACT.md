@@ -209,6 +209,7 @@ tick-list, derived from `adapters/codex/`.
 | --- | --- | --- | --- |
 | Claude Code | push | PostToolUse `additionalContext` reached a live subagent; telemetry row `rows_inspected 6, delta_emitted 3` | 2026-08-21, comms #1 |
 | Codex | push | byte-compatible Claude-shaped `hooks.json`; injection observed. Headless needs `--dangerously-bypass-hook-trust` -- untrusted hooks are skipped SILENTLY | 2026-08-21, codex 0.148.0 |
+| Gemini CLI | UNVERIFIED | adapter present, no probe run | 2026-08-26 |
 | Kimi | resume-driver | push (a) by ASSERTED ABSENCE: no hook surface, so nothing can run after a tool call and the push probe cannot be installed. Poll test fails too -- no in-session way to read the mailbox. (b) passes: `kimi -r <id> -p` delivers into a live session | pre-extraction |
 | grok (xAI) | poll | hooks load and fire (stdin copy present) and stdout is discarded (`NOTHING-APPEARED`) -- a measured push negative | 2026-08-25, grok 0.2.106 |
 | pi (badlogic) | poll | no hook surface; runs shell commands in its own turn | pre-extraction |

@@ -12,7 +12,10 @@ MODE="${1:-install}"
   exit 1
 }
 
-export COMMS_GEMINI_TARGET="$SETTINGS" COMMS_GEMINI_COMMAND="bash $HOOK" COMMS_GEMINI_MODE="$MODE"
+HOOK_COMMAND="bash \"${HOOK//\\/\\\\}\""
+HOOK_COMMAND="${HOOK_COMMAND//\$/\\\$}"
+HOOK_COMMAND="${HOOK_COMMAND//\`/\\\`}"
+export COMMS_GEMINI_TARGET="$SETTINGS" COMMS_GEMINI_COMMAND="$HOOK_COMMAND" COMMS_GEMINI_MODE="$MODE"
 python3 - <<'PY' || { echo "install: FAILED: Gemini settings edit failed" >&2; exit 1; }
 import json
 import os
@@ -21,6 +24,10 @@ import sys
 path = os.environ["COMMS_GEMINI_TARGET"]
 command = os.environ["COMMS_GEMINI_COMMAND"]
 uninstall = os.environ["COMMS_GEMINI_MODE"] == "--uninstall"
+
+if uninstall and not os.path.exists(path):
+    print("Gemini AfterTool hook already absent in %s" % path)
+    sys.exit(0)
 
 try:
     with open(path) as fh:

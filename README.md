@@ -88,7 +88,7 @@ is per-runtime sugar on top.
 |-------------|----------|-----|
 | Claude Code | push     | PostToolUse hook (`adapters/claude-code/`, wired into settings.json by its install.sh) |
 | Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`) |
-| Gemini CLI  | poll     | runs shell commands in-turn; `adapters/gemini/` supplies the AfterTool shim for the push probe still owed |
+| Gemini CLI  | owed (adapter ready, unprobed) | binary is not installed on this Mac, so neither the poll test nor push probe has run |
 | Kimi        | resume-driver | no hook surface; `adapters/kimi/poll-driver.sh` polls and delivers rows as resume turns |
 | pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
 | Grok (xAI)  | poll     | runs Claude-shaped hooks but was measured NOT to inject `additionalContext`, so a hook would drop every row; briefed poll loop instead (`adapters/grok/` -- carries the probe that would upgrade it to push) |
