@@ -28,6 +28,9 @@ KIT="$SELF_DIR/../adapters/probe"
 ARM="$KIT/arm-probe.sh"
 HOOK="$KIT/push-probe-hook.sh"
 VERDICT="$KIT/probe-verdict.sh"
+# Canonical (no "..") form of HOOK, matching what arm-probe.sh's own SELF_DIR
+# resolves to internally -- needed to compare against text the script prints.
+HOOK_ABS="$(cd "$(dirname "$HOOK")" && pwd)/$(basename "$HOOK")"
 pass=0
 fail=0
 
@@ -360,6 +363,53 @@ JSON
     #     The scripts write only into the probe dir handed to them.
     ck "(g) kit scripts never reference HOME" "0" \
         "$(grep -c 'HOME' "$ARM" "$HOOK" "$VERDICT" | awk -F: '{s+=$2} END {print s}')"
+
+    # ---- (h) --format none: hand-wiring instead of a config ----------------
+    #     A runtime whose hook config is not the {"EVENT": [...]} /
+    #     {"hooks": {"EVENT": [...]}} JSON shape gets NO config write and a
+    #     plain-text hand-wiring file instead, so a person can paste it into
+    #     Cline's, Gemini's, Crush's, or Hermes's own config by hand.
+    D="$SANDBOX/h"
+    ARM_OUT="$(bash "$ARM" --dir "$D" --format none 2>&1)"; ARM_RC=$?
+    ck "(h) format none exits 0" "0" "$ARM_RC"
+    ck "(h) format none writes a passphrase" "yes" "$([ -s "$D/passphrase" ] && echo yes)"
+    ck "(h) format none writes armed-at" "yes" "$([ -s "$D/armed-at" ] && echo yes)"
+    ck "(h) format none writes event" "yes" "$([ -s "$D/event" ] && echo yes)"
+    ck "(h) format none writes hand-wiring.txt" "yes" "$([ -s "$D/hand-wiring.txt" ] && echo yes)"
+    ck "(h) format none writes NO hooks.json" "" "$([ -e "$D/hooks.json" ] && echo present)"
+    ck "(h) format none writes NO settings.json" "" "$([ -e "$D/settings.json" ] && echo present)"
+    ck "(h) format none creates no other json file in the probe dir" "0" \
+        "$(find "$D" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')"
+    D_ABS="$(cd "$D" && pwd)"
+    HW="$D/hand-wiring.txt"
+    PP="$(passphrase_of "$D")"
+    ck_contains "(h) hand-wiring names the exact hook command" \
+        "bash $HOOK_ABS $D_ABS" "$(cat "$HW")"
+    ck_contains "(h) hand-wiring names the event" "PostToolUse" "$(cat "$HW")"
+    ck_contains "(h) hand-wiring carries the envelope's event key" \
+        '"hookEventName":"PostToolUse"' "$(cat "$HW")"
+    ck_contains "(h) hand-wiring carries the envelope's context key" \
+        '"additionalContext"' "$(cat "$HW")"
+    ck_contains "(h) hand-wiring carries this run's passphrase" "$PP" "$(cat "$HW")"
+    ck_contains "(h) arm-probe still prints the hand-wiring path" \
+        "$D_ABS/hand-wiring.txt" "$ARM_OUT"
+    ck_contains "(h) arm-probe still prints the verdict command" \
+        "probe-verdict.sh $D_ABS" "$ARM_OUT"
+
+    #     A custom --event flows through to the hand-wiring text too.
+    D2="$SANDBOX/h2"
+    ARM_OUT="$(bash "$ARM" --dir "$D2" --format none --event Stop 2>&1)"; ARM_RC=$?
+    ck "(h) format none with --event exits 0" "0" "$ARM_RC"
+    ck_contains "(h) hand-wiring reflects the custom event" \
+        '"hookEventName":"Stop"' "$(cat "$D2/hand-wiring.txt")"
+
+    #     A --config passed alongside --format none is still not written to --
+    #     none means no config write, full stop.
+    D3="$SANDBOX/h3"; C3="$SANDBOX/h3-hooks.json"
+    ARM_OUT="$(bash "$ARM" --dir "$D3" --config "$C3" --format none 2>&1)"; ARM_RC=$?
+    ck "(h) format none with --config still exits 0" "0" "$ARM_RC"
+    ck "(h) format none with --config still writes nothing to it" "" \
+        "$([ -e "$C3" ] && echo present)"
 
     rm -rf "$SANDBOX"
 }

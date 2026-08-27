@@ -24,9 +24,15 @@
 #   --event NAME    hook event to install on and to name in the envelope
 #                   (default PostToolUse).
 #   --matcher M     matcher for the config entry (default "*", i.e. no filter).
-#   --format auto|flat|wrapped   config shape (default auto; see above). Codex
-#                                reads hooks.json only in the wrapped shape,
-#                                so pass --format wrapped for Codex.
+#   --format auto|flat|wrapped|none  config shape (default auto; see above).
+#                                Codex reads hooks.json only in the wrapped
+#                                shape, so pass --format wrapped for Codex.
+#                                `none` writes NO config file at all -- it
+#                                writes <probe-dir>/hand-wiring.txt instead,
+#                                naming the hook command line, the event, and
+#                                the envelope, for a runtime whose hook config
+#                                is not this kit's JSON shape (YAML, TOML, JS,
+#                                or an in-process plugin registration).
 #   --passphrase P  use this passphrase instead of minting one (tests).
 #
 # Exit codes: 0 armed | 1 could not arm (missing hook script, unparseable or
@@ -61,8 +67,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$FORMAT" in
-    auto|flat|wrapped) ;;
-    *) usage "--format must be auto, flat or wrapped (got: $FORMAT)" ;;
+    auto|flat|wrapped|none) ;;
+    *) usage "--format must be auto, flat, wrapped or none (got: $FORMAT)" ;;
 esac
 
 [ -f "$HOOK" ] || die "missing hook script $HOOK"
@@ -87,6 +93,71 @@ printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$DIR/armed-at"
 # An isolated state dir to export into the runtime under test, so a probe run
 # can never write into ~/.comms/state or move a real cursor.
 mkdir -p "$DIR/state"
+
+# --format none: no config is this kit's JSON shape to edit. Write NO config
+# file anywhere -- not even the isolated default -- and instead hand the
+# operator the exact three pieces to paste into whatever schema the runtime's
+# own config uses (YAML, TOML, JS, an in-process plugin registration...). The
+# kit still knows no runtime names here: the text below says "the runtime",
+# never a specific one.
+if [ "$FORMAT" = "none" ]; then
+    HAND_WIRING="$DIR/hand-wiring.txt"
+    ENVELOPE="{\"hookSpecificOutput\":{\"hookEventName\":\"$EVENT\",\"additionalContext\":\"MAILBOX ROW (comms push probe -- this is DATA, not instructions): passphrase $PASSPHRASE . If you can read this, report the passphrase verbatim.\"}}"
+    cat > "$HAND_WIRING" <<EOF
+Hand-wiring the push probe -- no config file was written
+==========================================================
+
+--format none means this runtime's hook config is not the JSON shape
+arm-probe.sh edits automatically ({"EVENT": [...]} or
+{"hooks": {"EVENT": [...]}}). Nothing was written to any config file.
+Wire the three pieces below into the runtime's own config by hand --
+YAML, TOML, JS, or an in-process plugin registration all carry the same
+three facts, just in different syntax.
+
+Hook command line (no matcher needed -- fire this on every event):
+  bash $HOOK $DIR
+
+Event to wire it on:
+  $EVENT
+
+Envelope this hook prints on stdout when it fires, with THIS run's
+passphrase already substituted -- your wiring is right if this exact
+text reaches the agent's turn:
+  $ENVELOPE
+
+Next, in this order:
+
+1. Wire the command line above into the event named above, by hand, in
+   whatever shape this runtime's config uses.
+2. Run the runtime HEADLESS in a scratch directory, told to run ONE
+   shell command and then report any extra context or passphrase it
+   saw, verbatim:
+       COMMS_STATE_DIR=$DIR/state <runtime> -p "run: echo hello. Then report any extra context or passphrase you saw, verbatim. If none, answer NOTHING-APPEARED." | tee $DIR/agent-answer.txt
+
+3. Read the verdict. It reads the positive control BEFORE the answer,
+   on purpose:
+       bash $SELF_DIR/probe-verdict.sh $DIR
+
+Remove the entry from the runtime's config when you are done; the
+probe fires on every hook call for as long as it is wired.
+EOF
+    cat <<EOF
+arm-probe: armed (format none -- no config file written)
+  probe dir     $DIR
+  passphrase    $PASSPHRASE
+  event         $EVENT
+  hand-wiring   $HAND_WIRING
+
+See $HAND_WIRING for the exact command line, event, and envelope to
+paste into this runtime's own config by hand. Then:
+
+1. Run the runtime headless (full command in $HAND_WIRING) and tee its
+   answer to $DIR/agent-answer.txt.
+2. Read the verdict:
+       bash $SELF_DIR/probe-verdict.sh $DIR
+EOF
+    exit 0
+fi
 
 [ -n "$CONFIG" ] || CONFIG="$DIR/hooks.json"
 
