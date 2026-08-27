@@ -859,6 +859,135 @@ EOF
 
     rm -rf "$REPO2" "$OUTSIDE2" "$SHIM" "$SLOW_SHIM"
 
+    # -----------------------------------------------------------------------
+    # (x) DELIVERY ORDER: rows specifically for this seat precede ordinary
+    #     subscribed rows and do not consume the ordinary-row CAP. Status rows
+    #     older than the thread alive window are consumed without delivery.
+    RX="hbtestx$$x$RANDOM"
+    arm_run "$RX"
+    enroll_agent "$RX" agentX "projX,doc:repo/watched.py" seatX
+    for n in $(seq -w 1 25); do
+        post_row "$RX" seatPeer finding "X1-TOPIC-$n" \
+            "2026-08-27T01:05:$n+00:00" "projX"
+    done
+    post_row "$RX" seatPeer finding "X1-UNICAST-LAST" \
+        "2026-08-27T01:06:00+00:00" "@seatX"
+    run_hook agentX; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-1) unicast behind the topic backlog is delivered" \
+        "[FOR YOU from seatPeer] [seatPeer | finding | @seatX | 2026-08-27T01:06:00+00:00] X1-UNICAST-LAST" "$ctx"
+    ck "(x-1) ordinary topic rows remain capped at ten" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X1-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-1) overflow counts only held ordinary rows" \
+        "15 more, read the full board" "$ctx"
+
+    RX2="hbtestx2$$x$RANDOM"
+    arm_run "$RX2"
+    enroll_agent "$RX2" agentX2 "projX" seatX2
+    for n in $(seq -w 1 12); do
+        post_row "$RX2" seatPeer finding "X2-UNICAST-$n" \
+            "2026-08-27T02:00:$n+00:00" "@seatX2"
+        post_row "$RX2" seatPeer finding "X2-TOPIC-$n" \
+            "2026-08-27T02:01:$n+00:00" "projX"
+    done
+    run_hook agentX2; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck "(x-2) all twelve unicasts are emitted" "12" \
+        "$(printf '%s' "$ctx" | grep -c 'X2-UNICAST-' | tr -d ' ')"
+    ck "(x-2) ten ordinary rows are emitted" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X2-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-2) overflow holds only two ordinary rows" \
+        "2 more, read the full board" "$ctx"
+
+    RX3="hbtestx3$$x$RANDOM"
+    arm_run "$RX3"
+    enroll_agent "$RX3" agentX3 "projX,doc:repo/watched.py" seatX3
+    for n in $(seq -w 1 20); do
+        post_row "$RX3" seatPeer finding "X3-TOPIC-$n" \
+            "2026-08-27T03:00:$n+00:00" "projX"
+    done
+    post_row "$RX3" seatPeer finding "X3-THREAD-LAST" \
+        "2026-08-27T03:01:00+00:00" "other" "doc:repo/watched.py"
+    run_hook agentX3; ctx="$(addl_ctx "$HOOK_OUT")"
+    first_x3="$(printf '%s\n' "$ctx" | grep 'X3-' | head -1)"
+    ck_contains "(x-3) subscribed-thread row is emitted first" "X3-THREAD-LAST" "$first_x3"
+
+    old_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).isoformat())')"
+    fresh_at="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())')"
+    RX4="hbtestx4$$x$RANDOM"
+    arm_run "$RX4"
+    enroll_agent "$RX4" agentX4 "projX" seatX4
+    for n in $(seq -w 1 30); do
+        post_row "$RX4" seatPeer status "X4-STALE-$n" "$old_at" "projX"
+    done
+    post_row "$RX4" seatPeer finding "X4-FRESH-FINDING" "$fresh_at" "projX"
+    run_hook agentX4; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-4) fresh finding survives stale status backlog" "X4-FRESH-FINDING" "$ctx"
+    ck_absent "(x-4) stale status rows are skipped" "X4-STALE-" "$ctx"
+    ck_absent "(x-4) skipped status rows do not create overflow" \
+        "more, read the full board" "$ctx"
+    run_hook agentX4
+    ck "(x-4) second beat is empty after stale rows are consumed" "" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX5="hbtestx5$$x$RANDOM"
+    arm_run "$RX5"
+    enroll_agent "$RX5" agentX5 "projX" seatX5
+    young_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=5)).isoformat())')"
+    post_row "$RX5" seatPeer status "X5-YOUNG-STATUS" "$young_at" "projX"
+    run_hook agentX5
+    ck_contains "(x-5) five-minute-old status is delivered" "X5-YOUNG-STATUS" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX6="hbtestx6$$x$RANDOM"
+    arm_run "$RX6"
+    enroll_agent "$RX6" agentX6 "projX" seatX6
+    post_row "$RX6" seatPeer status "X6-BAD-DATE" "not-a-date" "projX"
+    run_hook agentX6
+    ck_contains "(x-6) unparseable status date is delivered" "X6-BAD-DATE" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX7="hbtestx7$$x$RANDOM"
+    arm_run "$RX7"
+    enroll_agent "$RX7" agentX7 "projX" seatX7
+    two_min_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=2)).isoformat())')"
+    post_row "$RX7" seatPeer status "X7-OVERRIDE-STALE" "$two_min_at" "projX"
+    HOOK_OUT="$(payload agentX7 | COMMS_THREAD_ALIVE_SECONDS=60 \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    ck_absent "(x-7) sixty-second window skips two-minute status" \
+        "X7-OVERRIDE-STALE" "$(addl_ctx "$HOOK_OUT")"
+
+    # Byte-identity control against the base commit under equivalent isolated
+    # state: ordinary rows exercise neither priority nor stale-status behavior.
+    BASE_TREE="$STATE/base-tree"
+    mkdir -p "$BASE_TREE/adapters/claude-code" "$BASE_TREE/lib"
+    git show 18e1b24:adapters/claude-code/swarm-heartbeat.sh > \
+        "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    git show 18e1b24:adapters/claude-code/stdin-bounded.sh > \
+        "$BASE_TREE/adapters/claude-code/stdin-bounded.sh"
+    git show 18e1b24:lib/swarm_arm.py > "$BASE_TREE/lib/swarm_arm.py"
+    chmod +x "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    CUR_STATE="$STATE/control-current"; BASE_STATE="$STATE/control-base"
+    CUR_ROOT="$ROOT/control-current"; BASE_ROOT="$ROOT/control-base"
+    COMMS_STATE_DIR="$CUR_STATE" python3 "$SA" arm control >/dev/null
+    COMMS_STATE_DIR="$CUR_STATE" python3 "$SA" enroll control --agent-id control-agent \
+        --topics projX --seat control-seat >/dev/null
+    COMMS_STATE_DIR="$BASE_STATE" python3 "$BASE_TREE/lib/swarm_arm.py" arm control >/dev/null
+    COMMS_STATE_DIR="$BASE_STATE" python3 "$BASE_TREE/lib/swarm_arm.py" enroll control \
+        --agent-id control-agent --topics projX --seat control-seat >/dev/null
+    for control_root in "$CUR_ROOT" "$BASE_ROOT"; do
+        ROOT="$control_root"
+        post_row control seatPeer finding CONTROL-1 "2026-08-27T04:00:01+00:00" projX
+        post_row control seatPeer finding CONTROL-2 "2026-08-27T04:00:02+00:00" projX
+        post_row control seatPeer finding CONTROL-3 "2026-08-27T04:00:03+00:00" projX
+    done
+    ROOT="$CUR_ROOT"
+    current_control="$(payload control-agent | COMMS_STATE_DIR="$CUR_STATE" \
+        COMMS_ROOT="$CUR_ROOT" /bin/bash "$HOOK")"
+    base_control="$(payload control-agent | COMMS_STATE_DIR="$BASE_STATE" \
+        COMMS_ROOT="$BASE_ROOT" /bin/bash "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh")"
+    ck "(x-9) ordinary-row beat is byte-identical to base commit" \
+        "$base_control" "$current_control"
+    ROOT="${CUR_ROOT%/control-current}"
+
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
     #     file_path makes os.path.realpath raise ValueError -- the leg is
     #     wrapped, so the beat still emits its rows and exits 0.

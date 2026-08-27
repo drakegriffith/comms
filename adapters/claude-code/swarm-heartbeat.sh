@@ -195,6 +195,19 @@
 #   (`comms post reply --to <seat> --thread <key> "<text>"`). A row with
 #   neither renders exactly as before.
 #
+# DELIVERY ORDER
+#   Rows FOR THIS SEAT -- its "@<seat>" unicast or a subscribed thread -- are
+#   emitted first in `at` order and never consume the ordinary-row CAP. The CAP
+#   remains 10 for everything else. Status rows older than the configured alive
+#   window are consumed without emission or overflow. Measured incident,
+#   2026-08-27: a fresh Codex seat on machine-ops had a cursor at 2026-08-24 and
+#   1,397 unread rows, including 663 stale status rows; a unicast posted at
+#   01:06 sat behind about 1,370 unread rows delivered 10 per beat. Starting the
+#   cursor at enrol time was discarded because it drops pending rows meant for
+#   the seat; raising CAP loses the context bound; a separate priority queue
+#   adds a second cursor that can drift. If FOR-YOU rows alone ever exceed about
+#   10 in one beat on a real run, this uncapped lane needs its own ceiling.
+#
 # ISOLATION KNOBS (tests set these; production uses the defaults)
 #   COMMS_STATE_DIR   swarm-arm/ registry + cursor dir + telemetry log
 #                     (falls back to the pre-extraction SWARM_HEARTBEAT_STATE_DIR,
@@ -267,6 +280,7 @@ lib_dir = os.environ.get("HB_SWARM_LIB") or ""
 sys.path.insert(0, lib_dir)
 try:
     import swarm_arm
+    import swarm_threads
 except Exception:
     # Cannot load the registry -> behave like no-armed-run: silent, no output.
     sys.exit(0)
@@ -487,21 +501,50 @@ def process_run(runid):
     delta = [r for r in rows if (r.get("at") or "") > cursor]
     delta.sort(key=lambda r: r.get("at", ""))
 
+    # Ambient session births stop being useful after the same alive window the
+    # thread model uses. A malformed timestamp is deliberately retained: bad
+    # input must not become silent message loss. Keep the original delta for
+    # the cursor edge, so skipped stale rows are consumed exactly like emitted
+    # rows even when every deliverable row was filtered away.
+    alive_window_s = swarm_threads.env_int(
+        swarm_threads.ALIVE_SECONDS_VAR, swarm_threads.DEFAULT_WINDOW_S
+    )
+    beat_now = datetime.datetime.now(datetime.timezone.utc)
+    deliverable = []
+    for r in delta:
+        row_at = swarm_threads.parsed_at(r)
+        stale_status = (
+            r.get("kind") == swarm_threads.STATUS_KIND
+            and row_at is not None
+            and (beat_now - row_at).total_seconds() > alive_window_s
+        )
+        if not stale_status:
+            deliverable.append(r)
+
     if not delta:
         deferred_mtime.append((cursor_dir, mtime_file, "set", newest))
         append_telemetry(runid, topic_label, rows_inspected, 0)
         return
 
-    emitted = delta[:CAP]
-    overflow = len(delta) - len(emitted)
-    new_cursor = emitted[-1].get("at", "")
+    for_you_topic = ("@" + seat) if seat else None
+    priority = [
+        r for r in deliverable
+        if (for_you_topic and (r.get("topic") or "default") == for_you_topic)
+        or (subs is not None and (r.get("thread") or "") in subs)
+    ]
+    ordinary = [r for r in deliverable if r not in priority]
+    emitted = priority + ordinary[:CAP]
+    overflow = max(0, len(ordinary) - CAP)
+    # The overflow contract points readers at --replay because advancing past
+    # the pass is intentional. It also lets stale-only passes consume their
+    # rows without producing output.
+    new_cursor = delta[-1].get("at", "")
 
     # FOR-YOU FLAG + THREAD SUFFIX (issue #41): a row riding this agent's own
     # unicast topic "@<seat>" is addressed to it specifically, and a `thread`
     # field names the document/conversation a reply belongs in -- both are
     # purely additive to the line format, so a row with neither renders
     # BYTE-IDENTICAL to before.
-    for_you_topic = ("@" + seat) if seat else None
     for r in emitted:
         prefix = ""
         if for_you_topic and (r.get("topic") or "default") == for_you_topic:
