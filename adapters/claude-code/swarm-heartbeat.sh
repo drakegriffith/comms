@@ -484,6 +484,24 @@ def process_run(runid):
             cursor = fh.read().strip()
     except OSError:
         cursor = ""
+    # machine-ops is an ambient live channel, not an inbox. On its first beat,
+    # begin at this session's enrollment time instead of replaying the standing
+    # channel's history ten rows per tool call. Explicit swarm runs retain their
+    # backlog contract.
+    seeded = False
+    if runid == "machine-ops" and not cursor:
+        participant_file = os.path.join(
+            state_dir, "swarm-arm", runid, "participants", safe_agent
+        )
+        try:
+            cursor = datetime.datetime.fromtimestamp(
+                os.path.getmtime(participant_file), datetime.timezone.utc
+            ).isoformat()
+            seeded = True
+        except OSError:
+            # Do not guess a birth time. The existing bounded replay is the
+            # recoverable fallback when enrollment state cannot be inspected.
+            pass
 
     forwarded = set()
     try:
@@ -570,7 +588,19 @@ def process_run(runid):
     if seat:
         rows = [r for r in rows if r.get("seat") != seat]
 
-    delta = [r for r in rows if (r.get("at") or "") > cursor]
+    # A seeded cursor skips the ordinary backlog only. A row addressed to this
+    # seat (@seat unicast or a subscribed thread) that was posted before the
+    # seat enrolled is still delivered once; the .forwarded sidecar keeps it
+    # from repeating. Without this, seeding would drop a direct message posted
+    # minutes before enrollment, the loss both consult seats named (2026-08-27).
+    seed_for_you = ("@" + seat) if (seeded and seat) else None
+    delta = [
+        r for r in rows
+        if (r.get("at") or "") > cursor
+        or (seeded and (
+            (seed_for_you and (r.get("topic") or "default") == seed_for_you)
+            or (subs is not None and (r.get("thread") or "") in subs)))
+    ]
     delta.sort(key=lambda r: r.get("at", ""))
 
     # Ambient session births stop being useful after the same alive window the
@@ -639,6 +669,11 @@ def process_run(runid):
     # purely additive to the line format, so a row with neither renders
     # BYTE-IDENTICAL to before.
     for r in emitted:
+        row_text = r.get("text", "")
+        if runid == "machine-ops" and len(row_text) > 240:
+            # Bound ambient context. The mailbox remains the source of record;
+            # priority routing and cursor semantics are unchanged.
+            row_text = row_text[:237] + "..."
         prefix = ""
         if for_you_topic and (r.get("topic") or "default") == for_you_topic:
             prefix = "[FOR YOU from %s] " % r.get("seat", "?")
@@ -653,7 +688,7 @@ def process_run(runid):
                 r.get("kind", "?"),
                 r.get("topic") or "default",
                 r.get("at", "?"),
-                r.get("text", ""),
+                row_text,
                 suffix,
             )
         )

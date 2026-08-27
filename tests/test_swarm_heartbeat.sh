@@ -1270,6 +1270,34 @@ print(swarm_arm.participant_sub(sys.argv[2], sys.argv[3])[1] or "", end="")' \
     fi
     ck "(v) bystander child emits nothing" "" "$HOOK_OUT"
 
+    # -----------------------------------------------------------------------
+    # (w) machine-ops SEEDED CURSOR (2026-08-27). The standing ambient channel
+    #     is a live feed, not an inbox: a fresh enrollment starts at its own
+    #     enrollment time instead of replaying the board ten rows per beat
+    #     (measured 13.2% of the transcript tape over 3 days). A row addressed
+    #     to the seat that predates enrollment is still delivered once. Explicit
+    #     runs keep their backlog contract: case (g) above stays the control.
+    RW="machine-ops"
+    arm_run "$RW"
+    post_row "$RW" seatOld status "old ordinary backlog row" "2026-01-01T00:00:01+00:00"
+    post_row "$RW" seatOld finding "old finding backlog row" "2026-01-01T00:00:02+00:00"
+    post_row "$RW" seatOld comment "old unicast for W" "2026-01-01T00:00:03+00:00" "@seatW"
+    enroll_agent "$RW" agentW "" seatW
+    post_row "$RW" seatNew finding "fresh row after enrollment" "2099-01-01T00:00:00+00:00"
+    run_hook agentW; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(w) seeded cursor skips old ordinary row" "old finding backlog row" "$ctx"
+    ck_absent "(w) seeded cursor skips old status row" "old ordinary backlog row" "$ctx"
+    ck_contains "(w) pre-enrollment unicast still delivered" "old unicast for W" "$ctx"
+    ck_contains "(w) post-enrollment row delivered" "fresh row after enrollment" "$ctx"
+    run_hook agentW; ctx2="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(w) second beat does not repeat the unicast" "old unicast for W" "$ctx2"
+    ck_absent "(w) second beat does not repeat the fresh row" "fresh row after enrollment" "$ctx2"
+    long="$(printf 'x%.0s' $(seq 1 400))"
+    post_row "$RW" seatNew finding "$long" "2099-01-01T00:00:01+00:00"
+    run_hook agentW; ctx3="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(w) machine-ops row text bounded at 240" "$long" "$ctx3"
+    ck_contains "(w) bounded row still delivered" "xxxxxxxxxx..." "$ctx3"
+
     rm -rf "$STATE" "$ROOT"
 }
 
