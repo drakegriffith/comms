@@ -711,6 +711,9 @@ run_suite() {  # one fully-isolated pass
     enroll_agent "$RW2" agentMismatch "projW2" seatMismatch
     enroll_agent "$RW2" agentOutside "projW2" seatOutside
     enroll_agent "$RW2" agentSlow "projW2" seatSlow
+    enroll_agent "$RW2" agentRead "projW2" seatRead
+    enroll_agent "$RW2" agentRedirect "projW2" seatRedirect
+    enroll_agent "$RW2" agentHeredoc "projW2" seatHeredoc
     enroll_agent "$RW2" agentSeatless "projW2"
     REPO2="$(mktemp -d)" || exit 1
     REPONAME2="$(basename "$REPO2")"
@@ -740,6 +743,16 @@ run_suite() {  # one fully-isolated pass
     run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update")"
     ck "(w-b) apply_patch Update File does not duplicate a claim" "1" \
         "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+
+    patch_update_fresh='*** Begin Patch
+*** Update File: sub/u.py
+@@
+-old
++new
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update_fresh")"
+    ck "(w-b2) apply_patch Update File enrols on its own" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/u.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
 
     before_patch_topics="$(part_topics "$RW2" agentPatch)"
     patch_delete='*** Begin Patch
@@ -780,16 +793,41 @@ EOF"
     printf 'git-spawn-proof read=%s write=%s\n' \
         "$(wc -l < "$GIT_CALLS" | tr -d ' ')" "$write_git_calls"
 
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRead Bash "$REPO2" 'grep -n "def" sub/b.py 2>/dev/null' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) fd redirect on a read-shaped Bash command posts no claim" "0" \
+        "$(grep "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRead.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+    ck "(w-j) fd redirect on a read-shaped Bash command spawns no git" "0" \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRedirect Bash "$REPO2" 'printf x > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRedirect.jsonl" 2>/dev/null | tr -d ' ')"
+    HOOK_OUT="$(command_payload agentHeredoc Bash "$REPO2" 'cat <<EOF > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) heredoc plus output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatHeredoc.jsonl" 2>/dev/null | tr -d ' ')"
+
     before_mismatch="$(part_topics "$RW2" agentMismatch)"
     run_hook_raw "$(command_payload agentMismatch Bash "$REPO2" 'printf x > unrelated.py')"
     ck "(w-f) basename gate rejects an unrelated dirty path" "$before_mismatch" \
         "$(part_topics "$RW2" agentMismatch)"
 
     OUTSIDE2="$(mktemp -d)" || exit 1
-    run_hook_raw "$(command_payload agentOutside Bash "$OUTSIDE2" 'printf x > loose.py')"
+    OUTSIDE_ERR="$STATE/outside-repo.err"
+    HOOK_OUT="$(command_payload agentOutside Bash "$OUTSIDE2" 'printf x > loose.py' | \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$OUTSIDE_ERR")"
+    HOOK_RC=$?
     ck "(w-g) write-shaped Bash outside a repo exits 0" "0" "$HOOK_RC"
     ck "(w-g) write-shaped Bash outside a repo enrols nothing" "projW2" \
         "$(part_topics "$RW2" agentOutside)"
+    ck "(w-g) write-shaped Bash outside a repo is silent" "" "$(cat "$OUTSIDE_ERR")"
 
     SLOW_SHIM="$(mktemp -d)" || exit 1
     cat > "$SLOW_SHIM/git" <<'EOF'

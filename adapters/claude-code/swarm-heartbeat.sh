@@ -75,11 +75,15 @@
 #   header in tool_input.command is resolved against the payload cwd; Delete
 #   File is ignored because nobody is editing a deleted document.
 #
-#   A write-shaped Bash beat (heredoc, redirect, sed -i, tee, mv, cp, git apply
-#   or patch) asks git status for changed paths, bounded to two seconds, then
-#   accepts only paths whose BASENAME occurs in the command. Read-shaped Bash
-#   never spawns git. The basename gate is attribution, not discovery: if one
-#   week of measurement shows it rejects most true writes, fall back to
+#   A write-shaped Bash beat (heredoc, redirect-shaped `>`/`>>` excluding fd
+#   redirects, sed -i, tee, mv, cp, git apply or patch) asks git status for
+#   changed paths, bounded to two seconds, then accepts only paths whose
+#   BASENAME occurs in the command. Read-shaped Bash never spawns git. Dropping
+#   the bare `>` marker avoids git work caused by a decorative marker in 34.6%
+#   of 6,549 measured Bash calls (PreToolUse recorder, 2026-08-25). The dirty
+#   path scan itself has no cap; the basename gate bounds enrol count by command
+#   text, not by tree size. The basename gate is attribution, not discovery: if
+#   one week of measurement shows it rejects most true writes, fall back to
 #   enrol-only for every git-found path.
 #
 #   Every entry path keeps the same four load-bearing properties:
@@ -633,8 +637,9 @@ def _enrol_paths(paths):
 
 
 def _bash_changed_paths(command, cwd):
-    write_markers = ("<<", ">", "sed -i", "tee ", "mv ", "cp ", "git apply", "patch ")
-    if not any(marker in command for marker in write_markers):
+    write_markers = ("<<", "sed -i", "tee ", "mv ", "cp ", "git apply", "patch ")
+    redirect = re.compile(r"(?:^|[^0-9&<>=!-])>>?\s*(?![&=])")
+    if not any(marker in command for marker in write_markers) and not redirect.search(command):
         return []  # fast path: a read-shaped command must not spawn git
     try:
         result = subprocess.run(
@@ -644,6 +649,8 @@ def _bash_changed_paths(command, cwd):
     except (OSError, subprocess.TimeoutExpired) as exc:
         sys.stderr.write("swarm-heartbeat: doc-enrol git status failed: %s\n" % exc)
         return []
+    if result.returncode == 128:
+        return []  # documented outside-any-repo case, not a hook failure
     if result.returncode != 0:
         sys.stderr.write(
             "swarm-heartbeat: doc-enrol git status failed: exit %s\n"
