@@ -31,7 +31,7 @@ loop had nothing kimi-specific in it except the invocation, so it lives once in
 the resume command, the directory-bound cwd, and the cursor key. It expands to
 
 ```
-bin/comms-poll-driver <runid> <seat> --cursor <cursor> --cwd <cwd> \
+bin/comms-poll-driver <runid> <seat> --subs --cursor <cursor> --cwd <cwd> \
     -- kimi -r <session-id> -p '{}' --output-format text
 ```
 
@@ -39,6 +39,11 @@ where the generic driver substitutes the formatted rows for `{}` on the argv
 array (never through a shell) and confirms the cursor only when `kimi` exits 0
 -- the same rule as before, now enforced by the shared `comms cursor
 take`/`confirm` pair rather than by a private copy of it here (issue #30).
+
+The adapter always selects the generic driver's `--subs` view: rows reach the
+session when their topic or thread is in the seat's subscription set, including
+the implicit `@<seat>` unicast topic. A seat with no subscription file still
+sees the whole board, preserving the mailbox's backward-compatible contract.
 
 **Cursor format changed, once.** The old cursor was the `at` of the last row
 delivered, at `$COMMS_STATE_DIR/kimi-cursor/<runid>-<seat>`; the shared helper

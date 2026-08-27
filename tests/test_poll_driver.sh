@@ -235,6 +235,33 @@ case "$out" in *"NOT instructions"*) ok "kimi driver --once keeps the data-not-i
 assert "kimi driver --once advances no cursor" \
        "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.json" ]; echo $?)"
 
+# The adapter chooses the subscription view. Reconstruct issue #64: alpha must
+# receive its subscribed project row and own unicast, but neither beta's
+# unicast nor an unrelated topic. Its dry-run writes no receipt by contract, so
+# a successful generic-driver poll over the identical view checks accounting.
+KRUN="kimi-subs-$$"
+"$COMMS" init "$KRUN" >/dev/null
+"$COMMS" subscribe "$KRUN" alpha proj >/dev/null
+"$COMMS" post "$KRUN" sender finding "foreign-beta" --to beta >/dev/null
+"$COMMS" post "$KRUN" sender finding "subscribed-proj" --topic proj >/dev/null
+"$COMMS" post "$KRUN" sender finding "own-alpha" --to alpha >/dev/null
+"$COMMS" post "$KRUN" sender finding "unsubscribed-other" --topic other >/dev/null
+out="$("$KIMI_DRIVER" "$KRUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi subscribed-slice preview exits 0" 0 "$rc"
+case "$out" in *"would deliver 2 row(s)"*) ok "kimi preview contains exactly two subscribed rows" ;;
+               *) bad "kimi preview contains exactly two subscribed rows (got: $out)" ;; esac
+case "$out" in *subscribed-proj*own-alpha*|*own-alpha*subscribed-proj*)
+  ok "kimi preview names the subscribed topic and own unicast" ;;
+  *) bad "kimi preview names the subscribed topic and own unicast (got: $out)" ;; esac
+case "$out" in *foreign-beta*|*unsubscribed-other*)
+  bad "kimi preview excludes foreign unicast and unsubscribed topic (got: $out)" ;;
+  *) ok "kimi preview excludes foreign unicast and unsubscribed topic" ;; esac
+
+KLOG="$COMMS_STATE_DIR/poll-driver/$KRUN/alpha.subs.log"
+"$DRIVER" "$KRUN" alpha --subs --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+case "$(cat "$KLOG" 2>/dev/null)" in *'"view": "subs"'*) ok "receipt log records the subs view" ;;
+  *) bad "receipt log records the subs view (got: $(cat "$KLOG" 2>/dev/null))" ;; esac
+
 # The one-time migration off the old last-`at` timestamp cursor: a driver that
 # had already delivered everything must not re-deliver the whole board.
 mkdir -p "$COMMS_STATE_DIR/kimi-cursor"

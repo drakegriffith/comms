@@ -909,6 +909,13 @@ EOF
     run_hook agentX3; ctx="$(addl_ctx "$HOOK_OUT")"
     first_x3="$(printf '%s\n' "$ctx" | grep 'X3-' | head -1)"
     ck_contains "(x-3) subscribed-thread row is emitted first" "X3-THREAD-LAST" "$first_x3"
+    if grep -q 'swarm_mailbox.row_reaches' "$HOOK" \
+        && ! grep -q 'if (r.get("topic") or "default") in subs or' "$HOOK"; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "  FAIL (x-3) heartbeat uses the shared subscription predicate only" >&2
+    fi
 
     old_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).isoformat())')"
     fresh_at="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())')"
@@ -1056,6 +1063,7 @@ PY
     cp "$SELF_DIR/../adapters/claude-code/stdin-bounded.sh" \
         "$SHIM_TREE/adapters/claude-code/stdin-bounded.sh"
     cp "$SA" "$SHIM_TREE/lib/swarm_arm.py"
+    cp "$SELF_DIR/../lib/swarm_mailbox.py" "$SHIM_TREE/lib/swarm_mailbox.py"
     chmod +x "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh"
     X12_ERR="$STATE/x12.err"
     HOOK_OUT="$(payload agentX12 | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" \

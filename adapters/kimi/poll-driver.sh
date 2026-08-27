@@ -73,7 +73,7 @@ CURSOR_FILE="$CURSOR_DIR/$RUNID-$SEAT.json"  # now: per-seat row counts
 # be done the driver says so and starts from zero: re-delivery is recoverable.
 if [ -f "$OLD_CURSOR" ] && [ ! -f "$CURSOR_FILE" ]; then
   mkdir -p "$CURSOR_DIR"
-  if "$COMMS" read "$RUNID" "$SEAT" --replay | python3 -c '
+  if "$COMMS" read "$RUNID" "$SEAT" --replay --subs | python3 -c '
 import json, sys
 last_at = sys.argv[1]
 counts = {}
@@ -98,7 +98,7 @@ fi
 # --once maps to --once --dry-run because this adapter's --once has always
 # meant "show me what would go, invoke nothing"; the generic driver splits
 # those two ideas, so a real single poll is `--once` alone there.
-ARGS=("$RUNID" "$SEAT" --cursor "$CURSOR_FILE" --cwd "$CWD" --interval "$INTERVAL")
+ARGS=("$RUNID" "$SEAT" --subs --cursor "$CURSOR_FILE" --cwd "$CWD" --interval "$INTERVAL")
 [ "$ONCE" -eq 0 ] || ARGS=("${ARGS[@]}" --once --dry-run)
 
 # NOTE: -p combines with neither -y nor --auto (see README.md). The rows are

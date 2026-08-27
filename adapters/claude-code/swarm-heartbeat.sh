@@ -286,6 +286,7 @@ lib_dir = os.environ.get("HB_SWARM_LIB") or ""
 sys.path.insert(0, lib_dir)
 try:
     import swarm_arm
+    import swarm_mailbox
 except Exception:
     # Cannot load the registry -> behave like no-armed-run: silent, no output.
     sys.exit(0)
@@ -506,12 +507,7 @@ def process_run(runid):
     # equality, one shared set -- see SUBSCRIPTION FILTER in the header. A row
     # with no thread contributes "" here, which is never a subscribed topic
     # (_as_topics strips empties), so the old behavior is untouched.
-    if subs is not None:
-        rows = [
-            r
-            for r in rows
-            if (r.get("topic") or "default") in subs or (r.get("thread") or "") in subs
-        ]
+    rows = [r for r in rows if swarm_mailbox.row_reaches(r, subs)]
 
     # ECHO SUPPRESSION: never inject a seat's own rows back at it. Measured
     # live (wave swarmw-0821a, 2026-08-21): 30 of 52 delivered rows were the
