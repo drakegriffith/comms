@@ -260,6 +260,7 @@ def _render_note(board, date, groups, window_s, min_seats, thread_dates_before):
     )
     threads_inspected = len(keys)
     threads_alive = 0
+    threads_exchange = 0
     sections = []
     updated = dict(thread_dates_before)
     for key in keys:
@@ -268,9 +269,18 @@ def _render_note(board, date, groups, window_s, min_seats, thread_dates_before):
             ((_parsed_at(r), r) for r in rows if _parsed_at(r) is not None),
             key=lambda pair: pair[0],
         )
-        if swarm_threads.alive(rows, window_s=window_s, min_seats=min_seats):
+        is_alive = swarm_threads.alive(
+            rows, window_s=window_s, min_seats=min_seats
+        )
+        is_exchange = swarm_threads.exchange(
+            rows, window_s=window_s, min_seats=min_seats
+        )
+        if is_alive:
             threads_alive += 1
+        if is_exchange:
+            threads_exchange += 1
         lines = ["## %s" % key]
+        lines.append("exchange: %s" % ("yes" if is_exchange else "no"))
         prev_date = thread_dates_before.get(key)
         if prev_date and prev_date != date:
             lines.append("continues: %s.md" % prev_date)
@@ -284,7 +294,9 @@ def _render_note(board, date, groups, window_s, min_seats, thread_dates_before):
         updated[key] = date
 
     description = "Compiled agent-to-agent thread activity for %s on %s: " \
-        "%d thread(s), %d alive." % (board, date, threads_inspected, threads_alive)
+        "%d thread(s), %d alive, %d exchange." % (
+            board, date, threads_inspected, threads_alive, threads_exchange
+        )
     front = [
         "---",
         'title: "%s thread log -- %s"' % (board, date),
@@ -296,6 +308,7 @@ def _render_note(board, date, groups, window_s, min_seats, thread_dates_before):
         "board: %s" % board,
         "threads_inspected: %d" % threads_inspected,
         "threads_alive: %d" % threads_alive,
+        "threads_exchange: %d" % threads_exchange,
         "---",
         "",
         "# %s -- %s" % (board, date),

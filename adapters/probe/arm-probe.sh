@@ -24,7 +24,9 @@
 #   --event NAME    hook event to install on and to name in the envelope
 #                   (default PostToolUse).
 #   --matcher M     matcher for the config entry (default "*", i.e. no filter).
-#   --format auto|flat|wrapped   config shape (default auto; see above).
+#   --format auto|flat|wrapped   config shape (default auto; see above). Codex
+#                                reads hooks.json only in the wrapped shape,
+#                                so pass --format wrapped for Codex.
 #   --passphrase P  use this passphrase instead of minting one (tests).
 #
 # Exit codes: 0 armed | 1 could not arm (missing hook script, unparseable or
@@ -53,7 +55,7 @@ while [ $# -gt 0 ]; do
         --matcher)    [ $# -ge 2 ] || usage "--matcher needs a value";    MATCHER="$2"; shift 2 ;;
         --format)     [ $# -ge 2 ] || usage "--format needs a value";     FORMAT="$2"; shift 2 ;;
         --passphrase) [ $# -ge 2 ] || usage "--passphrase needs a value"; PASSPHRASE="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,34p' "$0"; exit 0 ;;
         *)            usage "unknown argument: $1" ;;
     esac
 done

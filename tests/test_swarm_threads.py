@@ -48,6 +48,10 @@ def test_status_kind_is_a_valid_mailbox_kind():
     assert st.STATUS_KIND in mb.VALID_KINDS
 
 
+def test_claim_kind_is_a_valid_mailbox_kind():
+    assert st.CLAIM_KIND in mb.VALID_KINDS
+
+
 # ---- group_by_thread -------------------------------------------------------
 
 
@@ -188,6 +192,66 @@ def test_two_real_seats_plus_status_noise_is_still_alive():
         row("s", 50, kind="status"),
     ]
     assert st.alive(rows) is True
+
+
+# ---- exchange: claims do not count as talk ---------------------------------
+
+
+def test_two_claims_make_a_thread_alive_but_not_an_exchange():
+    # The doc-enrol leg auto-posts kind=claim "editing <relpath>" on first
+    # edit. Two such claims are co-presence (two seats on one file), not talk.
+    rows = [
+        row("a", 0, kind=st.CLAIM_KIND, text="editing a.md"),
+        row("b", 60, kind=st.CLAIM_KIND, text="editing a.md"),
+    ]
+    assert st.alive(rows) is True
+    assert st.exchange(rows) is False
+
+
+def test_claims_plus_two_seats_talking_is_an_exchange():
+    # Two claims bring the thread alive on co-presence; an actual exchange
+    # needs two non-claim speakers answering each other inside the window.
+    rows = [
+        row("a", 0, kind=st.CLAIM_KIND, text="editing a.md"),
+        row("b", 60, kind=st.CLAIM_KIND, text="editing a.md"),
+        row("b", 120, kind="reply", text="looks good"),
+        row("a", 180, kind="reply", text="thanks"),
+    ]
+    assert st.alive(rows) is True
+    assert st.exchange(rows) is True
+
+
+def test_exchange_still_ignores_status_rows():
+    rows = [
+        row("a", 0, kind="status", text="session started"),
+        row("b", 60, kind="reply", text="hello"),
+        row("c", 120, kind="reply", text="hi"),
+    ]
+    assert st.exchange(rows) is True
+
+
+def test_exchange_needs_two_different_seats():
+    rows = [
+        row("a", 0, kind="reply", text="hello"),
+        row("a", 60, kind="reply", text="again"),
+    ]
+    assert st.exchange(rows) is False
+
+
+def test_exchange_honours_the_window():
+    rows = [
+        row("a", 0, kind="reply", text="hello"),
+        row("b", 1801, kind="reply", text="too late"),
+    ]
+    assert st.exchange(rows) is False
+
+
+def test_exchange_malformed_input_never_raises():
+    rows = [
+        {"seat": "a", "kind": "reply"},
+        row("b", 60, kind="reply"),
+    ]
+    assert st.exchange(rows) is False
 
 
 # ---- alive: the two knobs -------------------------------------------------
@@ -450,12 +514,67 @@ def test_main_threads_json_output(capsys):
     assert rc == 0
     lines = capsys.readouterr().out.strip().splitlines()
     summary = json.loads(lines[0])
-    assert summary == {"threads_inspected": 1, "threads_alive": 1}
+    assert summary == {
+        "threads_inspected": 1,
+        "threads_alive": 1,
+        "threads_exchange": 1,
+    }
     detail = json.loads(lines[1])
     assert detail["thread"] == "doc:x/a.md"
     assert detail["alive"] is True
+    assert detail["exchange"] is True
     assert detail["seats"] == 2
     assert detail["rows"] == 2
+
+
+def test_main_threads_text_output_includes_exchange(capsys):
+    _post("test-r1", "a", "doc:x/a.md")
+    _post("test-r1", "b", "doc:x/a.md")
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1 threads_alive=1 threads_exchange=1" in out
+    assert "exchange=True" in out
+
+
+def test_main_threads_claims_make_alive_but_not_exchange(capsys):
+    # Two kind=claim rows from two seats inside the window make a thread alive
+    # on co-presence, but they are not talk: exchange must stay False.
+    _post(
+        "test-r1",
+        "a",
+        "doc:x/a.md",
+        kind="claim",
+        text="editing a.md",
+        at="2026-08-25T12:00:00+00:00",
+    )
+    _post(
+        "test-r1",
+        "b",
+        "doc:x/a.md",
+        kind="claim",
+        text="editing a.md",
+        at="2026-08-25T12:01:00+00:00",
+    )
+    rc = st.main(["swarm_threads.py", "threads"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "threads_inspected=1 threads_alive=1 threads_exchange=0" in out
+    assert "alive=True exchange=False" in out
+
+    rc = st.main(["swarm_threads.py", "threads", "--json"])
+    assert rc == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    summary = json.loads(lines[0])
+    assert summary == {
+        "threads_inspected": 1,
+        "threads_alive": 1,
+        "threads_exchange": 0,
+    }
+    detail = json.loads(lines[1])
+    assert detail["thread"] == "doc:x/a.md"
+    assert detail["alive"] is True
+    assert detail["exchange"] is False
 
 
 def test_main_threads_unexpected_positional_argument_exits_2(capsys):

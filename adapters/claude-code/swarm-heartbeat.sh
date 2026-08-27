@@ -71,8 +71,24 @@
 #   START REACHING YOU -- no seat has to guess a topic name, and the two seats
 #   editing one file never coordinate. A path outside any repo keys to None
 #   and enrols nothing; a fabricated key would be an invisible mis-grouping.
+#   Codex apply_patch beats take the same leg: every Add File and Update File
+#   header in tool_input.command is resolved against the payload cwd; Delete
+#   File is ignored because nobody is editing a deleted document.
 #
-#   Four properties this leg does NOT have, each load-bearing:
+#   A write-shaped Bash beat (heredoc, redirect-shaped `>`/`>>` excluding fd
+#   redirects, sed -i, tee, mv, cp, git apply or patch) asks git status for
+#   changed paths, bounded to two seconds, then accepts only paths whose
+#   BASENAME occurs in the command. Read-shaped Bash never spawns git. Dropping
+#   the bare `>` marker avoids git work caused by a decorative marker in 34.6%
+#   of 6,549 measured Bash calls (PreToolUse recorder, 2026-08-25). The dirty
+#   path scan itself has no cap; the basename gate bounds enrol count by command
+#   text, not by tree size. The basename gate is attribution, not discovery: if
+#   one week of measurement shows it rejects most true writes, fall back to
+#   enrol-only for every git-found path.
+#
+#   Every entry path keeps the same four load-bearing properties:
+#   it never enrols non-participants, never narrows subscribe-all, never blocks
+#   the beat, and stays silent when nothing changed. The detailed invariants:
 #     * It NEVER ENROLLS. add_topics on a non-participant returns [] and
 #       creates no roster row, so a bystander writing a file stays a bystander.
 #       Enrol-by-side-effect would be the machine-global contamination the ARM
@@ -87,6 +103,24 @@
 #       topic, writes no file (add_topics no-ops without touching the roster
 #       row) and appends no telemetry line, so the log records enrolments, not
 #       keystrokes.
+#     * It SPEAKS ONCE PER DOCUMENT (Drake, 2026-08-26, "option 2"). The first
+#       enrol of a doc key also posts ONE row as this seat: kind=claim,
+#       text "editing <relpath>", thread=<key>, topic=board:<repo>. Listening
+#       alone left the forum empty: no real session ever put a `thread` on a
+#       row (measured 2026-08-26: 0 of 196 real rows that day). Two seats
+#       editing one file inside the alive window now make a thread the board
+#       lane renders. kind=claim because swarm_threads.alive() ignores status
+#       rows; board:<repo> so the row reaches only seats on that board or
+#       document, never every terminal (~130 such rows/day measured). It rides
+#       `changed`, so a re-Write posts nothing; a seatless or subscribe-all
+#       participant enrols (or is left whole) and posts nothing. _auto_claim
+#       holds the full reasoning and the discarded alternatives.
+#     * It HINTS THE REPLY (Drake, "option 1", the companion line). A beat that
+#       delivers a row carrying `thread` appends one fixed line naming
+#       `COMMS_RUN=<runid> comms post reply --to <seat> --thread <key>
+#       "<text>"`, so the reply
+#       carries the key and lands in the same thread. A beat with no threaded
+#       row renders byte-identical to before (REPLY_HINT).
 #   It runs BEFORE the per-run row pass, so a key learned on this beat filters
 #   this beat's rows -- and a run whose subscription grew this beat BYPASSES
 #   the mtime short-circuit below, for this beat only. That short-circuit asks
@@ -161,6 +195,24 @@
 #   (`comms post reply --to <seat> --thread <key> "<text>"`). A row with
 #   neither renders exactly as before.
 #
+# DELIVERY ORDER
+#   Rows FOR THIS SEAT -- its "@<seat>" unicast or a subscribed thread -- are
+#   emitted first in `at` order and never consume the ordinary-row CAP. The CAP
+#   remains 10 for everything else. Status rows older than the configured alive
+#   window are consumed without emission or overflow. Measured incident,
+#   2026-08-27: a fresh Codex seat on machine-ops had a cursor at 2026-08-24 and
+#   1,397 unread rows, including 663 stale status rows; a unicast posted at
+#   01:06 sat behind about 1,370 unread rows delivered 10 per beat. Starting the
+#   cursor at enrol time was discarded because it drops pending rows meant for
+#   the seat; raising CAP loses the context bound. Advancing the cursor past the
+#   whole pass and leaving ordinary overflow reachable only through --replay was
+#   also discarded: silent loss from push on a busy board costs more than one
+#   extra forwarded-set state file. The cursor therefore stops at the last
+#   emitted ordinary row during overflow, while the per-seat forwarded set keeps
+#   already-emitted priority rows from repeating on later beats. If FOR-YOU rows
+#   alone ever exceed about 10 in one beat on a real run, this uncapped lane
+#   needs its own ceiling.
+#
 # ISOLATION KNOBS (tests set these; production uses the defaults)
 #   COMMS_STATE_DIR   swarm-arm/ registry + cursor dir + telemetry log
 #                     (falls back to the pre-extraction SWARM_HEARTBEAT_STATE_DIR,
@@ -216,7 +268,8 @@ fi
 export HB_PAYLOAD="$input"
 export HB_STATE_DIR="$STATE_DIR"
 # The participant registry (swarm_arm) is IMPORTED, one implementation, never
-# re-derived here. Resolved from this checkout's own lib/, nowhere else.
+# re-derived here. Resolved from this checkout's own lib/, nowhere else: a test
+# that needs a different lib/ copies the adapter into a tree of its own.
 export HB_SWARM_LIB="$HB_REPO_ROOT/lib"
 # COMMS_ROOT / CLAUDE_SWARM_ROOT are inherited if set; python defaults the root
 # to /tmp otherwise, matching swarm_mailbox.py's own resolution order.
@@ -225,6 +278,8 @@ exec python3 <<'PY'
 import datetime
 import json
 import os
+import re
+import subprocess
 import sys
 
 lib_dir = os.environ.get("HB_SWARM_LIB") or ""
@@ -234,6 +289,13 @@ try:
 except Exception:
     # Cannot load the registry -> behave like no-armed-run: silent, no output.
     sys.exit(0)
+try:
+    import swarm_threads
+except Exception as exc:
+    # Older live-shim checkouts can lack this optional stale-status helper.
+    # Keep delivery live and disable only stale skipping.
+    swarm_threads = None
+    sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)
 
 payload_raw = os.environ.get("HB_PAYLOAD", "")
 state_dir = os.environ.get("HB_STATE_DIR") or os.path.expanduser("~/.comms/state")
@@ -338,6 +400,7 @@ def append_telemetry(runid, topic_label, rows_inspected, delta_emitted, short_ci
 
 row_lines = []                 # emitted rows across every participating run
 deferred_cursor = []           # (cursor_dir, cursor_file, new_cursor)
+deferred_forwarded = []        # (cursor_dir, forwarded_file, keys)
 deferred_mtime = []            # (cursor_dir, mtime_file, "set"|"clear", val)
 enrolled_this_beat = set()     # runids whose subscription GREW on this beat
 
@@ -359,6 +422,7 @@ def process_run(runid):
 
     cursor_dir = os.path.join(state_dir, "swarm-cursor", runid)
     cursor_file = os.path.join(cursor_dir, safe_agent)
+    forwarded_file = cursor_file + ".forwarded"
     mtime_file = cursor_file + ".mtime"
     mailbox_dir = os.path.join(swarm_root, "comms-%s" % runid)
 
@@ -367,6 +431,16 @@ def process_run(runid):
             cursor = fh.read().strip()
     except OSError:
         cursor = ""
+
+    forwarded = set()
+    try:
+        with open(forwarded_file) as fh:
+            for line in fh:
+                key = line.rstrip("\n").split("\t", 1)
+                if len(key) == 2 and key[0]:
+                    forwarded.add((key[0], key[1]))
+    except OSError:
+        pass
 
     if not os.path.isdir(mailbox_dir):
         append_telemetry(runid, topic_label, 0, 0)
@@ -451,21 +525,71 @@ def process_run(runid):
     delta = [r for r in rows if (r.get("at") or "") > cursor]
     delta.sort(key=lambda r: r.get("at", ""))
 
+    # Ambient session births stop being useful after the same alive window the
+    # thread model uses. A malformed timestamp is deliberately retained: bad
+    # input must not become silent message loss. Keep the original delta for
+    # the cursor edge, so skipped stale rows are consumed exactly like emitted
+    # rows even when every deliverable row was filtered away.
+    alive_window_s = None
+    if swarm_threads is not None:
+        alive_window_s = swarm_threads.env_int(
+            swarm_threads.ALIVE_SECONDS_VAR, swarm_threads.DEFAULT_WINDOW_S
+        )
+    beat_now = datetime.datetime.now(datetime.timezone.utc)
+    deliverable = []
+    for r in delta:
+        row_at = swarm_threads.parsed_at(r) if swarm_threads is not None else None
+        stale_status = (
+            alive_window_s is not None
+            and r.get("kind") == swarm_threads.STATUS_KIND
+            and row_at is not None
+            and (beat_now - row_at).total_seconds() > alive_window_s
+        )
+        if not stale_status:
+            deliverable.append(r)
+
     if not delta:
         deferred_mtime.append((cursor_dir, mtime_file, "set", newest))
         append_telemetry(runid, topic_label, rows_inspected, 0)
         return
 
-    emitted = delta[:CAP]
-    overflow = len(delta) - len(emitted)
-    new_cursor = emitted[-1].get("at", "")
+    for_you_topic = ("@" + seat) if seat else None
+    priority_all = [
+        r for r in deliverable
+        if (for_you_topic and (r.get("topic") or "default") == for_you_topic)
+        or (subs is not None and (r.get("thread") or "") in subs)
+    ]
+    priority = [
+        r for r in priority_all
+        if not r.get("at") or (r.get("at"), r.get("seat") or "") not in forwarded
+    ]
+    ordinary = [r for r in deliverable if r not in priority_all]
+    emitted = priority + ordinary[:CAP]
+    overflow = max(0, len(ordinary) - CAP)
+    # Preserve ordinary push continuity under overflow. Priority rows beyond
+    # this edge are remembered separately so they do not repeat next beat.
+    new_cursor = (
+        ordinary[CAP - 1].get("at", "")
+        if overflow > 0
+        else delta[-1].get("at", "")
+    )
+    # Keys are timestamps; a corrupt line whose key does not start with a
+    # digit would sort above every cursor and pin itself forever, so drop it.
+    forwarded = {
+        key for key in forwarded
+        if key[0] > new_cursor and key[0][:1].isdigit()
+    }
+    forwarded.update(
+        (r.get("at"), r.get("seat") or "")
+        for r in priority
+        if r.get("at") and r.get("at") > new_cursor
+    )
 
     # FOR-YOU FLAG + THREAD SUFFIX (issue #41): a row riding this agent's own
     # unicast topic "@<seat>" is addressed to it specifically, and a `thread`
     # field names the document/conversation a reply belongs in -- both are
     # purely additive to the line format, so a row with neither renders
     # BYTE-IDENTICAL to before.
-    for_you_topic = ("@" + seat) if seat else None
     for r in emitted:
         prefix = ""
         if for_you_topic and (r.get("topic") or "default") == for_you_topic:
@@ -485,6 +609,8 @@ def process_run(runid):
                 suffix,
             )
         )
+    if any(r.get("thread") for r in emitted):
+        row_lines.append(REPLY_HINT % runid)
     if overflow > 0:
         # --replay, NOT a plain read (issue #33): this hint is aimed at an
         # agent whose heartbeat cursor just advanced past the rows it is being
@@ -499,6 +625,7 @@ def process_run(runid):
         )
 
     deferred_cursor.append((cursor_dir, cursor_file, new_cursor))
+    deferred_forwarded.append((cursor_dir, forwarded_file, forwarded))
     # overflow un-surfaced => force next beat to parse (clear); else short-circuit
     deferred_mtime.append(
         (cursor_dir, mtime_file, "clear" if overflow > 0 else "set", newest)
@@ -514,38 +641,153 @@ def process_run(runid):
 # which is the one cost this hook's whole fast-path design exists to avoid.
 FILE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
+# The one line an agent needs to answer INSIDE the thread it was just shown.
+# Appended once per beat, only when a delivered row carries a thread key, so
+# a beat with no threaded row renders byte-identical to before.
+REPLY_HINT = (
+    'Reply inside a thread with: COMMS_RUN=%s comms post reply --to <seat> '
+    '--thread <key> "<text>" (seat and key as shown on the row; the reply then '
+    'lands in the same forum thread)'
+)  # %s = the run this beat came from; the short form defaults to machine-ops
+   # otherwise (bin/comms:148), which is the wrong run for any other beat
+   # (verify seat, PR #63).
+
+
+def _auto_claim(runid, key):
+    """Post ONE claim row on the FIRST enrol of a doc key (Drake, 2026-08-26,
+    option 2): "editing <relpath>" carrying thread=<key> and topic=board:<repo>.
+
+    WHY A ROW AT ALL. Enrolling only LISTENS: before this, a seat that edited
+    a file heard about it and said nothing, so no real session ever put a
+    `thread` field on a row and the forum stayed at its seeded threads. This
+    row is the seat's own voice on the document; two seats editing one file
+    inside the alive window now make a thread the board lane can render.
+
+    WHY kind=claim, NOT status. swarm_threads.alive() ignores status rows by
+    contract (a status row is a birth, not a speaker), so a status row here
+    could never make a thread alive and the whole point would be lost.
+    "claim" is also the honest kind: the seat is taking the document on.
+
+    WHY topic=board:<repo>, NOT the run topic. The run topic ("ops") reaches
+    every enrolled session's context on its next beat; one row per (seat,
+    file) is ~130 rows/day on this machine (session-writes, 2026-08-25/26),
+    all injected into every terminal. board:<repo> reaches only seats that
+    subscribed to that board or, via the thread filter, to that document --
+    exactly the seats the claim concerns. Discord's dashboard lane still
+    mirrors every row regardless of topic, so visibility is not reduced.
+
+    ONCE PER (agent, document, run): it rides `changed`, which add_topics
+    decides per agent_id. Two agent_ids sharing one seat name would each post
+    (verify seat, PR #63); shipped conventions keep agent_id 1:1 with seat
+    (bin/comms-poll-driver defaults --agent-id to the seat), and alive() still
+    needs two DISTINCT seats, so no false thread follows, only a duplicate line.
+    It rides `changed`, which add_topics
+    decides under its lock, so a re-Write of the same file posts nothing and
+    two racing beats cannot both post. A seatless participant enrols but has
+    no file to write, so it posts nothing (and says nothing on stderr: that
+    is the documented shape of a seatless enrollment, not a failure).
+
+    Crash ordering: the subscription is written before this row, so a beat
+    killed in between loses the claim, never duplicates it; the next Write
+    of that file is a no-op (changed=False). A missing claim costs one
+    thread appearing later; a duplicate would be noise on every board."""
+    _topics, seat = swarm_arm.participant_sub(runid, agent_id, state_dir=state_dir)
+    if not seat:
+        return
+    import swarm_mailbox
+
+    body = key[len(swarm_mailbox.THREAD_KEY_PREFIX):]
+    repo, _, rel = body.partition("/")
+    swarm_mailbox.post(
+        runid, seat, "claim", "editing %s" % (rel or repo),
+        topic="board:%s" % repo, thread=key,
+    )
+
+
+
+def _enrol_paths(paths):
+    """Feed every discovered path through the one enrol + claim pipeline."""
+    import swarm_mailbox
+
+    for file_path in paths:
+        key = swarm_mailbox.thread_key(file_path)
+        if not key:
+            continue  # outside any repo -- no thread, never a fabricated key
+        for runid in my_runs:
+            # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
+            # would race; the lock is the only place with one answer.
+            _topics, changed = swarm_arm.add_topics(
+                runid, agent_id, [key], state_dir=state_dir
+            )
+            if changed:
+                enrolled_this_beat.add(runid)
+                append_telemetry(runid, "doc-enrol " + key, 0, 0)
+                _auto_claim(runid, key)
+
+
+def _bash_changed_paths(command, cwd):
+    write_markers = ("<<", "sed -i", "tee ", "mv ", "cp ", "git apply", "patch ")
+    redirect = re.compile(r"(?:^|[^0-9&<>=!-])>>?\s*(?![&=])")
+    if not any(marker in command for marker in write_markers) and not redirect.search(command):
+        return []  # fast path: a read-shaped command must not spawn git
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=cwd, check=False, capture_output=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write("swarm-heartbeat: doc-enrol git status failed: %s\n" % exc)
+        return []
+    if result.returncode == 128:
+        return []  # documented outside-any-repo case, not a hook failure
+    if result.returncode != 0:
+        sys.stderr.write(
+            "swarm-heartbeat: doc-enrol git status failed: exit %s\n"
+            % result.returncode
+        )
+        return []
+
+    fields = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    paths = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, relpath = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1  # porcelain -z follows the destination with the source
+        if os.path.basename(relpath) in command:
+            paths.append(os.path.join(cwd, relpath))
+    return paths
+
 
 def doc_enrol():
-    if payload.get("tool_name") not in FILE_TOOLS:
-        return
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return
-    file_path = tool_input.get("file_path")
-    # Type guard, same reasoning as the identity gate: a non-string path is no
-    # path. MultiEdit/NotebookEdit take this leg only when they carry one.
-    if not isinstance(file_path, str) or not file_path:
-        return
-    # Imported HERE, not at the top: a failure to import swarm_mailbox must
-    # cost this leg only. At the top it would exit the whole beat, trading a
-    # missing subscription for a missing delivery.
-    import swarm_mailbox
-
-    key = swarm_mailbox.thread_key(file_path)
-    if not key:
-        return  # outside any repo -- no thread, never a fabricated key
-    for runid in my_runs:
-        # `changed` comes back FROM INSIDE add_topics' lock. Deciding it here
-        # -- read the topics, compare after the call -- would race: two beats
-        # adding the same key both see it absent beforehand and both report an
-        # enrolment that happened once. The lock is the only place with one
-        # answer, so the answer is returned from there.
-        _topics, changed = swarm_arm.add_topics(
-            runid, agent_id, [key], state_dir=state_dir
-        )
-        if changed:
-            enrolled_this_beat.add(runid)
-            append_telemetry(runid, "doc-enrol " + key, 0, 0)
+    tool_name = payload.get("tool_name")
+    paths = []
+    if tool_name in FILE_TOOLS:
+        file_path = tool_input.get("file_path")
+        # Keep the established Write/Edit behavior: only a non-empty string.
+        if isinstance(file_path, str) and file_path:
+            paths = [file_path]
+    elif tool_name == "apply_patch":
+        command = tool_input.get("command")
+        cwd = payload.get("cwd")
+        if isinstance(command, str) and isinstance(cwd, str):
+            for relpath in re.findall(r"^\*\*\* (?:Add|Update) File: (.+)$", command, re.M):
+                paths.append(relpath if os.path.isabs(relpath) else os.path.join(cwd, relpath))
+    elif tool_name == "Bash":
+        command = tool_input.get("command")
+        cwd = payload.get("cwd")
+        if isinstance(command, str) and isinstance(cwd, str):
+            paths = _bash_changed_paths(command, cwd)
+    if paths:
+        # Import/thread-key failures cost this leg only via the outer wrapper.
+        _enrol_paths(paths)
 
 
 try:
@@ -578,6 +820,15 @@ for cursor_dir, cursor_file, new_cursor in deferred_cursor:
         os.makedirs(cursor_dir, exist_ok=True)
         with open(cursor_file, "w") as fh:
             fh.write(new_cursor)
+    except OSError:
+        pass
+
+for cursor_dir, forwarded_file, forwarded in deferred_forwarded:
+    try:
+        os.makedirs(cursor_dir, exist_ok=True)
+        with open(forwarded_file, "w") as fh:
+            for at, seat in sorted(forwarded):
+                fh.write("%s\t%s\n" % (at, seat))
     except OSError:
         pass
 

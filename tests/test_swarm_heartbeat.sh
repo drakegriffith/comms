@@ -142,6 +142,13 @@ write_payload() {  # write_payload <agent_id> <tool_name> <file_path>
         "$2" "$1" "$3"
 }
 
+command_payload() {  # command_payload <agent_id> <tool_name> <cwd> <command>
+    python3 -c 'import json,sys
+print(json.dumps({"hook_event_name":"PostToolUse", "tool_name":sys.argv[2],
+ "session_id":"sess-1", "agent_id":sys.argv[1], "cwd":sys.argv[3],
+ "tool_input":{"command":sys.argv[4]}}))' "$1" "$2" "$3" "$4"
+}
+
 # This agent's current subscription, comma-joined (empty => subscribe-all).
 part_topics() {  # part_topics <runid> <agent_id>
     COMMS_STATE_DIR="$STATE" python3 -c '
@@ -634,6 +641,454 @@ run_suite() {  # one fully-isolated pass
     run_hook_raw "$(write_payload agentS NotebookEdit "$REPO/sub/n.ipynb")"
     ck_contains "(s) NotebookEdit enrols the doc key" \
         "doc:$REPONAME/sub/n.ipynb" "$(part_topics "$RS" agentS)"
+
+    #     AUTO-CLAIM (2026-08-26, Drake's option 2): the FIRST enrol of a doc key
+    #     posts ONE claim row carrying that key, so two seats editing one file
+    #     inside the alive window make a thread the board lane can render.
+    #     kind=claim, never status: swarm_threads.alive() ignores status rows,
+    #     so a status row could never make a thread alive.
+    SEATFILE="$ROOT/comms-$RS/seatS.jsonl"
+    claims_for() {  # claims_for <relpath> ; rows in seatS.jsonl carrying that key
+        grep -c "\"thread\": \"doc:$REPONAME/$1\"" "$SEATFILE" 2>/dev/null | tr -d ' '
+    }
+    ck "(v) the first Write of a doc posts exactly one claim row" "1" "$(claims_for sub/a.py)"
+    ck "(v) a re-Write of the same doc posts no second claim" "1" "$(claims_for sub/c.py)"
+    ck "(v) MultiEdit's first enrol posts a claim too" "1" "$(claims_for sub/m.py)"
+    claim_a="$(grep "\"thread\": \"doc:$REPONAME/sub/a.py\"" "$SEATFILE")"
+    ck_contains "(v) the claim is kind=claim (status rows never count toward alive)" \
+        '"kind": "claim"' "$claim_a"
+    ck_contains "(v) the claim rides the repo board topic" \
+        "\"topic\": \"board:$REPONAME\"" "$claim_a"
+    ck_contains "(v) the claim text names the repo-relative path" \
+        '"text": "editing sub/a.py"' "$claim_a"
+    ck_contains "(v) the claim is posted as the participant's own seat" \
+        '"seat": "seatS"' "$claim_a"
+
+    #     No seat, no claim: a participant enrolled without --seat has no file
+    #     to write, so the enrol still happens and nothing is posted.
+    enroll_agent "$RS" agentNoSeat "projN"
+    files_before="$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
+    run_hook_raw "$(write_payload agentNoSeat Write "$REPO/sub/a.py")"
+    ck_contains "(v) a seatless participant still enrols the key" \
+        "doc:$REPONAME/sub/a.py" "$(part_topics "$RS" agentNoSeat)"
+    ck "(v) a seatless participant posts no claim (no new mailbox file)" \
+        "$files_before" "$(ls "$ROOT/comms-$RS" | wc -l | tr -d ' ')"
+
+    #     Subscribe-all is not narrowed (above) AND posts no claim: add_topics
+    #     reports changed=False for it, and the claim rides on changed.
+    enroll_agent "$RS" agentAllSeat "" seatAllS
+    run_hook_raw "$(write_payload agentAllSeat Write "$REPO/sub/a.py")"
+    if [ -e "$ROOT/comms-$RS/seatAllS.jsonl" ]; then
+        fail=$((fail + 1)); echo "  FAIL (u) a subscribe-all seat posted a claim" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    #     REPLY HINT (Drake's option 1, the companion line): a beat that delivers
+    #     a threaded row also delivers ONE line naming the reply command, so the
+    #     reply carries --thread and lands in the same thread. A beat with only
+    #     unthreaded rows carries no hint.
+    post_row "$RS" seatU finding "HINT-THREAD-ROW" "2026-08-01T00:00:03+00:00" \
+        "otherproj" "doc:$REPONAME/sub/a.py"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(v) a threaded delivery carries the reply hint" \
+        "comms post reply --to <seat> --thread <key>" "$ctx"
+    ck_contains "(v) the reply hint names the run the beat came from" \
+        "COMMS_RUN=$RS comms post reply" "$ctx"
+    post_row "$RS" seatU comment "PLAIN-ROW" "2026-08-01T00:00:04+00:00" "projS"
+    run_hook agentS; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(v) control: the plain row is delivered" "PLAIN-ROW" "$ctx"
+    ck_absent "(v) an unthreaded delivery carries no reply hint" \
+        "comms post reply" "$ctx"
+
+    # -----------------------------------------------------------------------
+    # (w) AGENT-AGNOSTIC DOC ENROL: Codex apply_patch paths and write-shaped
+    #     Bash beats feed the same subscription + auto-claim path as Write/Edit.
+    RW2="hbtestw2$$x$RANDOM"
+    arm_run "$RW2"
+    enroll_agent "$RW2" agentPatch "projW2" seatPatch
+    enroll_agent "$RW2" agentBash "projW2" seatBash
+    enroll_agent "$RW2" agentMismatch "projW2" seatMismatch
+    enroll_agent "$RW2" agentOutside "projW2" seatOutside
+    enroll_agent "$RW2" agentSlow "projW2" seatSlow
+    enroll_agent "$RW2" agentRead "projW2" seatRead
+    enroll_agent "$RW2" agentRedirect "projW2" seatRedirect
+    enroll_agent "$RW2" agentHeredoc "projW2" seatHeredoc
+    enroll_agent "$RW2" agentSeatless "projW2"
+    REPO2="$(mktemp -d)" || exit 1
+    REPONAME2="$(basename "$REPO2")"
+    mkdir -p "$REPO2/sub"
+    git -C "$REPO2" init -q
+    : > "$REPO2/tracked.py"
+    git -C "$REPO2" add tracked.py
+
+    patch_add='*** Begin Patch
+*** Add File: sub/n.py
++hi
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_add")"
+    PATCHFILE="$ROOT/comms-$RW2/seatPatch.jsonl"
+    patch_claims="$(grep -c "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+    ck "(w-a) apply_patch Add File posts one claim" "1" "$patch_claims"
+    patch_row="$(grep "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null)"
+    ck_contains "(w-a) apply_patch claim text names the relative path" '"text": "editing sub/n.py"' "$patch_row"
+    ck_contains "(w-a) apply_patch claim uses the repo board topic" "\"topic\": \"board:$REPONAME2\"" "$patch_row"
+
+    patch_update='*** Begin Patch
+*** Update File: sub/n.py
+@@
+-hi
++bye
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update")"
+    ck "(w-b) apply_patch Update File does not duplicate a claim" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/n.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+
+    patch_update_fresh='*** Begin Patch
+*** Update File: sub/u.py
+@@
+-old
++new
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_update_fresh")"
+    ck "(w-b2) apply_patch Update File enrols on its own" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/u.py\"" "$PATCHFILE" 2>/dev/null | tr -d ' ')"
+
+    before_patch_topics="$(part_topics "$RW2" agentPatch)"
+    patch_delete='*** Begin Patch
+*** Delete File: sub/gone.py
+*** End Patch'
+    run_hook_raw "$(command_payload agentPatch apply_patch "$REPO2" "$patch_delete")"
+    ck "(w-c) apply_patch Delete File enrols nothing" "$before_patch_topics" \
+        "$(part_topics "$RW2" agentPatch)"
+
+    GIT_REAL="$(command -v git)"
+    SHIM="$(mktemp -d)" || exit 1
+    GIT_CALLS="$SHIM/git.calls"
+    cat > "$SHIM/git" <<EOF
+#!/bin/sh
+printf 'git %s\n' "\$*" >> "$GIT_CALLS"
+exec "$GIT_REAL" "\$@"
+EOF
+    chmod +x "$SHIM/git"
+    bash_command="cat <<'EOF' > sub/b.py
+bash write
+EOF"
+    (cd "$REPO2" && /bin/bash -c "$bash_command")
+    HOOK_OUT="$(command_payload agentBash Bash "$REPO2" "$bash_command" | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    BASHFILE="$ROOT/comms-$RW2/seatBash.jsonl"
+    ck "(w-d) Bash heredoc beat exits 0" "0" "$HOOK_RC"
+    ck "(w-d) Bash heredoc posts one claim" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$BASHFILE" 2>/dev/null | tr -d ' ')"
+
+    write_git_calls="$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentBash Bash "$REPO2" 'cat sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-e) read-shaped Bash spawns no git process" "0" \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+    printf 'git-spawn-proof read=%s write=%s\n' \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')" "$write_git_calls"
+
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRead Bash "$REPO2" 'grep -n "def" sub/b.py 2>/dev/null' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) fd redirect on a read-shaped Bash command posts no claim" "0" \
+        "$(grep "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRead.jsonl" 2>/dev/null | wc -l | tr -d ' ')"
+    ck "(w-j) fd redirect on a read-shaped Bash command spawns no git" "0" \
+        "$(wc -l < "$GIT_CALLS" | tr -d ' ')"
+
+    : > "$GIT_CALLS"
+    HOOK_OUT="$(command_payload agentRedirect Bash "$REPO2" 'printf x > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatRedirect.jsonl" 2>/dev/null | tr -d ' ')"
+    HOOK_OUT="$(command_payload agentHeredoc Bash "$REPO2" 'cat <<EOF > sub/b.py' | \
+        PATH="$SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    HOOK_RC=$?
+    ck "(w-j) heredoc plus output redirect remains write-shaped" "1" \
+        "$(grep -c "\"thread\": \"doc:$REPONAME2/sub/b.py\"" "$ROOT/comms-$RW2/seatHeredoc.jsonl" 2>/dev/null | tr -d ' ')"
+
+    before_mismatch="$(part_topics "$RW2" agentMismatch)"
+    run_hook_raw "$(command_payload agentMismatch Bash "$REPO2" 'printf x > unrelated.py')"
+    ck "(w-f) basename gate rejects an unrelated dirty path" "$before_mismatch" \
+        "$(part_topics "$RW2" agentMismatch)"
+
+    OUTSIDE2="$(mktemp -d)" || exit 1
+    OUTSIDE_ERR="$STATE/outside-repo.err"
+    HOOK_OUT="$(command_payload agentOutside Bash "$OUTSIDE2" 'printf x > loose.py' | \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$OUTSIDE_ERR")"
+    HOOK_RC=$?
+    ck "(w-g) write-shaped Bash outside a repo exits 0" "0" "$HOOK_RC"
+    ck "(w-g) write-shaped Bash outside a repo enrols nothing" "projW2" \
+        "$(part_topics "$RW2" agentOutside)"
+    ck "(w-g) write-shaped Bash outside a repo is silent" "" "$(cat "$OUTSIDE_ERR")"
+
+    SLOW_SHIM="$(mktemp -d)" || exit 1
+    cat > "$SLOW_SHIM/git" <<'EOF'
+#!/bin/sh
+exec sleep 5
+EOF
+    chmod +x "$SLOW_SHIM/git"
+    post_row "$RW2" seatOther finding "SLOW-BEAT-DELIVERS" \
+        "2026-08-03T00:00:01+00:00" "projW2"
+    started="$(date +%s)"
+    HOOK_OUT="$(command_payload agentSlow Bash "$REPO2" 'printf x > slow.py' | \
+        PATH="$SLOW_SHIM:$PATH" COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>/dev/null)"
+    HOOK_RC=$?
+    elapsed=$(( $(date +%s) - started ))
+    ck "(w-h) timed-out git beat exits 0" "0" "$HOOK_RC"
+    if [ "$elapsed" -lt 4 ]; then pass=$((pass + 1)); else
+        fail=$((fail + 1)); echo "  FAIL (w-h) git timeout took ${elapsed}s" >&2; fi
+    ck_contains "(w-h) timed-out git still delivers ordinary rows" \
+        "SLOW-BEAT-DELIVERS" "$(addl_ctx "$HOOK_OUT")"
+
+    run_hook_raw "$(command_payload agentSeatless apply_patch "$REPO2" "$patch_add")"
+    ck_contains "(w-i) seatless apply_patch participant enrols" \
+        "doc:$REPONAME2/sub/n.py" "$(part_topics "$RW2" agentSeatless)"
+    if [ -e "$ROOT/comms-$RW2/agentSeatless.jsonl" ]; then
+        fail=$((fail + 1)); echo "  FAIL (w-i) seatless apply_patch posted a claim" >&2
+    else
+        pass=$((pass + 1))
+    fi
+
+    rm -rf "$REPO2" "$OUTSIDE2" "$SHIM" "$SLOW_SHIM"
+
+    # -----------------------------------------------------------------------
+    # (x) DELIVERY ORDER: rows specifically for this seat precede ordinary
+    #     subscribed rows and do not consume the ordinary-row CAP. Status rows
+    #     older than the thread alive window are consumed without delivery.
+    RX="hbtestx$$x$RANDOM"
+    arm_run "$RX"
+    enroll_agent "$RX" agentX "projX,doc:repo/watched.py" seatX
+    for n in $(seq -w 1 25); do
+        post_row "$RX" seatPeer finding "X1-TOPIC-$n" \
+            "2026-08-27T01:05:$n+00:00" "projX"
+    done
+    post_row "$RX" seatPeer finding "X1-UNICAST-LAST" \
+        "2026-08-27T01:06:00+00:00" "@seatX"
+    run_hook agentX; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-1) unicast behind the topic backlog is delivered" \
+        "[FOR YOU from seatPeer] [seatPeer | finding | @seatX | 2026-08-27T01:06:00+00:00] X1-UNICAST-LAST" "$ctx"
+    ck "(x-1) ordinary topic rows remain capped at ten" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X1-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-1) overflow counts only held ordinary rows" \
+        "15 more, read the full board" "$ctx"
+
+    RX2="hbtestx2$$x$RANDOM"
+    arm_run "$RX2"
+    enroll_agent "$RX2" agentX2 "projX" seatX2
+    for n in $(seq -w 1 12); do
+        post_row "$RX2" seatPeer finding "X2-UNICAST-$n" \
+            "2026-08-27T02:00:$n+00:00" "@seatX2"
+        post_row "$RX2" seatPeer finding "X2-TOPIC-$n" \
+            "2026-08-27T02:01:$n+00:00" "projX"
+    done
+    run_hook agentX2; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck "(x-2) all twelve unicasts are emitted" "12" \
+        "$(printf '%s' "$ctx" | grep -c 'X2-UNICAST-' | tr -d ' ')"
+    ck "(x-2) ten ordinary rows are emitted" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X2-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-2) overflow holds only two ordinary rows" \
+        "2 more, read the full board" "$ctx"
+
+    RX3="hbtestx3$$x$RANDOM"
+    arm_run "$RX3"
+    enroll_agent "$RX3" agentX3 "projX,doc:repo/watched.py" seatX3
+    for n in $(seq -w 1 20); do
+        post_row "$RX3" seatPeer finding "X3-TOPIC-$n" \
+            "2026-08-27T03:00:$n+00:00" "projX"
+    done
+    post_row "$RX3" seatPeer finding "X3-THREAD-LAST" \
+        "2026-08-27T03:01:00+00:00" "other" "doc:repo/watched.py"
+    run_hook agentX3; ctx="$(addl_ctx "$HOOK_OUT")"
+    first_x3="$(printf '%s\n' "$ctx" | grep 'X3-' | head -1)"
+    ck_contains "(x-3) subscribed-thread row is emitted first" "X3-THREAD-LAST" "$first_x3"
+
+    old_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).isoformat())')"
+    fresh_at="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())')"
+    RX4="hbtestx4$$x$RANDOM"
+    arm_run "$RX4"
+    enroll_agent "$RX4" agentX4 "projX" seatX4
+    for n in $(seq -w 1 30); do
+        post_row "$RX4" seatPeer status "X4-STALE-$n" "$old_at" "projX"
+    done
+    post_row "$RX4" seatPeer finding "X4-FRESH-FINDING" "$fresh_at" "projX"
+    run_hook agentX4; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-4) fresh finding survives stale status backlog" "X4-FRESH-FINDING" "$ctx"
+    ck_absent "(x-4) stale status rows are skipped" "X4-STALE-" "$ctx"
+    ck_absent "(x-4) skipped status rows do not create overflow" \
+        "more, read the full board" "$ctx"
+    run_hook agentX4
+    ck "(x-4) second beat is empty after stale rows are consumed" "" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX5="hbtestx5$$x$RANDOM"
+    arm_run "$RX5"
+    enroll_agent "$RX5" agentX5 "projX" seatX5
+    young_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=5)).isoformat())')"
+    post_row "$RX5" seatPeer status "X5-YOUNG-STATUS" "$young_at" "projX"
+    run_hook agentX5
+    ck_contains "(x-5) five-minute-old status is delivered" "X5-YOUNG-STATUS" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX6="hbtestx6$$x$RANDOM"
+    arm_run "$RX6"
+    enroll_agent "$RX6" agentX6 "projX" seatX6
+    post_row "$RX6" seatPeer status "X6-BAD-DATE" "not-a-date" "projX"
+    run_hook agentX6
+    ck_contains "(x-6) unparseable status date is delivered" "X6-BAD-DATE" \
+        "$(addl_ctx "$HOOK_OUT")"
+
+    RX7="hbtestx7$$x$RANDOM"
+    arm_run "$RX7"
+    enroll_agent "$RX7" agentX7 "projX" seatX7
+    two_min_at="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=2)).isoformat())')"
+    post_row "$RX7" seatPeer status "X7-OVERRIDE-STALE" "$two_min_at" "projX"
+    HOOK_OUT="$(payload agentX7 | COMMS_THREAD_ALIVE_SECONDS=60 \
+        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK")"
+    ck_absent "(x-7) sixty-second window skips two-minute status" \
+        "X7-OVERRIDE-STALE" "$(addl_ctx "$HOOK_OUT")"
+
+    # Byte-identity control against the base commit under equivalent isolated
+    # state: ordinary rows exercise neither priority nor stale-status behavior.
+    BASE_TREE="$STATE/base-tree"
+    mkdir -p "$BASE_TREE/adapters/claude-code" "$BASE_TREE/lib"
+    git show 18e1b24:adapters/claude-code/swarm-heartbeat.sh > \
+        "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    git show 18e1b24:adapters/claude-code/stdin-bounded.sh > \
+        "$BASE_TREE/adapters/claude-code/stdin-bounded.sh"
+    git show 18e1b24:lib/swarm_arm.py > "$BASE_TREE/lib/swarm_arm.py"
+    chmod +x "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    CUR_STATE="$STATE/control-current"; BASE_STATE="$STATE/control-base"
+    CUR_ROOT="$ROOT/control-current"; BASE_ROOT="$ROOT/control-base"
+    COMMS_STATE_DIR="$CUR_STATE" python3 "$SA" arm control >/dev/null
+    COMMS_STATE_DIR="$CUR_STATE" python3 "$SA" enroll control --agent-id control-agent \
+        --topics projX --seat control-seat >/dev/null
+    COMMS_STATE_DIR="$BASE_STATE" python3 "$BASE_TREE/lib/swarm_arm.py" arm control >/dev/null
+    COMMS_STATE_DIR="$BASE_STATE" python3 "$BASE_TREE/lib/swarm_arm.py" enroll control \
+        --agent-id control-agent --topics projX --seat control-seat >/dev/null
+    for control_root in "$CUR_ROOT" "$BASE_ROOT"; do
+        ROOT="$control_root"
+        post_row control seatPeer finding CONTROL-1 "2026-08-27T04:00:01+00:00" projX
+        post_row control seatPeer finding CONTROL-2 "2026-08-27T04:00:02+00:00" projX
+        post_row control seatPeer finding CONTROL-3 "2026-08-27T04:00:03+00:00" projX
+    done
+    ROOT="$CUR_ROOT"
+    current_control="$(payload control-agent | COMMS_STATE_DIR="$CUR_STATE" \
+        COMMS_ROOT="$CUR_ROOT" /bin/bash "$HOOK")"
+    base_control="$(payload control-agent | COMMS_STATE_DIR="$BASE_STATE" \
+        COMMS_ROOT="$BASE_ROOT" /bin/bash "$BASE_TREE/adapters/claude-code/swarm-heartbeat.sh")"
+    ck "(x-9) ordinary-row beat is byte-identical to base commit" \
+        "$base_control" "$current_control"
+    ROOT="${CUR_ROOT%/control-current}"
+
+    RX10="hbtestx10$$x$RANDOM"
+    arm_run "$RX10"
+    enroll_agent "$RX10" agentX10 "projX" seatX10
+    for n in $(seq -w 1 25); do
+        post_row "$RX10" seatPeer finding "X10-TOPIC-$n" \
+            "2026-08-27T05:00:$n+00:00" "projX"
+    done
+    post_row "$RX10" seatPeer finding "X10-UNICAST-LAST" \
+        "2026-08-27T05:01:00+00:00" "@seatX10"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_contains "(x-10) beat 1 delivers FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 1 delivers first ten ordinary rows" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-10) beat 1 reports fifteen held rows" \
+        "15 more, read the full board" "$ctx"
+    FORWARDED="$STATE/swarm-cursor/$RX10/agentX10.forwarded"
+    ck "(x-10) forwarded set holds the unicast key after beat 1" \
+        "2026-08-27T05:01:00+00:00	seatPeer" "$(cat "$FORWARDED" 2>/dev/null)"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(x-10) beat 2 does not repeat FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 2 delivers next ten ordinary rows" "10" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_contains "(x-10) beat 2 reports five held rows" \
+        "5 more, read the full board" "$ctx"
+    run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
+    ck_absent "(x-10) beat 3 does not repeat FOR YOU row" "X10-UNICAST-LAST" "$ctx"
+    ck "(x-10) beat 3 delivers final five ordinary rows" "5" \
+        "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
+    ck_absent "(x-10) beat 3 has no overflow hint" \
+        "more, read the full board" "$ctx"
+    run_hook agentX10
+    ck "(x-10) beat 4 is empty" "" "$(addl_ctx "$HOOK_OUT")"
+    ck "(x-10) forwarded set is written empty after beat 3" "0" \
+        "$(wc -c < "$FORWARDED" | tr -d ' ')"
+
+    RX11="hbtestx11$$x$RANDOM"
+    arm_run "$RX11"
+    enroll_agent "$RX11" agentX11 "projX" seatX11
+    X11_TEXT='X11 sentence one names @name, includes "double quotes", a | pipe, a <tag>, and a \ backslash. Sentence two preserves every byte while making this message deliberately long. Sentence three keeps going so truncation or reconstruction is visible. Sentence four repeats the contract in plain text: priority delivery must retain the complete finding. Sentence five adds enough material to cross the requested threshold without relying on rendering width. Sentence six says that punctuation, spacing, and symbols all belong to the payload. Sentence seven makes this exact string longer than six hundred characters. Sentence eight continues with stable prose for a byte-for-byte equality assertion. Sentence nine closes the message after another deliberately verbose clause whose only job is to make accidental shortening immediately observable in the emitted row.'
+    python3 - "$ROOT/comms-$RX11/seatPeer.jsonl" "$X11_TEXT" <<'PY'
+import json
+import os
+import sys
+path, text = sys.argv[1:]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "a") as fh:
+    fh.write(json.dumps({"seat": "seatPeer", "at": "2026-08-27T06:00:00+00:00",
+                         "kind": "finding", "text": text, "topic": "@seatX11"}) + "\n")
+PY
+    run_hook agentX11; ctx="$(addl_ctx "$HOOK_OUT")"
+    first_x11="$(printf '%s\n' "$ctx" | sed -n '2p')"
+    expected_x11="- [FOR YOU from seatPeer] [seatPeer | finding | @seatX11 | 2026-08-27T06:00:00+00:00] $X11_TEXT"
+    ck "(x-11) full priority text is verbatim on the first row" \
+        "$expected_x11" "$first_x11"
+
+    RX12="hbtestx12$$x$RANDOM"
+    arm_run "$RX12"
+    enroll_agent "$RX12" agentX12 "projX" seatX12
+    post_row "$RX12" seatPeer finding "X12-FRESH" \
+        "2026-08-27T07:00:00+00:00" "projX"
+    # A checkout whose lib/ predates swarm_threads.py: a WHOLE TREE, not an env
+    # override, so the production hook keeps resolving lib/ from its own dir.
+    SHIM_TREE="$STATE/shim-tree"
+    mkdir -p "$SHIM_TREE/adapters/claude-code" "$SHIM_TREE/lib"
+    cp "$HOOK" "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    cp "$SELF_DIR/../adapters/claude-code/stdin-bounded.sh" \
+        "$SHIM_TREE/adapters/claude-code/stdin-bounded.sh"
+    cp "$SA" "$SHIM_TREE/lib/swarm_arm.py"
+    chmod +x "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    X12_ERR="$STATE/x12.err"
+    HOOK_OUT="$(payload agentX12 | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" \
+        /bin/bash "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh" 2>"$X12_ERR")"
+    ck_contains "(x-12) missing swarm_threads still delivers a fresh row" \
+        "X12-FRESH" "$(addl_ctx "$HOOK_OUT")"
+    ck "(x-12) missing swarm_threads prints exactly one stderr line" \
+        "1" "$(wc -l < "$X12_ERR" | tr -d ' ')"
+
+    RX13="hbtestx13$$x$RANDOM"
+    arm_run "$RX13"
+    enroll_agent "$RX13" agentX13A "projX" seatX13A
+    enroll_agent "$RX13" agentX13B "projX" seatX13B
+    for n in $(seq -w 1 11); do
+        post_row "$RX13" seatPeer finding "X13-TOPIC-$n" \
+            "2026-08-27T08:00:$n+00:00" "projX"
+    done
+    post_row "$RX13" seatPeer finding "X13-FOR-A" \
+        "2026-08-27T08:01:00+00:00" "@seatX13A"
+    post_row "$RX13" seatPeer finding "X13-FOR-B" \
+        "2026-08-27T08:01:01+00:00" "@seatX13B"
+    run_hook agentX13A
+    ck_contains "(x-13) seat A receives its FOR YOU row" \
+        "X13-FOR-A" "$(addl_ctx "$HOOK_OUT")"
+    # Seed B's own forwarded file with A's key by hand: a forwarded set keyed
+    # on (at, seat) must not suppress B's row, which shares the poster but not
+    # the timestamp. An implementation keyed on the poster alone fails here.
+    mkdir -p "$STATE/swarm-cursor/$RX13"
+    printf '2026-08-27T08:01:00+00:00\tseatPeer\n' \
+        > "$STATE/swarm-cursor/$RX13/agentX13B.forwarded"
+    run_hook agentX13B
+    ck_contains "(x-13) seat A forwarded state does not suppress seat B" \
+        "X13-FOR-B" "$(addl_ctx "$HOOK_OUT")"
 
     #     A THREAD_KEY THAT RAISES must not break the beat. An embedded NUL in
     #     file_path makes os.path.realpath raise ValueError -- the leg is

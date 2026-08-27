@@ -72,10 +72,10 @@ metrics (lib/swarm_threads.py; exit 0 ok, 2 usage or the positive control --
         threads_inspected == 0, "inspected nothing" is never a quiet pass):
   threads   [--alive SECONDS] [--seats N] [--run RUNID | --all-runs] [--json]
             (groups the mailbox's threaded rows by document, prints
-             threads_inspected/threads_alive and, per thread key, seats/
-             rows/last_gap_s. Defaults come from COMMS_THREAD_ALIVE_SECONDS
-             (1800) / COMMS_THREAD_ALIVE_SEATS (2), the same knobs the
-             Discord board lane reads.)
+             threads_inspected/threads_alive/threads_exchange and, per thread
+             key, alive/exchange/seats/rows/last_gap_s. Defaults come from
+             COMMS_THREAD_ALIVE_SECONDS (1800) / COMMS_THREAD_ALIVE_SEATS (2),
+             the same knobs the Discord board lane reads.)
 
 arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):
   arm       <runid> [--topic <set>]
