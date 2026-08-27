@@ -223,6 +223,17 @@ class TestSubscriptions(unittest.TestCase):
         # The non-subscribed project's row is absent -- cross-project isolation.
         self.assertNotIn("in B", {r["text"] for r in view})
 
+    def test_subscriber_sees_rows_for_a_subscribed_thread(self):
+        mb.init("s-thread")
+        mb.subscribe("s-thread", "reader", ["doc:repo/watched.py"])
+        mb.post(
+            "s-thread", "writer", "finding", "about watched file",
+            topic="other-project", thread="doc:repo/watched.py",
+        )
+
+        view = mb.read_for("s-thread", "reader")
+        self.assertEqual([r["text"] for r in view], ["about watched file"])
+
     def test_non_subscriber_does_not_see_a_topic(self):
         mb.init("s2")
         mb.subscribe("s2", "readerB", ["projB"])   # only projB

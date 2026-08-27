@@ -62,14 +62,15 @@ writes topic "@seatC"; only seatC's read_for surfaces it. Real topics never begi
 with "@", so unicast and fan-out never collide and old rows (no "@" topic) are
 unaffected.
 
-THREADS ARE ABOUT-NESS, NOT ADDRESSING. A row may carry `thread`, a key naming
+THREADS ARE ABOUT-NESS AND CAN ALSO BE SUBSCRIBED. A row may carry `thread`, a key naming
 the DOCUMENT it concerns (thread_key turns a path into "doc:<repo>/<relpath>").
 topic/to answer "who receives this"; thread answers "what is this about". They
 are orthogonal and compose: a unicast can be threaded, a fan-out can be
-threaded, and a row with no thread behaves exactly as before. Nothing in this
-module routes on `thread` -- it is written here and consumed by renderers
-(adapters/discord's board lane groups rows by it; lib/swarm_threads decides
-which groups are live enough to render).
+threaded, and a row with no thread behaves exactly as before. A subscription
+may name a thread key, making read_for return rows about that document whatever
+topic they use. Renderers also consume threads: adapters/discord's board lane
+groups rows by them, and lib/swarm_threads decides which groups are live enough
+to render.
 
 BACKWARD COMPATIBLE: a seat that never calls subscribe() has NO registered
 subscription, and read_for then returns every sibling row -- exactly the
@@ -246,6 +247,13 @@ def subscriptions(runid, seat):
     except (OSError, json.JSONDecodeError):
         return None
     return set(topics) | {SELF_TOPIC_PREFIX + seat}
+
+
+def subscription_digest(runid, seat):
+    """Digest the effective subscription set for a cursor view name."""
+    registered = subscriptions(runid, seat)
+    selector = "null" if registered is None else json.dumps(sorted(registered))
+    return hashlib.sha1(selector.encode("utf-8")).hexdigest()[:12]
 
 
 # ---- THREAD KEY ------------------------------------------------------------
@@ -619,6 +627,26 @@ def read_siblings(runid, seat, topic=None, with_source=False):
     return rows
 
 
+def row_reaches(row, subs):
+    """Return whether one mailbox row reaches a subscription view.
+
+    behavior: accepts every row when subs is None; otherwise accepts a row when
+      its topic (missing/empty means "default") or its non-empty thread is an
+      exact member of subs.
+    in: row, a mapping with optional topic and thread keys; subs, a container
+      supporting membership tests or None for the backward-compatible whole
+      board view.
+    out: bool.
+    side effects: none.
+    errors: propagates mapping-access or membership errors from invalid inputs.
+    """
+    return (
+        subs is None
+        or (row.get("topic") or "default") in subs
+        or (row.get("thread") or "") in subs
+    )
+
+
 def read_for(runid, seat, with_source=False):
     """Subscription-honoring read: return only the sibling rows this seat is
     subscribed to (its topic slice) plus any unicast rows addressed to it,
@@ -635,8 +663,7 @@ def read_for(runid, seat, with_source=False):
     """
     subs = subscriptions(runid, seat)  # None if unregistered; else includes @self
     rows = _all_sibling_rows(runid, seat, with_source=with_source)
-    if subs is not None:
-        rows = [r for r in rows if (r.get("topic") or "default") in subs]
+    rows = [r for r in rows if row_reaches(r, subs)]
     rows.sort(key=lambda r: r.get("at", ""))
     return rows
 
@@ -1075,9 +1102,7 @@ def read_delta(runid, seat, topic=None, subs=False):
     """
     if subs:
         rows = read_for(runid, seat)
-        registered = subscriptions(runid, seat)
-        selector = "null" if registered is None else json.dumps(sorted(registered))
-        view = "subs-" + hashlib.sha1(selector.encode("utf-8")).hexdigest()[:12]
+        view = "subs-" + subscription_digest(runid, seat)
     elif topic is not None:
         rows = read_siblings(runid, seat, topic=topic)
         view = "topic-" + _slug(topic)

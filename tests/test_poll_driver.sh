@@ -74,6 +74,14 @@ LOG="$COMMS_STATE_DIR/poll-driver/$RUN/beta.all.log"
 # reason -- caught while writing this suite).
 deliveries() { local n; n="$(grep -c -- '--- delivery ---' "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
 handed()     { local n; n="$(grep -c -F -- "$1" "$INBOX" 2>/dev/null)"; echo "${n:-0}"; }
+wait_handed() {
+  local needle="$1" want="$2" pid="$3" cap="$4" start="$SECONDS"
+  while [ "$(handed "$needle")" -lt "$want" ]; do
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ $((SECONDS - start)) -lt "$cap" ] || return 1
+    sleep 1
+  done
+}
 
 # ---- 1. empty board: nothing new, and NOTHING is written -------------------
 "$COMMS" init "$RUN" >/dev/null
@@ -185,6 +193,56 @@ out="$("$COMMS" subs "$RUN" delta --replay 2>&1)"
 case "$out" in *topic-a-row*) ok "--topics subscribed the seat's mailbox slice" ;;
                *) bad "--topics subscribed the seat's mailbox slice (got: $out)" ;; esac
 
+# Widening a subscription changes the view. The new view starts at zero, so it
+# replays the already-subscribed rows alongside the older rows newly brought
+# into view; a third poll then has nothing left.
+WIDE_RUN="driver-subs-widen-$$"
+: > "$INBOX"
+"$COMMS" init "$WIDE_RUN" >/dev/null
+"$COMMS" subscribe "$WIDE_RUN" alpha proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "LATER-1" --topic later >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "LATER-2" --topic later >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-3" --topic proj >/dev/null
+"$DRIVER" "$WIDE_RUN" alpha --subs --topics proj --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "initial subscription poll delivers three project rows" 3 "$(handed PROJ-)"
+"$DRIVER" "$WIDE_RUN" alpha --subs --topics proj,later --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "widened subscription delivers both older later rows" 2 "$(handed LATER-)"
+eq "widened subscription explicitly replays the three project rows" 6 "$(handed PROJ-)"
+before="$(deliveries)"
+out="$("$DRIVER" "$WIDE_RUN" alpha --subs --topics proj,later --once -- "$WORK/fake-runtime" 2>&1)"
+case "$out" in *"nothing new"*) ok "third widened-subscription poll has nothing new" ;;
+               *) bad "third widened-subscription poll has nothing new (got: $out)" ;; esac
+eq "third widened-subscription poll delivers nothing" "$before" "$(deliveries)"
+
+# A long-running driver must re-derive a mutable subscription view every poll.
+# Every wait is capped and also fails immediately if the background driver dies.
+LOOP_RUN="driver-subs-loop-$$"
+: > "$INBOX"
+"$COMMS" init "$LOOP_RUN" >/dev/null
+"$COMMS" subscribe "$LOOP_RUN" alpha proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "LATER-1" --topic later >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "LATER-2" --topic later >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$LOOP_RUN" gamma finding "PROJ-3" --topic proj >/dev/null
+"$DRIVER" "$LOOP_RUN" alpha --subs --topics proj --interval 1 -- "$WORK/fake-runtime" \
+  >"$WORK/direct-loop.out" 2>"$WORK/direct-loop.err" &
+LOOP_PID=$!
+if wait_handed PROJ- 3 "$LOOP_PID" 8; then
+  "$COMMS" subscribe "$LOOP_RUN" alpha proj later >/dev/null
+  wait_handed LATER- 2 "$LOOP_PID" 8
+  LOOP_WAIT_RC=$?
+else
+  LOOP_WAIT_RC=1
+fi
+kill "$LOOP_PID" 2>/dev/null || true
+wait "$LOOP_PID" 2>/dev/null || true
+eq "loop-mode widening delivers both older later rows" 0 "$LOOP_WAIT_RC"
+eq "loop-mode widening announces one subscription view change" 1 \
+  "$(grep -c 'subscription view changed .* -> .*; replaying the subscribed board' "$WORK/direct-loop.err" 2>/dev/null || true)"
+
 # ---- 13. usage / argument errors --------------------------------------------
 out="$("$DRIVER" "$RUN" beta --once -- 2>&1)"; rc=$?
 eq "-- with no command is a usage error" 2 "$rc"
@@ -233,7 +291,116 @@ case "$out" in *"would deliver"*row-one*) ok "kimi driver --once still previews 
 case "$out" in *"NOT instructions"*) ok "kimi driver --once keeps the data-not-instructions header" ;;
                *) bad "kimi driver --once keeps the data-not-instructions header" ;; esac
 assert "kimi driver --once advances no cursor" \
-       "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.json" ]; echo $?)"
+       "$([ ! -e "$COMMS_STATE_DIR/kimi-cursor/$RUN-epsilon.subs.json" ]; echo $?)"
+
+# The adapter chooses the subscription view. Reconstruct issue #64: alpha must
+# receive its subscribed project row and own unicast, but neither beta's
+# unicast nor an unrelated topic. Its dry-run writes no receipt by contract, so
+# a successful generic-driver poll over the identical view checks accounting.
+KRUN="kimi-subs-$$"
+"$COMMS" init "$KRUN" >/dev/null
+"$COMMS" subscribe "$KRUN" alpha proj >/dev/null
+"$COMMS" post "$KRUN" sender finding "foreign-beta" --to beta >/dev/null
+"$COMMS" post "$KRUN" sender finding "subscribed-proj" --topic proj >/dev/null
+"$COMMS" post "$KRUN" sender finding "own-alpha" --to alpha >/dev/null
+"$COMMS" post "$KRUN" sender finding "unsubscribed-other" --topic other >/dev/null
+out="$("$KIMI_DRIVER" "$KRUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi subscribed-slice preview exits 0" 0 "$rc"
+case "$out" in *"would deliver 2 row(s)"*) ok "kimi preview contains exactly two subscribed rows" ;;
+               *) bad "kimi preview contains exactly two subscribed rows (got: $out)" ;; esac
+case "$out" in *subscribed-proj*own-alpha*|*own-alpha*subscribed-proj*)
+  ok "kimi preview names the subscribed topic and own unicast" ;;
+  *) bad "kimi preview names the subscribed topic and own unicast (got: $out)" ;; esac
+case "$out" in *foreign-beta*|*unsubscribed-other*)
+  bad "kimi preview excludes foreign unicast and unsubscribed topic (got: $out)" ;;
+  *) ok "kimi preview excludes foreign unicast and unsubscribed topic" ;; esac
+
+"$DRIVER" "$KRUN" alpha --subs --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+KLOG="$(find "$COMMS_STATE_DIR/poll-driver/$KRUN" -name 'alpha.subs-*.log' -print -quit)"
+case "$(cat "$KLOG" 2>/dev/null)" in *'"view": "subs-'*) ok "receipt log records the digested subs view" ;;
+  *) bad "receipt log records the digested subs view (got: $(cat "$KLOG" 2>/dev/null))" ;; esac
+
+# The kimi override carries the same digest. Establish the first cursor through
+# the generic driver, widen, then prove the adapter's dry preview sees the two
+# older rows and the intentional full-view replay. Confirm that view and the
+# adapter's third preview is empty.
+KWIDE_RUN="kimi-subs-widen-$$"
+"$COMMS" init "$KWIDE_RUN" >/dev/null
+"$COMMS" subscribe "$KWIDE_RUN" alpha proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-LATER-1" --topic later >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-LATER-2" --topic later >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-3" --topic proj >/dev/null
+KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
+KCURSOR="$COMMS_STATE_DIR/poll-driver/$KWIDE_RUN/alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --once -- /usr/bin/true >/dev/null 2>&1
+"$COMMS" subscribe "$KWIDE_RUN" alpha proj later >/dev/null
+out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi widened-subscription preview exits 0" 0 "$rc"
+case "$out" in *K-LATER-1*K-LATER-2*|*K-LATER-2*K-LATER-1*)
+  ok "kimi widened-subscription preview names both older later rows" ;;
+  *) bad "kimi widened-subscription preview names both older later rows (got: $out)" ;; esac
+case "$out" in *"would deliver 5 row(s)"*K-PROJ-1*K-PROJ-2*K-PROJ-3*)
+  ok "kimi widened-subscription preview explicitly replays the project rows" ;;
+  *) bad "kimi widened-subscription preview explicitly replays the project rows (got: $out)" ;; esac
+KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
+KCURSOR="$COMMS_STATE_DIR/poll-driver/$KWIDE_RUN/alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --once -- /usr/bin/true >/dev/null 2>&1
+out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"
+case "$out" in *"nothing new"*) ok "kimi third widened-subscription preview has nothing new" ;;
+               *) bad "kimi third widened-subscription preview has nothing new (got: $out)" ;; esac
+
+# The adapter's real loop follows the same widening contract. A fake kimi is
+# the oracle and records the prompt argument it received.
+KLOOP_RUN="kimi-subs-loop-$$"
+KIMI_BIN="$WORK/kimi-bin"
+mkdir -p "$KIMI_BIN"
+cat > "$KIMI_BIN/kimi" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$INBOX_PATH"
+exit 0
+EOF
+chmod +x "$KIMI_BIN/kimi"
+: > "$INBOX"
+"$COMMS" init "$KLOOP_RUN" >/dev/null
+"$COMMS" subscribe "$KLOOP_RUN" alpha proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-LATER-1" --topic later >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-LATER-2" --topic later >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$KLOOP_RUN" gamma finding "KLOOP-PROJ-3" --topic proj >/dev/null
+PATH="$KIMI_BIN:$PATH" "$KIMI_DRIVER" "$KLOOP_RUN" alpha sess-loop "$WORK" --interval 1 \
+  >"$WORK/kimi-loop.out" 2>"$WORK/kimi-loop.err" &
+KLOOP_PID=$!
+if wait_handed KLOOP-PROJ- 3 "$KLOOP_PID" 8; then
+  "$COMMS" subscribe "$KLOOP_RUN" alpha proj later >/dev/null
+  wait_handed KLOOP-LATER- 2 "$KLOOP_PID" 8
+  KLOOP_WAIT_RC=$?
+else
+  KLOOP_WAIT_RC=1
+fi
+kill "$KLOOP_PID" 2>/dev/null || true
+wait "$KLOOP_PID" 2>/dev/null || true
+eq "kimi loop-mode widening delivers both older later rows" 0 "$KLOOP_WAIT_RC"
+eq "kimi loop-mode widening announces one subscription view change" 1 \
+  "$(grep -c 'subscription view changed .* -> .*; replaying the subscribed board' "$WORK/kimi-loop.err" 2>/dev/null || true)"
+
+# A whole-board counts cursor cannot be reused for the narrower subscription
+# view: its per-poster count can silently skip that poster's first visible row.
+KVIEW_RUN="kimi-view-key-$$"
+"$COMMS" init "$KVIEW_RUN" >/dev/null
+"$COMMS" subscribe "$KVIEW_RUN" alpha watched >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-one" --topic other >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-two" --topic other >/dev/null
+"$COMMS" post "$KVIEW_RUN" gamma finding "unsubscribed-three" --topic other >/dev/null
+mkdir -p "$COMMS_STATE_DIR/kimi-cursor"
+printf '%s\n' '{"gamma": 3}' > "$COMMS_STATE_DIR/kimi-cursor/$KVIEW_RUN-alpha.json"
+"$COMMS" post "$KVIEW_RUN" gamma finding "first-subscribed-row" --topic watched >/dev/null
+out="$("$KIMI_DRIVER" "$KVIEW_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi view-key preview exits 0" 0 "$rc"
+case "$out" in *first-subscribed-row*) ok "kimi view-key preview delivers the subscribed row" ;;
+               *) bad "kimi view-key preview delivers the subscribed row (got: $out)" ;; esac
 
 # The one-time migration off the old last-`at` timestamp cursor: a driver that
 # had already delivered everything must not re-deliver the whole board.
@@ -250,6 +417,63 @@ assert "migration leaves the old cursor file behind as evidence" \
 out="$("$KIMI_DRIVER" "$RUN" zeta sess-1 "$WORK" --once 2>&1)"
 case "$out" in *post-migration-row*) ok "a migrated cursor still delivers what comes next" ;;
                *) bad "a migrated cursor still delivers what comes next (got: $out)" ;; esac
+
+# Migration must count only the same subscription view the new cursor owns.
+KMIG_RUN="kimi-migration-view-$$"
+"$COMMS" init "$KMIG_RUN" >/dev/null
+"$COMMS" subscribe "$KMIG_RUN" alpha watched >/dev/null
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-before-subscribed" --topic watched >/dev/null
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-before-unsubscribed" --topic other >/dev/null
+MIG_AT="$("$COMMS" read "$KMIG_RUN" alpha --replay | tail -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["at"])')"
+printf '%s' "$MIG_AT" > "$COMMS_STATE_DIR/kimi-cursor/$KMIG_RUN-alpha"
+"$COMMS" post "$KMIG_RUN" gamma finding "migration-after-subscribed" --topic watched >/dev/null
+out="$("$KIMI_DRIVER" "$KMIG_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi subscription-view migration exits 0" 0 "$rc"
+case "$out" in *"would deliver 1 row(s)"*) ok "kimi subscription-view migration delivers exactly one row" ;;
+  *) bad "kimi subscription-view migration delivers exactly one row (got: $out)" ;; esac
+case "$out" in *migration-after-subscribed*) ok "kimi migration delivers the post-timestamp subscribed row" ;;
+               *) bad "kimi migration delivers the post-timestamp subscribed row (got: $out)" ;; esac
+case "$out" in *migration-before-subscribed*|*migration-before-unsubscribed*)
+  bad "kimi migration excludes pre-timestamp rows (got: $out)" ;;
+  *) ok "kimi migration excludes pre-timestamp rows" ;; esac
+
+# ---- 15b. loud decline when lib/ cannot supply the digest; --cursor refused with --subs
+# The heartbeat declines loudly when swarm_mailbox is missing (x-12); the driver
+# must do the same instead of polling forever and reporting success.
+NOMAIL_RUN="nomail-$$"
+"$COMMS" init "$NOMAIL_RUN" >/dev/null
+"$COMMS" subscribe "$NOMAIL_RUN" alpha proj >/dev/null
+"$COMMS" post "$NOMAIL_RUN" gamma finding "NOMAIL-ROW" --topic proj >/dev/null
+NOMAIL_TREE="$WORK/nomail-tree"
+mkdir -p "$NOMAIL_TREE/bin" "$NOMAIL_TREE/lib"
+cp "$COMMS" "$NOMAIL_TREE/bin/comms"
+cp "$DRIVER" "$NOMAIL_TREE/bin/comms-poll-driver"
+cp "$REPO/lib/swarm_arm.py" "$NOMAIL_TREE/lib/swarm_arm.py" 2>/dev/null || true
+chmod +x "$NOMAIL_TREE/bin/comms" "$NOMAIL_TREE/bin/comms-poll-driver"
+NOMAIL_ERR="$WORK/nomail.err"
+NOMAIL_OUT="$("$NOMAIL_TREE/bin/comms-poll-driver" "$NOMAIL_RUN" alpha --subs --once -- /usr/bin/true 2>"$NOMAIL_ERR")"; rc=$?
+eq "missing swarm_mailbox: driver exits 1, never 0" 1 "$rc"
+eq "missing swarm_mailbox: exactly one driver-owned stderr line" 1 "$(grep -c "^comms-poll-driver: cannot derive the subscription view" "$NOMAIL_ERR")"
+eq "missing swarm_mailbox: no raw traceback reaches stderr" 0 "$(grep -c "Traceback" "$NOMAIL_ERR")"
+# Positive control: the real tree delivers the same row.
+CTRL_OUT="$("$DRIVER" "$NOMAIL_RUN" alpha --subs --once --dry-run -- /usr/bin/true 2>&1)"
+case "$CTRL_OUT" in *NOMAIL-ROW*) ok "missing swarm_mailbox control: the real tree previews the row" ;; *) bad "missing swarm_mailbox control: the real tree previews the row (got: $CTRL_OUT)" ;; esac
+REFUSE_OUT="$("$DRIVER" "$NOMAIL_RUN" alpha --subs --cursor "$WORK/fixed.json" --once -- /usr/bin/true 2>&1)"; rc=$?
+eq "--cursor with --subs is refused as a usage error" 2 "$rc"
+case "$REFUSE_OUT" in *"--cursor cannot be combined with --subs"*) ok "--cursor with --subs names the reason" ;; *) bad "--cursor with --subs names the reason (got: $REFUSE_OUT)" ;; esac
+assert "--cursor with --subs writes no cursor file" "$([ ! -e "$WORK/fixed.json" ]; echo $?)"
+
+# The kimi adapter derives a digest at startup too: same loud decline, no traceback.
+KNOMAIL_TREE="$WORK/knomail-tree"
+mkdir -p "$KNOMAIL_TREE/bin" "$KNOMAIL_TREE/lib" "$KNOMAIL_TREE/adapters/kimi"
+cp "$COMMS" "$KNOMAIL_TREE/bin/comms"; cp "$DRIVER" "$KNOMAIL_TREE/bin/comms-poll-driver"
+cp "$KIMI_DRIVER" "$KNOMAIL_TREE/adapters/kimi/poll-driver.sh"
+chmod +x "$KNOMAIL_TREE/bin/comms" "$KNOMAIL_TREE/bin/comms-poll-driver" "$KNOMAIL_TREE/adapters/kimi/poll-driver.sh"
+KNOMAIL_ERR="$WORK/knomail.err"
+"$KNOMAIL_TREE/adapters/kimi/poll-driver.sh" "$NOMAIL_RUN" alpha sess-x "$WORK" --once >/dev/null 2>"$KNOMAIL_ERR"; rc=$?
+eq "kimi adapter missing swarm_mailbox: exits 1" 1 "$rc"
+eq "kimi adapter missing swarm_mailbox: one adapter-owned stderr line" 1 "$(grep -c "^kimi poll-driver: cannot derive the subscription view" "$KNOMAIL_ERR")"
+eq "kimi adapter missing swarm_mailbox: no raw traceback" 0 "$(grep -c "Traceback" "$KNOMAIL_ERR")"
 
 # ---- 16. isolation control: nothing leaked outside the temp dirs -----------
 if [ -e "$HOME/.comms/state/poll-driver/$RUN" ] || [ -e "/tmp/comms-$RUN" ] \

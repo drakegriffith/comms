@@ -287,13 +287,18 @@ sys.path.insert(0, lib_dir)
 try:
     import swarm_arm
 except Exception:
-    # Cannot load the registry -> behave like no-armed-run: silent, no output.
+    # Cannot load the registry: behave like no-armed-run, silent with no output.
+    sys.exit(0)
+try:
+    import swarm_mailbox
+except Exception as exc:
+    # Cannot load the mailbox: decline delivery loudly, but never block the hook.
+    sys.stderr.write("swarm-heartbeat: swarm_mailbox unavailable: %s\n" % exc)
     sys.exit(0)
 try:
     import swarm_threads
 except Exception as exc:
-    # Older live-shim checkouts can lack this optional stale-status helper.
-    # Keep delivery live and disable only stale skipping.
+    # Cannot load the optional stale-status helper: disable only stale skipping.
     swarm_threads = None
     sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)
 
@@ -506,12 +511,7 @@ def process_run(runid):
     # equality, one shared set -- see SUBSCRIPTION FILTER in the header. A row
     # with no thread contributes "" here, which is never a subscribed topic
     # (_as_topics strips empties), so the old behavior is untouched.
-    if subs is not None:
-        rows = [
-            r
-            for r in rows
-            if (r.get("topic") or "default") in subs or (r.get("thread") or "") in subs
-        ]
+    rows = [r for r in rows if swarm_mailbox.row_reaches(r, subs)]
 
     # ECHO SUPPRESSION: never inject a seat's own rows back at it. Measured
     # live (wave swarmw-0821a, 2026-08-21): 30 of 52 delivered rows were the

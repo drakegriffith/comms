@@ -28,8 +28,16 @@
 #
 # ONE READER, ONE VIEW. The cursor is keyed on (runid, seat, view) like the
 #   CLI's, because a row in topic X belongs to both the plain view and the
-#   --topic X view and would be delivered once per view. Pick a view at start
-#   and stay on it; --cursor overrides the path if you need two streams.
+#   --topic X view and would be delivered once per view. A subscription view is
+#   re-derived every poll; a changed set starts a fresh cursor and replays,
+#   loudly. --log overrides the derived log path. --cursor overrides the cursor
+#   path and is REFUSED together with --subs: a fixed cursor file cannot follow
+#   a view whose name changes, so it would restore the very drop the digest
+#   prevents while still announcing a replay.
+#
+# KNOWN LIMIT, issue #76: append_mirrored can add a row with an old `at`, which
+#   inserts mid-view; a per-poster count cursor can then skip that row. That
+#   pre-existing ordering problem is out of scope here.
 #
 # usage: comms-poll-driver <runid> <seat> [options] -- <command> [arg ...]
 #
@@ -99,6 +107,8 @@ AGENT_ID=""
 CWD=""
 CURSOR_FILE=""
 LOG_FILE=""
+CURSOR_OVERRIDE=""
+LOG_OVERRIDE=""
 HAVE_CMD=0
 DELIVER_CMD=""
 
@@ -120,9 +130,14 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+CURSOR_OVERRIDE="$CURSOR_FILE"
+LOG_OVERRIDE="$LOG_FILE"
+
 [ "$HAVE_CMD" -eq 1 ] || { echo "$PROG: no delivery command (it goes after --)" >&2; usage; }
 [ "$SUBS" -eq 1 ] && [ -n "$TOPIC" ] && {
   echo "$PROG: pass either --topic or --subs, not both" >&2; exit 2; }
+[ "$SUBS" -eq 1 ] && [ -n "$CURSOR_FILE" ] && {
+  echo "$PROG: --cursor cannot be combined with --subs: the subscription view names its own cursor (<seat>.subs-<digest>.json) and a fixed file would skip rows after a subscription change" >&2; exit 2; }
 [ -z "$CWD" ] || [ -d "$CWD" ] || {
   echo "$PROG: cwd does not exist: $CWD" >&2; exit 1; }
 
@@ -133,16 +148,10 @@ READ_FLAGS=(--replay)
 VIEW="all"
 if [ "$SUBS" -eq 1 ]; then
   READ_FLAGS=(--replay --subs)
-  VIEW="subs"
 elif [ -n "$TOPIC" ]; then
   READ_FLAGS=(--replay --topic "$TOPIC")
   VIEW="topic-$(slug "$TOPIC")"
 fi
-
-STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
-DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
-[ -n "$CURSOR_FILE" ] || CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.json"
-[ -n "$LOG_FILE" ]    || LOG_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.log"
 
 # ---- enroll-first invariant ------------------------------------------------
 # Enrollment is write-once and refuses a run that is not armed, so doing it
@@ -165,6 +174,10 @@ if [ "$ENROLL" -eq 1 ]; then
     exit 1
   fi
 fi
+
+STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
+DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
+PREVIOUS_VIEW=""
 
 # ---- one poll --------------------------------------------------------------
 
@@ -232,7 +245,28 @@ deliver() {
 }
 
 run_once() {
-  local out receipt rows count msg rc
+  local out receipt rows count msg rc next_view
+
+  # A subscription file may change while loop mode is running. Name the view
+  # now in force on every pass so a widening gets a fresh counts cursor rather
+  # than applying narrow-view counts to a wider board.
+  next_view="$VIEW"
+  if [ "$SUBS" -eq 1 ]; then
+    # A checkout whose lib/ cannot supply the digest cannot name its view: decline
+    # delivery LOUDLY and stop, never poll forever reporting success (the same
+    # rule the heartbeat applies when swarm_mailbox is missing).
+    next_view="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT" 2>/dev/null)" || {
+      echo "$PROG: cannot derive the subscription view (swarm_mailbox unavailable under $SELF_DIR/../lib); declining delivery" >&2
+      exit 1
+    }
+  fi
+  if [ -n "$PREVIOUS_VIEW" ] && [ "$next_view" != "$PREVIOUS_VIEW" ]; then
+    echo "$PROG: subscription view changed $PREVIOUS_VIEW -> $next_view; replaying the subscribed board" >&2
+  fi
+  VIEW="$next_view"
+  PREVIOUS_VIEW="$VIEW"
+  CURSOR_FILE="${CURSOR_OVERRIDE:-$DRIVER_DIR/$(slug "$SEAT").$VIEW.json}"
+  LOG_FILE="${LOG_OVERRIDE:-$DRIVER_DIR/$(slug "$SEAT").$VIEW.log}"
 
   # --replay reads the board without touching the CLI's cursor; `cursor take`
   # prints the receipt line then the rows this driver has not confirmed, and

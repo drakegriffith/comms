@@ -12,7 +12,7 @@
 # file used to contain -- read, format, invoke, remember what got through -- had
 # nothing kimi-specific in it except the invocation, so it now lives once in
 # `bin/comms-poll-driver` and this file is the kimi PARAMETERS: the resume
-# command, the directory-bound cwd, and the cursor key. The confirmed-delivery
+# command and the directory-bound cwd. The confirmed-delivery
 # rule is unchanged and is now enforced by the shared `comms cursor
 # take/confirm` pair rather than by a private copy of it here: the cursor
 # advances ONLY after a kimi invocation that exited 0, a failed invocation
@@ -61,7 +61,13 @@ done
 STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
 CURSOR_DIR="$STATE_DIR/kimi-cursor"
 OLD_CURSOR="$CURSOR_DIR/$RUNID-$SEAT"        # pre-#30: a last-delivered `at`
-CURSOR_FILE="$CURSOR_DIR/$RUNID-$SEAT.json"  # now: per-seat row counts
+SUBS_DIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../../lib" "$RUNID" "$SEAT" 2>/dev/null)" || {
+  echo "kimi poll-driver: cannot derive the subscription view (swarm_mailbox unavailable under $SELF_DIR/../../lib); declining delivery" >&2
+  exit 1
+}
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._@-' '_'; }
+DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
+CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").subs-$SUBS_DIGEST.json"
 
 # ---- one-time cursor migration ---------------------------------------------
 # The shared helper counts rows per seat; this driver used to store the `at` of
@@ -72,8 +78,8 @@ CURSOR_FILE="$CURSOR_DIR/$RUNID-$SEAT.json"  # now: per-seat row counts
 # zero, which would re-deliver a live session's whole board once. If it cannot
 # be done the driver says so and starts from zero: re-delivery is recoverable.
 if [ -f "$OLD_CURSOR" ] && [ ! -f "$CURSOR_FILE" ]; then
-  mkdir -p "$CURSOR_DIR"
-  if "$COMMS" read "$RUNID" "$SEAT" --replay | python3 -c '
+  mkdir -p "$DRIVER_DIR"
+  if "$COMMS" read "$RUNID" "$SEAT" --replay --subs | python3 -c '
 import json, sys
 last_at = sys.argv[1]
 counts = {}
@@ -98,7 +104,7 @@ fi
 # --once maps to --once --dry-run because this adapter's --once has always
 # meant "show me what would go, invoke nothing"; the generic driver splits
 # those two ideas, so a real single poll is `--once` alone there.
-ARGS=("$RUNID" "$SEAT" --cursor "$CURSOR_FILE" --cwd "$CWD" --interval "$INTERVAL")
+ARGS=("$RUNID" "$SEAT" --subs --cwd "$CWD" --interval "$INTERVAL")
 [ "$ONCE" -eq 0 ] || ARGS=("${ARGS[@]}" --once --dry-run)
 
 # NOTE: -p combines with neither -y nor --auto (see README.md). The rows are
