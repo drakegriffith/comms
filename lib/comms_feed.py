@@ -2,7 +2,10 @@
 """Expose one mailbox run as a cursor-free NDJSON window.
 
 Behavior: read every row in one run, or ``read_for(runid, seat)`` for one
-seat's subscribed view; render one explicit audience; emit oldest first; and,
+seat's INBOX view (the rows seat would receive: its subscribed topics and its
+own unicasts; rows the seat itself authored are excluded, exactly as an agent
+polling its inbox never sees its own messages; a seat that never subscribed
+receives the whole board); render one explicit audience; emit oldest first; and,
 under ``--follow``, poll every ``COMMS_FEED_INTERVAL`` seconds (default 5,
 matching adapters/discord/mirror.py) for rows not printed by this process.
 Inputs are ``feed <runid> [--seat S] [--audience engineer|everyone]
@@ -11,10 +14,15 @@ Inputs are ``feed <runid> [--seat S] [--audience engineer|everyone]
 ``body``, ``title``, and ``lane``. Side effects: stdout only; no mailbox,
 network, read-cursor, heartbeat-cursor, environment-audience, or secret access.
 Errors: a missing run or unknown audience exits 2 and names the problem and,
-for audience errors, both legal values. Preconditions: COMMS_ROOT resolves to
-the mailbox root. Limitations: rows removed with the run cannot be backfilled;
-the feed provides no authentication and keeps only its follow position in
-memory, never a durable cursor.
+for audience errors, both legal values. ``--since AT`` is a lexicographic
+comparison against each row's ``at`` string (ISO-8601 sorts correctly); an
+unparseable value is not rejected and yields an empty feed with exit 0, so a
+consumer restarting from a saved position should validate it first.
+Preconditions: COMMS_ROOT resolves to the mailbox root. Limitations: rows
+removed with the run cannot be backfilled; the feed provides no
+authentication and keeps only its follow position in memory, never a durable
+cursor; the full-board view is the sibling view of a reserved seat name
+(``comms-feed-observer``), so rows posted under that name never appear.
 """
 
 import argparse
@@ -30,11 +38,21 @@ import swarm_mailbox
 
 
 DEFAULT_INTERVAL = 5.0  # parity with adapters/discord/mirror.py's file poll
+# Reserved: the full-board view is "every sibling of this seat", so a row posted
+# under this seat name would be invisible to the feed. Do not post as it.
 _OBSERVER_SEAT = "comms-feed-observer"
 
 
 def _lane(row):
-    """Classify using swarm_mailbox's thread, unicast, and kind vocabulary."""
+    """Classify using swarm_mailbox's thread, unicast, and kind vocabulary.
+
+    adapters/discord/mirror.py (_is_convo_lane_row, _is_threaded_row) holds the
+    Discord window's own classification. The two vocabularies are deliberately
+    different sets: the mirror routes to channels (all, convo, board) and gives
+    status rows no lane of their own, this feed labels rows for an app (board,
+    convo, status). Do not fold one into the other; a shared predicate would
+    need both windows to agree on a vocabulary first.
+    """
     if row.get("kind") == "status":
         return "status"
     if row.get("thread"):

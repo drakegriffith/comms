@@ -97,7 +97,14 @@ feed_capture() { # feed_capture <output-var> <rc-var> <args...>
   value="$("$COMMS" feed "$@" 2>&1)"; code=$?
   after_read="$(dir_checksum "$COMMS_STATE_DIR/read-cursor")"
   after_swarm="$(dir_checksum "$COMMS_STATE_DIR/swarm-cursor")"
-  if [ "$before_read" != "$after_read" ] || [ "$before_swarm" != "$after_swarm" ]; then
+  # The cursor guard only counts when the command did something: a feed that
+  # exits non-zero and prints nothing also moves no cursor, so require rc 0 and
+  # at least one emitted line unless the caller marked the case as expected-error
+  # by passing FEED_EXPECT_ERROR=1.
+  if [ "${FEED_EXPECT_ERROR:-0}" != "1" ] && { [ "$code" -ne 0 ] || [ -z "$value" ]; }; then
+    echo "FAIL: feed cursor guard inspected a run that produced nothing (rc=$code)"
+    FAIL=$((FAIL + 1))
+  elif [ "$before_read" != "$after_read" ] || [ "$before_swarm" != "$after_swarm" ]; then
     echo "FAIL: feed leaves read/swarm cursor directories byte-identical"
     FAIL=$((FAIL + 1))
   else
@@ -137,7 +144,7 @@ import json, sys
 print(next(item["render"]["body"] for item in map(json.loads, sys.stdin) if item["row"]["text"] == "feed finding"))
 ' 2>&1)"; body_rc=$?
 check "feed everyone audience uses shared plain-language table" 0 "$body_rc" "$everyone_body" "✅ Found something: feed finding"
-feed_capture out rc "$FEED_RUN" --audience operators
+FEED_EXPECT_ERROR=1 feed_capture out rc "$FEED_RUN" --audience operators
 if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qF engineer \
    && printf '%s' "$out" | grep -qF everyone; then
   echo "ok:   feed rejects unknown audience and names both legal values"; PASS=$((PASS + 1))
@@ -163,7 +170,7 @@ else
   echo "FAIL: feed --since is strict (rc=$rc)"; FAIL=$((FAIL + 1))
 fi
 
-feed_capture out rc "missing-feed-$$"
+FEED_EXPECT_ERROR=1 feed_capture out rc "missing-feed-$$"
 check "feed missing run exits 2 naming the run" 2 "$rc" "$out" "missing-feed-$$"
 
 follow_out="$(mktemp)"

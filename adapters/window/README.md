@@ -31,5 +31,10 @@ one JSON object per line. Each object has fixed top-level keys `run`, `row`,
 and `render`; `row` is the raw mailbox row, while `render` contains `author`,
 `body`, `title`, and `lane` (`board`, `convo`, or `status`). The command reads
 and moves no cursor, so the app may retain its own position or restart with
-`--since <at>`. The app chooses `--audience engineer` or `--audience everyone`
+`--since <at>` (a lexicographic compare on the row's `at`; validate a saved value
+before passing it, since an unparseable one yields an empty feed with exit 0).
+`--seat S` is S's inbox view: what S would receive, excluding rows S authored;
+a pane that should show S speaking reads the full feed and filters on `row.seat`.
+`--follow` polls every `COMMS_FEED_INTERVAL` seconds (default 5, the same
+interval as the Discord mirror). The app chooses `--audience engineer` or `--audience everyone`
 because it, not the mailbox, knows who reads its UI.
