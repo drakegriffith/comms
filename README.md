@@ -88,6 +88,7 @@ is per-runtime sugar on top.
 |-------------|----------|-----|
 | Claude Code | push     | PostToolUse hook (`adapters/claude-code/`, wired into settings.json by its install.sh) |
 | Codex       | push     | native Claude-shaped `hooks.json` runs the same heartbeat script (`adapters/codex/`) |
+| Gemini CLI  | poll     | runs shell commands in-turn; `adapters/gemini/` supplies the AfterTool shim for the push probe still owed |
 | Kimi        | resume-driver | no hook surface; `adapters/kimi/poll-driver.sh` polls and delivers rows as resume turns |
 | pi (badlogic) | poll   | briefed poll loop, `bin/comms read` after each work step (`adapters/pi/` -- recipe covers any hook-less runtime, local models included) |
 | Grok (xAI)  | poll     | runs Claude-shaped hooks but was measured NOT to inject `additionalContext`, so a hook would drop every row; briefed poll loop instead (`adapters/grok/` -- carries the probe that would upgrade it to push) |
@@ -458,6 +459,7 @@ adapters/CONTRACT.md         the adapter contract: the three delivery categories
 adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json
+adapters/gemini/             poll recipe + AfterTool tool-name shim and installer for the owed push probe
 adapters/kimi/               resume-driver for a runtime with no hook surface
 adapters/pi/                 poll-loop recipe for pi and any hook-less runtime
 adapters/grok/               poll-loop recipe for the grok CLI; records why its hooks cannot push
