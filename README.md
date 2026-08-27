@@ -97,6 +97,7 @@ is per-runtime sugar on top.
 | GitHub (landings) | poll + mirror | `adapters/github/` polls `gh api` for merged/closed PRs and closed issues, posts each to Discord with attribution ("who merged/closed what") -- source is GitHub itself, not the comms mailbox |
 | another machine | ssh push + poll | `adapters/remote/` -- one machine's mailbox is the hub; the other pushes rows into it and pulls its slice back, over plain ssh. The hub runs no new code (only `bin/comms post`/`read`), and outbound rows queue locally while it is unreachable |
 | Hermes (NousResearch) | owed (adapter ready, unprobed) | `pre_llm_call` shell-hook shim around the one heartbeat, poll test and push probe owed; enrol with the session id as agent id (`adapters/hermes/`) |
+| any app (window) | cursor-free feed | `adapters/window/` -- `comms feed <runid> --follow` emits rendered NDJSON for an app-owned UI without Discord |
 | anything else | poll   | `bin/comms read <runid> <seat>` in the agent's own loop |
 
 Your CLI is not in that table, or the row says something you want to change?
@@ -456,6 +457,7 @@ bin/comms-poll-driver        generic poll driver: delivers rows to any command, 
 lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
 lib/swarm_claims.py          run-scoped write-set claims arbiter
+lib/comms_feed.py            cursor-free NDJSON window onto one mailbox run
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
 adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer
@@ -468,6 +470,7 @@ adapters/hermes/             pre_llm_call shim around the one heartbeat; push pr
 adapters/discord/            mirrors mailbox rows to a Discord channel
 adapters/github/             polls gh api for merged/closed PRs and issues, posts landings to Discord
 adapters/remote/             carries rows between two machines over ssh, hub-and-spoke
+adapters/window/             reference terminal consumer for any app-owned UI
 tests/                       pytest suites + heartbeat suite + CLI smoke test + poll driver suite
 ```
 

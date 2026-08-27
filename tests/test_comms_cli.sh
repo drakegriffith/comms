@@ -82,6 +82,121 @@ fi
 out="$("$COMMS" read "$RUN" 2>&1)"; rc=$?
 check "read with missing seat preserves mailbox exit 1" 1 "$rc" "$out" "read needs"
 
+# ---- cursor-free NDJSON feed (S-W2 window interface) ----------------------
+dir_checksum() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then printf 'MISSING'; return; fi
+  (cd "$dir" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256) \
+    | shasum -a 256 | awk '{print $1}'
+}
+feed_capture() { # feed_capture <output-var> <rc-var> <args...>
+  local outvar="$1" rcvar="$2" before_read before_swarm after_read after_swarm value code
+  shift 2
+  before_read="$(dir_checksum "$COMMS_STATE_DIR/read-cursor")"
+  before_swarm="$(dir_checksum "$COMMS_STATE_DIR/swarm-cursor")"
+  value="$("$COMMS" feed "$@" 2>&1)"; code=$?
+  after_read="$(dir_checksum "$COMMS_STATE_DIR/read-cursor")"
+  after_swarm="$(dir_checksum "$COMMS_STATE_DIR/swarm-cursor")"
+  # The cursor guard only counts when the command did something: a feed that
+  # exits non-zero and prints nothing also moves no cursor, so require rc 0 and
+  # at least one emitted line unless the caller marked the case as expected-error
+  # by passing FEED_EXPECT_ERROR=1.
+  if [ "${FEED_EXPECT_ERROR:-0}" != "1" ] && { [ "$code" -ne 0 ] || [ -z "$value" ]; }; then
+    echo "FAIL: feed cursor guard inspected a run that produced nothing (rc=$code)"
+    FAIL=$((FAIL + 1))
+  elif [ "$before_read" != "$after_read" ] || [ "$before_swarm" != "$after_swarm" ]; then
+    echo "FAIL: feed leaves read/swarm cursor directories byte-identical"
+    FAIL=$((FAIL + 1))
+  else
+    echo "ok:   feed leaves read/swarm cursor directories byte-identical"
+    PASS=$((PASS + 1))
+  fi
+  printf -v "$outvar" '%s' "$value"
+  printf -v "$rcvar" '%s' "$code"
+}
+
+FEED_RUN="commstest-feed-$$"
+"$COMMS" init "$FEED_RUN" >/dev/null
+"$COMMS" subscribe "$FEED_RUN" B topic-b >/dev/null
+"$COMMS" post "$FEED_RUN" A finding "feed finding" --topic topic-b >/dev/null
+"$COMMS" post "$FEED_RUN" A comment "threaded comment" --topic other --thread doc:repo/file.py >/dev/null
+"$COMMS" post "$FEED_RUN" A reply "private reply" --to B >/dev/null
+"$COMMS" post "$FEED_RUN" C status "feed status" --topic topic-b >/dev/null
+
+feed_capture out rc "$FEED_RUN"
+check "feed emits the four-row scratch run" 0 "$rc" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" "4"
+schema_out="$(printf '%s\n' "$out" | python3 -c '
+import json, sys
+items = [json.loads(line) for line in sys.stdin if line.strip()]
+assert [item["row"]["at"] for item in items] == sorted(item["row"]["at"] for item in items)
+assert all(set(item) == {"run", "row", "render"} for item in items)
+assert all(set(item["render"]) == {"author", "body", "title", "lane"} for item in items)
+assert all(item["run"] == sys.argv[1] for item in items)
+assert [item["row"]["text"] for item in items] == ["feed finding", "threaded comment", "private reply", "feed status"]
+assert [item["render"]["lane"] for item in items] == ["board", "board", "convo", "status"]
+print("schema-ok")
+' "$FEED_RUN" 2>&1)"; rc=$?
+check "feed schema preserves raw rows, fixed keys, order, and mailbox-vocabulary lanes" 0 "$rc" "$schema_out" "schema-ok"
+
+feed_capture out rc "$FEED_RUN" --audience everyone
+everyone_body="$(printf '%s\n' "$out" | python3 -c '
+import json, sys
+print(next(item["render"]["body"] for item in map(json.loads, sys.stdin) if item["row"]["text"] == "feed finding"))
+' 2>&1)"; body_rc=$?
+check "feed everyone audience uses shared plain-language table" 0 "$body_rc" "$everyone_body" "✅ Found something: feed finding"
+FEED_EXPECT_ERROR=1 feed_capture out rc "$FEED_RUN" --audience operators
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qF engineer \
+   && printf '%s' "$out" | grep -qF everyone; then
+  echo "ok:   feed rejects unknown audience and names both legal values"; PASS=$((PASS + 1))
+else
+  echo "FAIL: feed rejects unknown audience and names both legal values (rc=$rc)"; FAIL=$((FAIL + 1))
+fi
+
+feed_capture out rc "$FEED_RUN" --seat B
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF "feed finding" \
+   && printf '%s' "$out" | grep -qF "private reply" \
+   && printf '%s' "$out" | grep -qF "feed status" \
+   && ! printf '%s' "$out" | grep -qF "threaded comment"; then
+  echo "ok:   feed --seat is exactly read_for's subscribed view"; PASS=$((PASS + 1))
+else
+  echo "FAIL: feed --seat is exactly read_for's subscribed view (rc=$rc)"; FAIL=$((FAIL + 1))
+fi
+since="$(printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.loads(next(sys.stdin))["row"]["at"])')"
+feed_capture out rc "$FEED_RUN" --since "$since"
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -qF "feed finding" \
+   && printf '%s' "$out" | grep -qF "threaded comment"; then
+  echo "ok:   feed --since is strict"; PASS=$((PASS + 1))
+else
+  echo "FAIL: feed --since is strict (rc=$rc)"; FAIL=$((FAIL + 1))
+fi
+
+FEED_EXPECT_ERROR=1 feed_capture out rc "missing-feed-$$"
+check "feed missing run exits 2 naming the run" 2 "$rc" "$out" "missing-feed-$$"
+
+follow_out="$(mktemp)"
+before_read="$(dir_checksum "$COMMS_STATE_DIR/read-cursor")"
+before_swarm="$(dir_checksum "$COMMS_STATE_DIR/swarm-cursor")"
+COMMS_FEED_INTERVAL=0.05 "$COMMS" feed "$FEED_RUN" --follow >"$follow_out" 2>&1 &
+follow_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do grep -qF "feed status" "$follow_out" && break; sleep 0.05; done
+"$COMMS" post "$FEED_RUN" D finding "posted after follow start" --topic topic-b >/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do grep -qF "posted after follow start" "$follow_out" && break; sleep 0.05; done
+kill "$follow_pid" 2>/dev/null || true
+wait "$follow_pid" 2>/dev/null || true
+after_read="$(dir_checksum "$COMMS_STATE_DIR/read-cursor")"
+after_swarm="$(dir_checksum "$COMMS_STATE_DIR/swarm-cursor")"
+if grep -qF "posted after follow start" "$follow_out"; then
+  echo "ok:   feed --follow prints a row posted after start"; PASS=$((PASS + 1))
+else
+  echo "FAIL: feed --follow prints a row posted after start"; FAIL=$((FAIL + 1))
+fi
+if [ "$before_read" = "$after_read" ] && [ "$before_swarm" = "$after_swarm" ]; then
+  echo "ok:   feed --follow leaves read/swarm cursor directories byte-identical"; PASS=$((PASS + 1))
+else
+  echo "FAIL: feed --follow leaves read/swarm cursor directories byte-identical"; FAIL=$((FAIL + 1))
+fi
+rm -f "$follow_out"
+
 # ---- read cursor (issue #33) ------------------------------------------------
 # The defect: two consecutive reads for the same (runid, seat) replayed rows the
 # first read already returned, while adapters/pi/README.md promised they would
