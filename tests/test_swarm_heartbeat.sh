@@ -1003,6 +1003,9 @@ EOF
         "$(printf '%s' "$ctx" | grep -c 'X10-TOPIC-' | tr -d ' ')"
     ck_contains "(x-10) beat 1 reports fifteen held rows" \
         "15 more, read the full board" "$ctx"
+    FORWARDED="$STATE/swarm-cursor/$RX10/agentX10.forwarded"
+    ck "(x-10) forwarded set holds the unicast key after beat 1" \
+        "2026-08-27T05:01:00+00:00	seatPeer" "$(cat "$FORWARDED" 2>/dev/null)"
     run_hook agentX10; ctx="$(addl_ctx "$HOOK_OUT")"
     ck_absent "(x-10) beat 2 does not repeat FOR YOU row" "X10-UNICAST-LAST" "$ctx"
     ck "(x-10) beat 2 delivers next ten ordinary rows" "10" \
@@ -1017,13 +1020,8 @@ EOF
         "more, read the full board" "$ctx"
     run_hook agentX10
     ck "(x-10) beat 4 is empty" "" "$(addl_ctx "$HOOK_OUT")"
-    FORWARDED="$STATE/swarm-cursor/$RX10/agentX10.forwarded"
-    if [ ! -e "$FORWARDED" ] || [ ! -s "$FORWARDED" ]; then
-        pass=$((pass + 1))
-    else
-        fail=$((fail + 1))
-        echo "  FAIL (x-10) forwarded set is empty after beat 3" >&2
-    fi
+    ck "(x-10) forwarded set is written empty after beat 3" "0" \
+        "$(wc -c < "$FORWARDED" | tr -d ' ')"
 
     RX11="hbtestx11$$x$RANDOM"
     arm_run "$RX11"
@@ -1050,12 +1048,18 @@ PY
     enroll_agent "$RX12" agentX12 "projX" seatX12
     post_row "$RX12" seatPeer finding "X12-FRESH" \
         "2026-08-27T07:00:00+00:00" "projX"
-    LIB_ONLY_ARM="$STATE/lib-only-arm"
-    mkdir -p "$LIB_ONLY_ARM"
-    cp "$SA" "$LIB_ONLY_ARM/swarm_arm.py"
+    # A checkout whose lib/ predates swarm_threads.py: a WHOLE TREE, not an env
+    # override, so the production hook keeps resolving lib/ from its own dir.
+    SHIM_TREE="$STATE/shim-tree"
+    mkdir -p "$SHIM_TREE/adapters/claude-code" "$SHIM_TREE/lib"
+    cp "$HOOK" "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh"
+    cp "$SELF_DIR/../adapters/claude-code/stdin-bounded.sh" \
+        "$SHIM_TREE/adapters/claude-code/stdin-bounded.sh"
+    cp "$SA" "$SHIM_TREE/lib/swarm_arm.py"
+    chmod +x "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh"
     X12_ERR="$STATE/x12.err"
-    HOOK_OUT="$(payload agentX12 | HB_SWARM_LIB="$LIB_ONLY_ARM" \
-        COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" /bin/bash "$HOOK" 2>"$X12_ERR")"
+    HOOK_OUT="$(payload agentX12 | COMMS_STATE_DIR="$STATE" COMMS_ROOT="$ROOT" \
+        /bin/bash "$SHIM_TREE/adapters/claude-code/swarm-heartbeat.sh" 2>"$X12_ERR")"
     ck_contains "(x-12) missing swarm_threads still delivers a fresh row" \
         "X12-FRESH" "$(addl_ctx "$HOOK_OUT")"
     ck "(x-12) missing swarm_threads prints exactly one stderr line" \
@@ -1072,10 +1076,16 @@ PY
     post_row "$RX13" seatPeer finding "X13-FOR-A" \
         "2026-08-27T08:01:00+00:00" "@seatX13A"
     post_row "$RX13" seatPeer finding "X13-FOR-B" \
-        "2026-08-27T08:01:00+00:00" "@seatX13B"
+        "2026-08-27T08:01:01+00:00" "@seatX13B"
     run_hook agentX13A
     ck_contains "(x-13) seat A receives its FOR YOU row" \
         "X13-FOR-A" "$(addl_ctx "$HOOK_OUT")"
+    # Seed B's own forwarded file with A's key by hand: a forwarded set keyed
+    # on (at, seat) must not suppress B's row, which shares the poster but not
+    # the timestamp. An implementation keyed on the poster alone fails here.
+    mkdir -p "$STATE/swarm-cursor/$RX13"
+    printf '2026-08-27T08:01:00+00:00\tseatPeer\n' \
+        > "$STATE/swarm-cursor/$RX13/agentX13B.forwarded"
     run_hook agentX13B
     ck_contains "(x-13) seat A forwarded state does not suppress seat B" \
         "X13-FOR-B" "$(addl_ctx "$HOOK_OUT")"

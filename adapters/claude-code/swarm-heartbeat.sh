@@ -268,9 +268,9 @@ fi
 export HB_PAYLOAD="$input"
 export HB_STATE_DIR="$STATE_DIR"
 # The participant registry (swarm_arm) is IMPORTED, one implementation, never
-# re-derived here. Production resolves this checkout's own lib/; tests may
-# override HB_SWARM_LIB to exercise compatibility with older live shims.
-export HB_SWARM_LIB="${HB_SWARM_LIB:-$HB_REPO_ROOT/lib}"
+# re-derived here. Resolved from this checkout's own lib/, nowhere else: a test
+# that needs a different lib/ copies the adapter into a tree of its own.
+export HB_SWARM_LIB="$HB_REPO_ROOT/lib"
 # COMMS_ROOT / CLAUDE_SWARM_ROOT are inherited if set; python defaults the root
 # to /tmp otherwise, matching swarm_mailbox.py's own resolution order.
 
@@ -573,7 +573,12 @@ def process_run(runid):
         if overflow > 0
         else delta[-1].get("at", "")
     )
-    forwarded = {key for key in forwarded if key[0] > new_cursor}
+    # Keys are timestamps; a corrupt line whose key does not start with a
+    # digit would sort above every cursor and pin itself forever, so drop it.
+    forwarded = {
+        key for key in forwarded
+        if key[0] > new_cursor and key[0][:1].isdigit()
+    }
     forwarded.update(
         (r.get("at"), r.get("seat") or "")
         for r in priority
