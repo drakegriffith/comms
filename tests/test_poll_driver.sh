@@ -185,6 +185,29 @@ out="$("$COMMS" subs "$RUN" delta --replay 2>&1)"
 case "$out" in *topic-a-row*) ok "--topics subscribed the seat's mailbox slice" ;;
                *) bad "--topics subscribed the seat's mailbox slice (got: $out)" ;; esac
 
+# Widening a subscription changes the view. The new view starts at zero, so it
+# replays the already-subscribed rows alongside the older rows newly brought
+# into view; a third poll then has nothing left.
+WIDE_RUN="driver-subs-widen-$$"
+: > "$INBOX"
+"$COMMS" init "$WIDE_RUN" >/dev/null
+"$COMMS" subscribe "$WIDE_RUN" alpha proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "LATER-1" --topic later >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "LATER-2" --topic later >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$WIDE_RUN" gamma finding "PROJ-3" --topic proj >/dev/null
+"$DRIVER" "$WIDE_RUN" alpha --subs --topics proj --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "initial subscription poll delivers three project rows" 3 "$(handed PROJ-)"
+"$DRIVER" "$WIDE_RUN" alpha --subs --topics proj,later --once -- "$WORK/fake-runtime" >/dev/null 2>&1
+eq "widened subscription delivers both older later rows" 2 "$(handed LATER-)"
+eq "widened subscription explicitly replays the three project rows" 6 "$(handed PROJ-)"
+before="$(deliveries)"
+out="$("$DRIVER" "$WIDE_RUN" alpha --subs --topics proj,later --once -- "$WORK/fake-runtime" 2>&1)"
+case "$out" in *"nothing new"*) ok "third widened-subscription poll has nothing new" ;;
+               *) bad "third widened-subscription poll has nothing new (got: $out)" ;; esac
+eq "third widened-subscription poll delivers nothing" "$before" "$(deliveries)"
+
 # ---- 13. usage / argument errors --------------------------------------------
 out="$("$DRIVER" "$RUN" beta --once -- 2>&1)"; rc=$?
 eq "-- with no command is a usage error" 2 "$rc"
@@ -257,10 +280,41 @@ case "$out" in *foreign-beta*|*unsubscribed-other*)
   bad "kimi preview excludes foreign unicast and unsubscribed topic (got: $out)" ;;
   *) ok "kimi preview excludes foreign unicast and unsubscribed topic" ;; esac
 
-KLOG="$COMMS_STATE_DIR/poll-driver/$KRUN/alpha.subs.log"
 "$DRIVER" "$KRUN" alpha --subs --once -- "$WORK/fake-runtime" >/dev/null 2>&1
-case "$(cat "$KLOG" 2>/dev/null)" in *'"view": "subs"'*) ok "receipt log records the subs view" ;;
-  *) bad "receipt log records the subs view (got: $(cat "$KLOG" 2>/dev/null))" ;; esac
+KLOG="$(find "$COMMS_STATE_DIR/poll-driver/$KRUN" -name 'alpha.subs-*.log' -print -quit)"
+case "$(cat "$KLOG" 2>/dev/null)" in *'"view": "subs-'*) ok "receipt log records the digested subs view" ;;
+  *) bad "receipt log records the digested subs view (got: $(cat "$KLOG" 2>/dev/null))" ;; esac
+
+# The kimi override carries the same digest. Establish the first cursor through
+# the generic driver, widen, then prove the adapter's dry preview sees the two
+# older rows and the intentional full-view replay. Confirm that view and the
+# adapter's third preview is empty.
+KWIDE_RUN="kimi-subs-widen-$$"
+"$COMMS" init "$KWIDE_RUN" >/dev/null
+"$COMMS" subscribe "$KWIDE_RUN" alpha proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-LATER-1" --topic later >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-LATER-2" --topic later >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-1" --topic proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-2" --topic proj >/dev/null
+"$COMMS" post "$KWIDE_RUN" gamma finding "K-PROJ-3" --topic proj >/dev/null
+KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
+KCURSOR="$COMMS_STATE_DIR/kimi-cursor/$KWIDE_RUN-alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --cursor "$KCURSOR" --once -- /usr/bin/true >/dev/null 2>&1
+"$COMMS" subscribe "$KWIDE_RUN" alpha proj later >/dev/null
+out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"; rc=$?
+eq "kimi widened-subscription preview exits 0" 0 "$rc"
+case "$out" in *K-LATER-1*K-LATER-2*|*K-LATER-2*K-LATER-1*)
+  ok "kimi widened-subscription preview names both older later rows" ;;
+  *) bad "kimi widened-subscription preview names both older later rows (got: $out)" ;; esac
+case "$out" in *"would deliver 5 row(s)"*K-PROJ-1*K-PROJ-2*K-PROJ-3*)
+  ok "kimi widened-subscription preview explicitly replays the project rows" ;;
+  *) bad "kimi widened-subscription preview explicitly replays the project rows (got: $out)" ;; esac
+KDIGEST="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$REPO/lib" "$KWIDE_RUN" alpha)"
+KCURSOR="$COMMS_STATE_DIR/kimi-cursor/$KWIDE_RUN-alpha.subs-$KDIGEST.json"
+"$DRIVER" "$KWIDE_RUN" alpha --subs --cursor "$KCURSOR" --once -- /usr/bin/true >/dev/null 2>&1
+out="$("$KIMI_DRIVER" "$KWIDE_RUN" alpha sess-1 "$WORK" --once 2>&1)"
+case "$out" in *"nothing new"*) ok "kimi third widened-subscription preview has nothing new" ;;
+               *) bad "kimi third widened-subscription preview has nothing new (got: $out)" ;; esac
 
 # A whole-board counts cursor cannot be reused for the narrower subscription
 # view: its per-poster count can silently skip that poster's first visible row.

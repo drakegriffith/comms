@@ -299,7 +299,6 @@ try:
     import swarm_threads
 except Exception as exc:
     # Cannot load the optional stale-status helper: disable only stale skipping.
-    # Keep delivery live and disable only stale skipping.
     swarm_threads = None
     sys.stderr.write("swarm-heartbeat: swarm_threads unavailable; stale-status skip disabled: %s\n" % exc)
 

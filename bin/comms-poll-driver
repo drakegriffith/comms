@@ -133,16 +133,10 @@ READ_FLAGS=(--replay)
 VIEW="all"
 if [ "$SUBS" -eq 1 ]; then
   READ_FLAGS=(--replay --subs)
-  VIEW="subs"
 elif [ -n "$TOPIC" ]; then
   READ_FLAGS=(--replay --topic "$TOPIC")
   VIEW="topic-$(slug "$TOPIC")"
 fi
-
-STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
-DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
-[ -n "$CURSOR_FILE" ] || CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.json"
-[ -n "$LOG_FILE" ]    || LOG_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.log"
 
 # ---- enroll-first invariant ------------------------------------------------
 # Enrollment is write-once and refuses a run that is not armed, so doing it
@@ -165,6 +159,18 @@ if [ "$ENROLL" -eq 1 ]; then
     exit 1
   fi
 fi
+
+# A subscription view is mutable: widening it can insert older rows before a
+# count cursor. Key each effective set separately, using the CLI's one digest
+# implementation. This must follow --topics so it names the set now in force.
+if [ "$SUBS" -eq 1 ]; then
+  VIEW="subs-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import swarm_mailbox; print(swarm_mailbox.subscription_digest(sys.argv[2], sys.argv[3]))' "$SELF_DIR/../lib" "$RUNID" "$SEAT")" || exit 1
+fi
+
+STATE_DIR="${COMMS_STATE_DIR:-$HOME/.comms/state}"
+DRIVER_DIR="$STATE_DIR/poll-driver/$(slug "$RUNID")"
+[ -n "$CURSOR_FILE" ] || CURSOR_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.json"
+[ -n "$LOG_FILE" ]    || LOG_FILE="$DRIVER_DIR/$(slug "$SEAT").$VIEW.log"
 
 # ---- one poll --------------------------------------------------------------
 

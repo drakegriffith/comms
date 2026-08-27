@@ -249,6 +249,13 @@ def subscriptions(runid, seat):
     return set(topics) | {SELF_TOPIC_PREFIX + seat}
 
 
+def subscription_digest(runid, seat):
+    """Digest the effective subscription set for a cursor view name."""
+    registered = subscriptions(runid, seat)
+    selector = "null" if registered is None else json.dumps(sorted(registered))
+    return hashlib.sha1(selector.encode("utf-8")).hexdigest()[:12]
+
+
 # ---- THREAD KEY ------------------------------------------------------------
 #
 # WHAT A THREAD IS: rows about the SAME DOCUMENT, grouped so a human reading
@@ -1095,9 +1102,7 @@ def read_delta(runid, seat, topic=None, subs=False):
     """
     if subs:
         rows = read_for(runid, seat)
-        registered = subscriptions(runid, seat)
-        selector = "null" if registered is None else json.dumps(sorted(registered))
-        view = "subs-" + hashlib.sha1(selector.encode("utf-8")).hexdigest()[:12]
+        view = "subs-" + subscription_digest(runid, seat)
     elif topic is not None:
         rows = read_siblings(runid, seat, topic=topic)
         view = "topic-" + _slug(topic)
