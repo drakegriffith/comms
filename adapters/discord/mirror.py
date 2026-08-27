@@ -631,36 +631,10 @@ def build_read_content(n, seats):
 
 
 def build_content(row):
-    """This row's Discord message CONTENT (no author -- that is the webhook
-    `username`, see build_author): first TEXT_CAP chars of text, one leading
-    emoji chosen by event shape, in this precedence:
-
-      1. the ambient "session started in <dir>" status row -> the "agent
-         born" verb: hatching-chick emoji + "I am awake in <dir>"
-      2. a unicast (topic starts with "@") -> incoming-envelope emoji +
-         "to <seat>: <text>"
-      3. a sendmessage-bridge row (text starts with "-> ") -> the target
-         rendered readably; a bare agent_id target is NEVER the bare object
-         of the sentence (a raw 17-hex id means nothing to a human) --
-         shortened to its first 8 chars and phrased as "a subagent (<short>)"
-      4. otherwise: kind's emoji (shared vocabulary, default info-source)
-         + text
-    """
+    """Return this row's transport-capped Discord message content."""
     adapted = dict(row)
     adapted["text"] = str(row.get("text", ""))[:TEXT_CAP]
     return comms_render.build_content(adapted, audience())
-
-
-def _build_content_everyone(kind, topic, text):
-    """build_content for AUDIENCE_EVERYONE: the same four shapes in the same
-    precedence, spoken plainly. No filesystem path (the born verb shows the
-    folder name), no bare agent id (a helper agent is "a helper agent"),
-    the envelope stays on direct messages because it is the one glyph a
-    demo audience already reads as "one agent talking to another"."""
-    return comms_render._build_content_everyone(
-        kind, topic, text[:TEXT_CAP], AUDIENCE_EVERYONE
-    )
-
 
 def format_row(row, machine, identity=None):
     """(author, content) for one row -- author is this row's seat's Discord

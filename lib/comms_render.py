@@ -52,7 +52,15 @@ def _sanitize_author(author):
 
 
 def build_author(seat, identity, machine, audience):
-    """Return the uncapped display author for one mailbox row."""
+    """Build an uncapped display author from ``seat`` and identity metadata.
+
+    The returned string reads only identity ``model`` and ``project``. It has
+    no side effects. ``machine`` appears only for the engineer audience and is
+    deliberately dropped for everyone. Mention-like and zero-width characters
+    are stripped. Inputs must be string-format-compatible mailbox identity
+    values; transport length limits are not applied. An unknown ``audience``
+    raises ValueError naming both ``engineer`` and ``everyone``.
+    """
     _validate_audience(audience)
     identity = identity or {}
     parts = []
@@ -71,7 +79,15 @@ def build_author(seat, identity, machine, audience):
 
 
 def build_read_content(n, seats, audience):
-    """Return the uncapped delivery-event sentence."""
+    """Build an uncapped delivery sentence for count ``n`` and ordered ``seats``.
+
+    The function returns a string and has no side effects. Inputs must provide
+    an integer-format-compatible count and a sequence of string seat names.
+    Empty seats become ``unknown sender(s)`` for engineers and omit the sender
+    phrase for everyone. It does not validate count/seat consistency or apply
+    transport caps. An unknown ``audience`` raises ValueError naming both
+    ``engineer`` and ``everyone``.
+    """
     _validate_audience(audience)
     if audience == AUDIENCE_EVERYONE:
         noun = "message" if n == 1 else "messages"
@@ -88,7 +104,19 @@ def build_read_content(n, seats, audience):
 
 
 def build_content(row, audience):
-    """Return the uncapped, single-line body for one mailbox row."""
+    """Build an uncapped, single-line body from one mailbox row mapping.
+
+    Event shapes use this precedence: an ambient ``session started in <dir>``
+    status; a unicast whose topic starts with ``@``; a sendmessage bridge whose
+    text starts with ``-> <target>:``; otherwise the kind vocabulary (with the
+    status vocabulary as everyone's fallback). A bare 17-hex bridge target is
+    described as a shortened subagent for engineers or a helper agent for
+    everyone. Newlines in text become spaces. The function has no side effects.
+
+    The row must support ``get`` and follow the mailbox mapping shape. This
+    function does not apply transport caps or validate row fields. An unknown
+    ``audience`` raises ValueError naming both ``engineer`` and ``everyone``.
+    """
     _validate_audience(audience)
     text = str(row.get("text", "")).replace("\n", " ")
     kind = row.get("kind", "?")
@@ -134,7 +162,16 @@ def _build_content_everyone(kind, topic, text, audience):
 
 
 def thread_title(key, audience):
-    """Return an uncapped human-visible title for a document thread key."""
+    """Build an uncapped human-visible title from a document thread ``key``.
+
+    The string result strips ``swarm_mailbox.THREAD_KEY_PREFIX``. Everyone's
+    slash-separated titles become ``<leaf> · <repo>``; engineer titles retain
+    their path. An empty result falls back to ``str(key)``. The function has no
+    side effects. ``key`` must be string-convertible; hierarchy beyond the repo
+    and leaf is intentionally omitted for everyone, and transport caps are not
+    applied. An unknown ``audience`` raises ValueError naming both ``engineer``
+    and ``everyone``.
+    """
     _validate_audience(audience)
     title = str(key)
     if title.startswith(swarm_mailbox.THREAD_KEY_PREFIX):
