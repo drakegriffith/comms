@@ -11,7 +11,10 @@ module does not apply transport-specific length limits or resolve configuration.
 import os
 import re
 
+import comms_counts
 import swarm_mailbox
+
+ANNOTATE_COUNTS_VAR = "COMMS_ANNOTATE_COUNTS"
 
 AUDIENCE_ENGINEER = "engineer"
 AUDIENCE_EVERYONE = "everyone"
@@ -103,8 +106,26 @@ def build_read_content(n, seats, audience):
     return "\U0001f441️ read %d row(s) from %s" % (n, senders)
 
 
-def build_content(row, audience):
+def annotate_counts_enabled():
+    """Whether the subject-count annotation is switched on. Default: OFF.
+
+    Reads COMMS_ANNOTATE_COUNTS; only the literal "1" turns it on, so a stray
+    "0"/"false"/"" never reads as enabled. OFF is the default because the
+    heartbeat has a never-block rule and a marker on a peer's message is a
+    behaviour change to every delivery surface at once. See
+    docs/subject-count-gate.md before flipping it.
+    """
+    return os.environ.get(ANNOTATE_COUNTS_VAR, "") == "1"
+
+
+def build_content(row, audience, annotate=None):
     """Build an uncapped, single-line body from one mailbox row mapping.
+
+    ``annotate`` is the subject-count marker switch: None (the default) defers
+    to annotate_counts_enabled(), so every existing two-argument caller keeps
+    its exact current output. When on, an evidentiary row whose text states no
+    subject count and no named enumerator gets comms_counts.ANNOTATION
+    appended. It only ever APPENDS -- nothing here drops or refuses a row.
 
     Event shapes use this precedence: an ambient ``session started in <dir>``
     status; a unicast whose topic starts with ``@``; a sendmessage bridge whose
@@ -117,6 +138,14 @@ def build_content(row, audience):
     function does not apply transport caps or validate row fields. An unknown
     ``audience`` raises ValueError naming both ``engineer`` and ``everyone``.
     """
+    body = _build_content_body(row, audience)
+    if annotate is None:
+        annotate = annotate_counts_enabled()
+    return comms_counts.annotate(body, row, enabled=annotate)
+
+
+def _build_content_body(row, audience):
+    """build_content's vocabulary, before any annotation is applied."""
     _validate_audience(audience)
     text = str(row.get("text", "")).replace("\n", " ")
     kind = row.get("kind", "?")

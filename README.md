@@ -452,6 +452,11 @@ The Discord mirror adds one more, `COMMS_AUDIENCE` (`engineer`, the default,
 or `everyone`), described under Visualization above; it changes the words
 in the channel and nothing in the mailbox.
 
+Two more belong to the subject-count lint: `COMMS_BOARD_DIR` (the directory
+`comms counts` scans, default `/tmp/comms-machine-ops`) and
+`COMMS_ANNOTATE_COUNTS` (only the literal `1` enables the inline marker;
+default off, and see the section above for why it should stay off).
+
 Each falls back to a pre-extraction legacy name (`CLAUDE_SWARM_ROOT`,
 `SWARM_ARM_STATE_DIR`/`SWARM_HEARTBEAT_STATE_DIR`) for migration
 compatibility; the `COMMS_*` name always wins.
@@ -464,6 +469,21 @@ the delivery oracle. Seat self-reports UNDERCOUNT -- an agent that received an
 injection does not reliably mention it -- so when auditing whether messages
 landed, read the log, not the seats.
 
+## Subject counts: measured, and deliberately not enforced
+
+`comms counts --board <dir>` reports what fraction of evidentiary rows
+(`finding|comment|reply|blocker`, minus auto-emitted shapes) state how many
+subjects were inspected and by what enumerator. Like `comms threads`, it exits
+2 when it inspected zero rows -- a scan that read nothing is not a pass.
+
+It is a REPORT, never a gate. `COMMS_ANNOTATE_COUNTS=1` will mark noncompliant
+rows inline at render time, and it ships OFF and should stay off: on the live
+board every row the scanner called compliant failed hand re-derivation, and 58
+of the 60 came from a scripted rehearsal corpus that fabricated its counts and
+its provenance attestation together. Read `docs/subject-count-gate.md` before
+flipping the switch; it has the numbers and the one fact that would change the
+recommendation.
+
 ## Layout
 
 ```
@@ -473,6 +493,7 @@ lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
 lib/swarm_claims.py          run-scoped write-set claims arbiter
 lib/comms_feed.py            cursor-free NDJSON window onto one mailbox run
+lib/comms_counts.py          subject-count lint over a board (`comms counts`); REPORT ONLY, see docs/subject-count-gate.md
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
 adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer + comms-say skill (phrase -> 1-1 send)
