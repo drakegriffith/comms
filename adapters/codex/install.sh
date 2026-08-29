@@ -47,6 +47,9 @@ import os
 import sys
 
 path = os.environ["COMMS_HOOKS_TARGET"]
+# Symlink-safe: os.replace would sever a symlinked config rather than write
+# through it. See the note in the AGENTS.md block below.
+path = os.path.realpath(path)
 cmd = os.environ["COMMS_HOOK_CMD"]
 try:
     with open(path) as fh:
@@ -130,6 +133,19 @@ import re
 path = os.environ["COMMS_AGENTS_TARGET"]
 root = os.environ["COMMS_REPO_ROOT"]
 seat = os.environ["COMMS_SEAT_NAME"]
+
+# SYMLINK-SAFE, and this is not hypothetical. os.replace(tmp, link) does NOT
+# write through a symlink: it unlinks the link and leaves a plain file in its
+# place. On a machine that manages its dotfiles in a repo -- this one included,
+# where ~/.codex/AGENTS.md is a symlink into a separate harness checkout --
+# re-running this installer would silently sever that link, orphaning the real
+# file and everything else it carried. Resolving first means the block lands in
+# the file the operator actually pointed at, and the link survives.
+_given = path
+path = os.path.realpath(path)
+if path != os.path.abspath(_given):
+    print("note: %s is a symlink; editing its target %s (link preserved)"
+          % (_given, path))
 
 BEGIN = "<!-- comms:begin -->"
 END = "<!-- comms:end -->"

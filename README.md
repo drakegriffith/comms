@@ -111,8 +111,45 @@ are upgrades from there, each behind its own probe.
 ```
 git clone https://github.com/drakegriffith/comms
 cd comms
+bash install.sh
+```
+
+`install.sh` is the canonical entrypoint and the only command you need. It is
+idempotent, so re-running it is the repair path, and it writes nothing without
+telling you what and where. It installs exactly four things:
+
+| | what | where |
+|---|---|---|
+| 1 | state dirs | `$COMMS_STATE_DIR` (default `~/.comms/state`) plus `swarm-arm/` |
+| 2 | the CLI | a symlink at `~/.local/bin/comms` into this checkout |
+| 3 | the Claude Code integration | PostToolUse heartbeat hook in `~/.claude/settings.json`, plus the `comms-say` skill |
+| 4 | verification | the suites, actually run, with their real exit codes reported |
+
+Other modes:
+
+```
+bash install.sh --check                    # dry run; writes nothing, anywhere
+bash install.sh --repair                   # re-assert every piece of a partial install
+bash install.sh --uninstall                # remove wiring, CLI and skill; KEEPS your mailbox data
+bash install.sh --uninstall --purge-state  # also delete the state dir
+```
+
+Exit codes: `0` installed and verified, `1` failed, `2` installed but NOT
+verified. **Exit 2 is not a pass.** It means the verification step never ran,
+which says nothing about whether the install works. You get a 2 when no test
+runner is reachable; install `pytest` or `uv` and re-run to turn it into a
+real verdict.
+
+Everything else is opt-in, and `install.sh` prints each one with its exact
+command rather than wiring it silently: `adapters/codex/`, `adapters/gemini/`,
+`adapters/discord/`, `adapters/launchd/`, `adapters/remote/`, and the ambient
+machine-ops lane. Nothing under `adapters/` is required for a working seat.
+
+You can still do it by hand -- the core is `bin/comms` plus stdlib-only Python
+files, with no pip installs, no config files and no daemon:
+
+```
 bin/comms status             # exits 0 and prints an armed_runs JSON object; you are installed
-python3 -m pytest tests -q   # optional: prove it on your machine
 ```
 
 (`bin/comms` with no subcommand prints the usage text and exits 2, the CLI's
@@ -120,9 +157,42 @@ usage-error code -- fine to read, useless as a check, and fatal inside a
 `set -e` script. `bin/comms status` is the smoke test that actually exercises
 the dispatcher, the `lib/` modules and the state dir, and exits 0.)
 
-There is nothing else: the core is `bin/comms` plus three stdlib-only Python
-files. No pip installs, no config files, no daemon. Two optional env knobs are
-listed under Configuration below.
+Two optional env knobs are listed under Configuration below;
+`COMMS_SETTINGS`, `COMMS_SKILLS_DIR` and `COMMS_BIN_DIR` redirect the
+installer's three targets, which is how its tests avoid touching real state.
+
+### How the settings.json edit is kept safe
+
+A mangled `~/.claude/settings.json` breaks every Claude session on the machine,
+not just comms, so that one write gets more care than the rest of this repo
+combined. It goes through `adapters/claude-code/settings_edit.py`, which takes
+a lock, snapshots the bytes, **refuses** an unparseable file rather than
+rewriting it, writes a timestamped `.comms-backup.<ts>`, stages and re-parses
+the new file, re-checks that the original has not changed underneath it, and
+only then does an atomic `os.replace`. It also resolves symlinks first, because
+`os.replace` severs a symlink instead of writing through it.
+
+Stated limit: Claude Code does not take our lock, so the re-check narrows the
+clobber window to microseconds rather than closing it. When it fires, the
+installer refuses and tells you to re-run; it never overwrites the other
+writer. Closing the window entirely needs the runtime to cooperate on a lock,
+which this repo cannot grant itself.
+
+### Known parity gaps
+
+Things the author's machine has that a fresh `install.sh` does **not** produce.
+Written down because an undocumented gap is how "works on my machine" survives:
+
+- **The ambient machine-ops lane needs a shim this repo does not ship.**
+  `adapters/claude-code/ambient/install.sh` routes its hooks through
+  `~/.claude/state/bin/hook-shim.sh`, which lives in a separate private harness
+  repo. Without it that installer exits 2 and the lane cannot be installed by
+  anyone else. This is the largest single parity gap.
+- **launchd jobs are hand-built.** `adapters/launchd/` ships one plist
+  (thread-compile). The Discord mirror jobs running on the author's machine
+  have no installable template.
+- **`~/.local/bin` may not be on your PATH.** The installer says so when it
+  is not, and prints the absolute path to use instead.
 
 The 1-1 terminal UX also ships with the installers, no hand-wiring:
 `adapters/claude-code/install.sh` installs the `comms-say` skill into
@@ -467,6 +537,7 @@ landed, read the log, not the seats.
 ## Layout
 
 ```
+install.sh                   canonical installer: state dirs, CLI, claude-code wiring, verification
 bin/comms                    dispatcher CLI (routes to lib/, preserves exit codes)
 bin/comms-poll-driver        generic poll driver: delivers rows to any command, cursor advances only on exit 0
 lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
@@ -476,6 +547,7 @@ lib/comms_feed.py            cursor-free NDJSON window onto one mailbox run
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests
 adapters/probe/              the push probe, runnable: arm it, run the runtime, get PUSH / NOT-PUSH / COULD-NOT-DETERMINE
 adapters/claude-code/        push adapter: PostToolUse heartbeat + installer + comms-say skill (phrase -> 1-1 send)
+  settings_edit.py           the ONE safe writer for a JSON hooks config: lock, backup, concurrency re-check, atomic replace
 adapters/codex/              wires the same heartbeat into ~/.codex/hooks.json + owns the AGENTS.md reply block
 adapters/gemini/             poll recipe + AfterTool tool-name shim and installer for the owed push probe
 adapters/kimi/               resume-driver for a runtime with no hook surface
@@ -497,6 +569,18 @@ bash tests/test_swarm_heartbeat.sh
 bash tests/test_comms_cli.sh
 bash tests/test_push_probe.sh
 bash tests/test_poll_driver.sh
+bash tests/test_install_parity.sh
 ```
 
 All suites isolate their writes to temp dirs; nothing touches real state.
+
+`test_install_parity.sh` is the executable form of "anyone who installs should
+have the functionality the author has": it installs into a `mktemp` HOME and
+asserts the resulting tree and settings entries. It covers idempotence, refusal
+on a corrupt config, refusal on a concurrent write, symlinked config targets,
+uninstall and repair. It also pins two traps shut: presence must be judged on
+the script NAME (an exact-string match would not recognise a shim-routed wiring
+and would add a second heartbeat entry, and two beats advancing one delivery
+cursor is silent message loss), and a skipped verification must report 2, never
+0. If `python3 -m pytest` finds no pytest, run the suites through
+`uv run --with pytest python -m pytest tests -q`.

@@ -44,6 +44,7 @@ for f in \
     adapters/claude-code/stdin-bounded.sh \
     adapters/claude-code/skills/comms-say/SKILL.md \
     adapters/claude-code/install-skill.sh \
+    adapters/claude-code/settings_edit.py \
     bin/comms; do
   [ -e "$REPO_ROOT/$f" ] || fail "missing $REPO_ROOT/$f -- incomplete checkout?"
 done
@@ -53,48 +54,36 @@ done
 # wiring can never point at a file that does not exist on this machine.
 HOOK_CMD="bash $SELF_DIR/swarm-heartbeat.sh"
 
-export COMMS_HOOK_CMD="$HOOK_CMD" COMMS_SETTINGS_TARGET="$SETTINGS"
-python3 - <<'PY' || fail "settings.json edit failed"
-import json
-import os
-import sys
-
-path = os.environ["COMMS_SETTINGS_TARGET"]
-cmd = os.environ["COMMS_HOOK_CMD"]
-try:
-    with open(path) as fh:
-        settings = json.load(fh)
-except FileNotFoundError:
-    settings = {}
-except json.JSONDecodeError as exc:
-    # Refusing beats clobbering: a rewrite of an unparseable settings file
-    # would silently destroy whatever the broken bytes were.
-    sys.stderr.write("refusing to edit %s: not valid JSON (%s)\n" % (path, exc))
-    sys.exit(1)
-
-hooks = settings.setdefault("hooks", {})
-ptu = hooks.setdefault("PostToolUse", [])
-present = any(
-    "swarm-heartbeat.sh" in (h.get("command") or "")
-    for entry in ptu
-    if isinstance(entry, dict)
-    for h in (entry.get("hooks") or [])
-    if isinstance(h, dict)
-)
-if present:
-    print("hook wiring: already present in %s, left untouched" % path)
-else:
-    ptu.append({"matcher": "*", "hooks": [{"type": "command", "command": cmd}]})
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = path + ".comms-tmp"
-    with open(tmp, "w") as fh:
-        json.dump(settings, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
-    print("hook wiring: added PostToolUse swarm-heartbeat entry to %s" % path)
-PY
+# The edit itself is delegated to settings_edit.py, the ONE safe writer for
+# this file (read its header). The block that used to live here parsed the
+# file, mutated it, and wrote it back with no check that the bytes on disk were
+# still the bytes it had read -- so a concurrent write by a live Claude session
+# was silently discarded, and a lost hooks block is indistinguishable from
+# corruption. The writer adds: a lock, a backup, a staged parse, a
+# re-check-then-atomic-replace, and symlink-safe resolution.
+#
+# PRESENCE IS JUDGED ON THE SCRIPT NAME, deliberately, and this must not be
+# "harmonised" to an exact-string match. The live wiring on a machine running
+# the harness routes through a dispatch shim:
+#   bash $HOME/.claude/state/bin/hook-shim.sh gate $HOME/.claude/hooks/swarm-heartbeat.sh
+# An exact match would not recognise that working wiring and would append a
+# SECOND heartbeat entry. Both beats then advance the ONE delivery cursor keyed
+# on (runid, agent_id), so one beat consumes rows the other never emitted:
+# silent message loss, not a visible duplicate.
+python3 "$SELF_DIR/settings_edit.py" add \
+  --file "$SETTINGS" \
+  --event PostToolUse \
+  --matcher '*' \
+  --command "$HOOK_CMD" \
+  --match-substring swarm-heartbeat.sh
+EDIT_RC=$?
+case "$EDIT_RC" in
+  0) ;;
+  3) fail "settings.json is not valid JSON -- REFUSED, nothing written. Fix or restore it, then re-run." ;;
+  4) fail "settings.json changed under us (concurrent write) -- REFUSED, nothing overwritten. Re-run." ;;
+  5) fail "could not take the settings lock -- another comms installer is running." ;;
+  *) fail "settings.json edit failed (rc=$EDIT_RC)" ;;
+esac
 
 # ---- (b2) install the comms-say skill, idempotently -----------------------
 bash "$SELF_DIR/install-skill.sh" || fail "comms-say skill install failed"
@@ -104,12 +93,36 @@ echo "comms CLI: $REPO_ROOT/bin/comms"
 echo "suggested alias: alias comms='$REPO_ROOT/bin/comms'"
 
 # ---- (d) post-install verification: run the existing suites ---------------
-if ! python3 -m pytest --version >/dev/null 2>&1; then
-  noverify "pytest not available (python3 -m pytest); install pytest and re-run"
+# TEST SEAM, NOT AN ESCAPE HATCH. COMMS_SKIP_VERIFY=1 skips the suites and
+# says so. It exists because tests/test_install_parity.sh installs a dozen
+# times into throwaway HOMEs to check the resulting TREE, and re-running the
+# whole corpus on each of those installs would make the parity suite cost
+# minutes to prove something the suites do not speak to. It reports rc=2
+# (could-not-verify), never 0: a skipped verification must never be able to
+# masquerade as a passed one, whatever set the variable.
+if [ "${COMMS_SKIP_VERIFY:-0}" = "1" ]; then
+  echo "install: wiring complete; verification SKIPPED (COMMS_SKIP_VERIFY=1)"
+  noverify "verification was skipped by request; run the suites yourself"
 fi
 
-python3 -m pytest "$REPO_ROOT/tests" -q
-PYTEST_RC=$?
+# PYTEST IS NOT ON THIS MACHINE'S python3 -- any of them. Gating on
+# `python3 -m pytest` made the step that proves the install works the one step
+# that could never run, so a fresh machine got exit 2 ("COULD NOT VERIFY")
+# every single time, and exit 2 is not a pass. The fix is to reach a runner
+# that EXISTS, not to drop the verification: try the interpreter's own pytest
+# first, then uv, which can fetch pytest into a throwaway env. Only when
+# neither route exists is this genuinely unverifiable, and only then exit 2.
+if python3 -m pytest --version >/dev/null 2>&1; then
+  echo "verification: running pytest via python3 -m pytest"
+  python3 -m pytest "$REPO_ROOT/tests" -q
+  PYTEST_RC=$?
+elif command -v uv >/dev/null 2>&1; then
+  echo "verification: python3 has no pytest; running it via uv"
+  uv run --with pytest python -m pytest "$REPO_ROOT/tests" -q
+  PYTEST_RC=$?
+else
+  noverify "no pytest and no uv; install either (python3 -m pip install pytest) and re-run"
+fi
 bash "$REPO_ROOT/tests/test_swarm_heartbeat.sh"
 HB_RC=$?
 bash "$REPO_ROOT/tests/test_comms_cli.sh"
