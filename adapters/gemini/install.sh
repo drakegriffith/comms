@@ -22,6 +22,10 @@ import os
 import sys
 
 path = os.environ["COMMS_GEMINI_TARGET"]
+# Symlink-safe: os.replace does not write THROUGH a symlink, it unlinks it and
+# drops a plain file in its place. A dotfile-managed config would be silently
+# severed from its repo. Resolve first so the edit lands in the real file.
+path = os.path.realpath(path)
 command = os.environ["COMMS_GEMINI_COMMAND"]
 uninstall = os.environ["COMMS_GEMINI_MODE"] == "--uninstall"
 
