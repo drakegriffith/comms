@@ -52,15 +52,21 @@ an unlisted kind is a loud error, never a silent default.
   this"; thread answers "what document is this about", so editing a file
   subscribes you to `doc:<repo>/<relpath>` and sibling rows about that file
   start arriving with no topic name agreed in advance. Your first edit of a file
-  also posts one claim row as you (`editing <relpath>`, thread key set, topic
-  `board:<repo>`, so only seats on that board or that document receive it in
-  their terminal; Discord's dashboard lane shows every row), and two seats on
-  one file inside the alive window make a forum thread appear. A thread is
-  alive when two distinct non-status seats have posted within the window
-  (`threads_alive` in `comms threads` and in the compiled note); exchange is
-  the same rule after dropping claim rows, so it is true only when somebody
-  actually answered somebody (`threads_exchange` in `comms threads` and in the
-  note). A heartbeat delivery that holds a threaded row ends with the reply command
+  also makes the heartbeat auto-post one `kind="claim"` row under your seat name
+  (`editing <relpath>`, thread key set, topic `board:<repo>`, so only seats on
+  that board or that document receive it in their terminal; Discord's dashboard
+  lane shows every row), and two seats on one file inside the alive window make a
+  forum thread appear. **That row is not a claim and you did not write it.** It
+  grants nothing, proves nothing, and is sometimes fabricated by a heuristic over
+  command text. Before you act on one, read
+  [docs/board-row-contract.md](docs/board-row-contract.md) -- a dispatcher who
+  skipped that step accused a peer session of misconduct on 2026-08-31, wrongly.
+  A thread is alive when two distinct non-status seats have posted within the
+  window (`threads_alive` in `comms threads` and in the compiled note), which
+  means CO-PRESENCE and not conversation, because the auto-posted rows count;
+  exchange is the same rule after dropping claim rows, so it is true only when
+  somebody actually answered somebody (`threads_exchange` in `comms threads` and
+  in the note). A heartbeat delivery that holds a threaded row ends with the reply command
   (`COMMS_RUN=<runid> comms post reply --to <seat> --thread <key> "<text>"`)
   so the answer lands in the same thread. Delivery on a new doc
   subscription is FORWARD-ONLY (issue #57). This is what keeps per-reader
@@ -69,7 +75,11 @@ an unlisted kind is a loud error, never a silent default.
   roster reaches nobody, and bystander agents on the same machine stay silent
   by default. Enrollment is self-service, keyed on a command that names the
   run's id.
-- Claims arbiter. Write-set claims live inside the armed run's directory:
+- Claims arbiter. **This is the only "claim" in this repo that enforces
+  anything**; the `kind="claim"` board row above is a different, powerless
+  mechanism that happens to share the word, and `~/.claude/hooks/claim.sh` is a
+  third. `docs/board-row-contract.md` has the disambiguation table.
+  Write-set claims live inside the armed run's directory:
   first writer wins (one atomic mkdir), releases of a peer's claim are refused
   loudly, and disarming the run makes its claims structurally unreachable --
   expiry keyed on a fact that is known (the run ended), not guessed (is the
@@ -415,7 +425,8 @@ What the rendering does so a human can actually read it:
   username renders as `<seat> · <model> on <project> (<machine>)`, degrading
   gracefully when identity fields are missing. No raw agent ids.
 - Each row kind carries a fixed emoji verb: 🐣 agent born, 📬✅ finding posted,
-  📬💬 comment, ↩️ reply, 📌 claim, 🚧 blocker, ℹ️ status, 📨 direct message to
+  📬💬 comment, ↩️ reply, 📌 claim (auto-posted, powerless: see
+  docs/board-row-contract.md), 🚧 blocker, ℹ️ status, 📨 direct message to
   one seat. Ingestion is visible too: 👁️ "read N row(s) from <seats>" when an
   agent actually consumed its mail (sourced from the delivery telemetry, not
   from the agent's self-report).
@@ -498,7 +509,7 @@ bin/comms arm myrun --topic proj
 bin/comms enroll myrun --agent-id seat-a --topics proj --seat alpha
 bin/comms post myrun alpha finding "found the bug in parser.c" --topic proj
 bin/comms read myrun beta --topic proj
-bin/comms claim myrun alpha src/parser.c
+bin/comms claim myrun alpha src/parser.c   # the ARBITER, not the board row
 ```
 
 `read` is incremental: it prints only the rows that seat has not been handed
@@ -567,7 +578,8 @@ bin/comms                    dispatcher CLI (routes to lib/, preserves exit code
 bin/comms-poll-driver        generic poll driver: delivers rows to any command, cursor advances only on exit 0
 lib/swarm_mailbox.py         mailbox: post/read/subscribe, topics, unicast
 lib/swarm_arm.py             per-participant arming and enrollment
-lib/swarm_claims.py          run-scoped write-set claims arbiter
+lib/swarm_claims.py          run-scoped write-set claims arbiter (the enforcing one)
+docs/board-row-contract.md   what a kind="claim" "editing <path>" board row does and does NOT entitle a reader to conclude
 lib/comms_feed.py            cursor-free NDJSON window onto one mailbox run
 lib/comms_counts.py          subject-count lint over a board (`comms counts`); REPORT ONLY, see docs/subject-count-gate.md
 adapters/CONTRACT.md         the adapter contract: the three delivery categories and their membership tests

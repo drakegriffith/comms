@@ -15,8 +15,22 @@ WHAT A THREAD KEY IS: lib/swarm_mailbox.thread_key turns a path into
 "doc:<repo>/<relpath>"; a row that carries one has a `thread` field. This
 module never derives a key -- it only groups rows that already have one.
 
+ALIVE MEANS CO-PRESENCE, NOT CONVERSATION. Read this before you quote an
+`alive` count at a human. The overwhelming majority of rows carrying a thread
+key are `kind="claim"` rows that no agent composed: the heartbeat's doc-enrol
+leg auto-posts them, sometimes from a heuristic over command TEXT rather than
+over any write. alive() counts them, so `alive=True` means "two seats were
+associated with one document close together in time", which is exactly the
+co-presence signal the board exists to surface -- and is NOT evidence that
+anybody said anything, held a claim, wrote the file, or that the file exists.
+exchange() below is the predicate for "somebody actually answered somebody".
+Measured 2026-08-31 over every row in /tmp/comms-*/*.jsonl: 2605 doc threads,
+284 alive, 5 with an exchange; 279 of the 284 were alive on auto-posted claim
+rows alone. The full ruling on what these rows entitle a reader to conclude is
+docs/board-row-contract.md; do not re-derive it from this file.
+
 THE ALIVE PREDICATE (P4), in words: a thread is alive when at least
-`min_seats` DISTINCT seats have said something non-status in it, AND some
+`min_seats` DISTINCT seats have a non-status row in it, AND some
 consecutive pair of those rows comes from two DIFFERENT seats no more than
 `window_s` apart. Both halves are load-bearing:
 
@@ -25,9 +39,12 @@ consecutive pair of those rows comes from two DIFFERENT seats no more than
   * a timely pair alone would render a thread where one seat posted twice in
     a minute -- a monologue with good rhythm.
 
-Together they mean "somebody answered somebody, recently". That is the thing
-a human reading a board wants a thread for; everything else is a log line,
-and the un-threaded channel already carries those.
+Together they mean "two seats were on this document, near each other in time".
+That is worth a thread: it is the unclaimed-collision case the write-set
+arbiters structurally cannot see, because they only know about seats that
+claimed. It is NOT "somebody answered somebody" -- that is exchange(), and the
+two came apart the moment auto-posted claim rows became the dominant producer
+of thread keys.
 
 STATUS ROWS DO NOT COUNT, either as a speaker or as a step in the sequence.
 The ambient "session started in <dir>" row is a birth announcement; counting
@@ -56,8 +73,12 @@ DEFAULT_MIN_SEATS = 2
 # The kind that announces a seat rather than saying anything in the thread.
 STATUS_KIND = "status"
 
-# The kind that announces a seat is taking a file ("editing <relpath>"),
-# auto-posted by the heartbeat's doc-enrol leg. It is a claim, not talk.
+# The kind the heartbeat's doc-enrol leg auto-posts ("editing <relpath>").
+# The NAME is a historical accident, kept because VALID_KINDS is a
+# cross-machine wire vocabulary and 3737 rows already carry it: it has nothing
+# to do with hooks/claim.sh or with this repo's own bin/comms claim arbiter,
+# and it grants and proves nothing. It is not talk either. See
+# docs/board-row-contract.md.
 CLAIM_KIND = "claim"
 
 THREAD_FIELD = "thread"
@@ -137,9 +158,15 @@ def _speaking_rows(rows):
 
 
 def alive(rows, window_s=DEFAULT_WINDOW_S, min_seats=DEFAULT_MIN_SEATS):
-    """True if `rows` (one thread's rows) are a live conversation: at least
+    """True if `rows` (one thread's rows) show CO-PRESENCE: at least
     `min_seats` distinct non-status seats, AND some consecutive pair from two
     different seats separated by 0 < gap <= window_s.
+
+    NOT "a live conversation" -- see the module docstring. Auto-posted
+    kind=claim rows count here, and they are the dominant producer, so a True
+    from this predicate entitles a reader to "two seats were associated with
+    this document close together in time" and nothing further. Use exchange()
+    when the question is whether anybody spoke.
 
     in: rows, a list of row dicts (any order, any mix of kinds); window_s,
       seconds; min_seats, a count.
