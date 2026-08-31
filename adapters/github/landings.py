@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """GitHub landings watcher: poll GitHub for merged/closed PRs and closed
 issues, post one Discord line per landing WITH attribution ("who merged/
-closed what"), to the main comms channel.
+closed what"), to the dedicated landings channel if one is configured
+(DISCORD_COMMS_LANDINGS_WEBHOOK_URL) and otherwise to the main comms
+channel (DISCORD_COMMS_WEBHOOK_URL) -- see SECRET_VAR below.
 
 WHY: landing events (merge, close) come from GitHub, not this machine's
 local mailbox -- adapters/discord/mirror.py tails the mailbox, which has
@@ -115,9 +117,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(SELF_DIR))
 sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "discord"))
 import mirror  # noqa: E402  (reused Discord machinery: post_content, machine_label)
 
-SECRET_VAR = "DISCORD_COMMS_WEBHOOK_URL"  # the MAIN channel -- landings are
-# dashboard/outcome news, not agent-to-agent chatter, so this deliberately
-# reuses mirror.py's default-lane var, never the convo lane's.
+LANDINGS_SECRET_VAR = "DISCORD_COMMS_LANDINGS_WEBHOOK_URL"  # a channel of
+# landings' OWN, checked FIRST: landings are a steady dashboard feed, and on a
+# busy day they drown the main channel's human-readable traffic. Optional --
+# see SECRET_VAR below for what happens when it is unset.
+SECRET_VAR = "DISCORD_COMMS_WEBHOOK_URL"  # the MAIN channel -- the FALLBACK,
+# used whenever LANDINGS_SECRET_VAR is set nowhere (env or secrets file), so a
+# machine that never configures the split keeps its existing behavior exactly.
+# Landings are dashboard/outcome news, not agent-to-agent chatter, so this
+# deliberately reuses mirror.py's default-lane var, never the convo lane's.
 
 CONTENT_CAP = 1900  # same headroom under Discord's 2000-char cap as mirror.py
 
@@ -517,13 +525,15 @@ def chunk_events(events, cap=CONTENT_CAP):
     return chunks
 
 
-def _find_webhook_url():
-    """No side effects -- see mirror.py's _find_webhook_url for why this is
-    factored apart from resolve_webhook_url (the launchd-safety quiet-check
-    path)."""
-    url = os.environ.get(SECRET_VAR)
-    if url:
-        return url
+def _find_config_var(var):
+    """Two-step lookup for ONE var name: the process environment first, then a
+    line scan of the secrets file ($COMMS_SECRETS_FILE, else
+    ~/.secrets/comms.env). Returns None when both miss. No side effects -- both
+    webhook vars share this one code path so they can never drift apart in how
+    they are read."""
+    val = os.environ.get(var)
+    if val:
+        return val
     path = os.environ.get("COMMS_SECRETS_FILE") or os.path.expanduser(
         "~/.secrets/comms.env"
     )
@@ -531,13 +541,24 @@ def _find_webhook_url():
         with open(path) as fh:
             for line in fh:
                 line = line.strip()
-                if line.startswith(SECRET_VAR + "="):
+                if line.startswith(var + "="):
                     val = line.split("=", 1)[1].strip().strip("'\"")
                     if val:
                         return val
     except OSError:
         pass
     return None
+
+
+def _find_webhook_url():
+    """The ONE resolution site for this module's webhook. Precedence:
+    LANDINGS_SECRET_VAR (env, then secrets file) wins; only when BOTH of its
+    steps miss does SECRET_VAR get looked up the same way. With the landings
+    var configured nowhere this is byte-identical to the pre-split behavior.
+    No side effects -- see mirror.py's _find_webhook_url for why this is
+    factored apart from resolve_webhook_url (the launchd-safety quiet-check
+    path)."""
+    return _find_config_var(LANDINGS_SECRET_VAR) or _find_config_var(SECRET_VAR)
 
 
 def resolve_webhook_url():
@@ -547,9 +568,13 @@ def resolve_webhook_url():
     sys.stderr.write(
         "github landings: no webhook configured.\n"
         "  1. open -e ~/.secrets/comms.env\n"
-        "  2. add line: %s=<paste webhook URL from the MAIN comms Discord "
-        "channel settings>\n"
-        "  3. chmod 600 ~/.secrets/comms.env\n" % SECRET_VAR
+        "  2. add line: %s=<paste webhook URL from the DEDICATED landings "
+        "Discord channel settings> -- recommended, it keeps the landings feed "
+        "out of the main channel\n"
+        "     (or, to keep posting into the main channel, add line: %s=<its "
+        "webhook URL> instead -- still supported as the fallback)\n"
+        "  3. chmod 600 ~/.secrets/comms.env\n"
+        % (LANDINGS_SECRET_VAR, SECRET_VAR)
     )
     sys.exit(2)
 
