@@ -23,6 +23,7 @@ no longer share (and cannot shadow each other on) one high-water mark. The
 specific starting point.
 """
 
+import datetime
 import json
 import os
 import sys
@@ -33,6 +34,20 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "adapters", "github"))
 
 import landings  # noqa: E402
+
+
+# The whole file's fixtures are stamped on this day (see _pr/_issue call
+# sites: "2026-08-24T10:00:00Z"). landings.py seeds a first-sight cursor from
+# start-of-today UTC (_today_utc_start -> _utcnow), so a real clock makes the
+# floor march past the fixtures and the suite goes red on a calendar boundary
+# rather than on a code change. Freeze the module's ONE clock seam instead of
+# bumping the fixture dates, which would only re-arm the same bomb.
+FROZEN_NOW = datetime.datetime(2026, 8, 24, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def frozen_clock(monkeypatch):
+    monkeypatch.setattr(landings, "_utcnow", lambda: FROZEN_NOW)
 
 
 @pytest.fixture(autouse=True)
