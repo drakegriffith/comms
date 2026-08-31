@@ -225,6 +225,12 @@ Installed. Optional adapters -- none of these were touched:
   discord mirror         bash $REPO_ROOT/adapters/discord/install.sh
                          (preflight only; needs DISCORD_COMMS_WEBHOOK_URL in
                           ~/.secrets/comms.env, and it writes nothing itself)
+  github landings        python3 $REPO_ROOT/adapters/github/landings.py --once
+                         (no installer; polls gh api for merged/closed PRs and
+                          issues and posts them with attribution. Optional
+                          DISCORD_COMMS_LANDINGS_WEBHOOK_URL sends them to a
+                          channel of their own; without it they fall back to
+                          the main DISCORD_COMMS_WEBHOOK_URL channel)
   launchd nightly job    bash $REPO_ROOT/adapters/launchd/install.sh
                          (writes the plist; you run launchctl yourself)
   remote seats           bash $REPO_ROOT/adapters/remote/install.sh

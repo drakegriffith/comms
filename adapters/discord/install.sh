@@ -93,6 +93,13 @@ DISCORD_COMMS_WEBHOOK_URL. Never run two of these against the same
 (runid or "every run") AND the same lane at once -- see README.md,
 Concurrency.
 
+NOTE: the GitHub landings watcher (adapters/github/landings.py) is not one of
+these lanes and needs no secret of its own -- it posts to
+DISCORD_COMMS_LANDINGS_WEBHOOK_URL when that OPTIONAL var is set (env or the
+secrets file, same drop-in steps as above) and otherwise falls back to
+DISCORD_COMMS_WEBHOOK_URL, the channel above. Not checked here, and never a
+reason this script fails: see adapters/github/README.md.
+
 "--follow-all --lane convo" ALSO tails the heartbeat-telemetry ingestion
 log each pass (adapters/discord/ingest_mirror.py), posting a "heard from
 mailbox" event when the heartbeat hook delivers new rows to an agent -- one
@@ -100,6 +107,9 @@ process, no second launchd job. It has its own standalone CLI too, if you
 want it separate:
   python3 $SELF_DIR/ingest_mirror.py --once
   python3 $SELF_DIR/ingest_mirror.py --follow            # poll loop
+Set DISCORD_COMMS_CONVO_INGEST=0 (default 1) to stop posting those "read N
+row(s)" lines; the ingest cursor keeps advancing while it is off, so turning
+it back on does not replay the backlog. Mailbox rows in convo are unaffected.
 See README.md, Ingestion events.
 
 Keep it alive under launchd (optional): save as
@@ -135,6 +145,7 @@ Env knobs: COMMS_AUDIENCE (engineer|everyone, the channel's vocabulary),
 COMMS_MACHINE_LABEL (prefix; default hostname -s),
 COMMS_ROOT (mailbox root), COMMS_STATE_DIR (cursor/skipped/held state),
 COMMS_SECRETS_FILE (default ~/.secrets/comms.env), COMMS_MIRROR_INTERVAL.
+Convo lane only: DISCORD_COMMS_CONVO_INGEST (0|1, default 1).
 Board lane only: COMMS_THREAD_ALIVE_SECONDS (default 1800),
 COMMS_THREAD_ALIVE_SEATS (2), COMMS_THREAD_HOLD_MAX (500).
 

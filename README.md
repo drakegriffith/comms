@@ -94,7 +94,7 @@ is per-runtime sugar on top.
 | Grok (xAI)  | poll     | runs Claude-shaped hooks but was measured NOT to inject `additionalContext`, so a hook would drop every row; briefed poll loop instead (`adapters/grok/` -- carries the probe that would upgrade it to push) |
 | Discord     | mirror   | `adapters/discord/` mirrors mailbox rows to a channel (in flight, issue #2) |
 | Claude Code (ambient) | push + mirror | `adapters/claude-code/ambient/` -- SessionStart + SendMessage-bridge hooks enroll every session into standing run `machine-ops` (topic `ops`; only message SUMMARIES are bridged), mirrored to Discord as the machine dashboard |
-| GitHub (landings) | poll + mirror | `adapters/github/` polls `gh api` for merged/closed PRs and closed issues, posts each to Discord with attribution ("who merged/closed what") -- source is GitHub itself, not the comms mailbox |
+| GitHub (landings) | poll + mirror | `adapters/github/` polls `gh api` for merged/closed PRs and closed issues, posts each to Discord with attribution ("who merged/closed what") -- source is GitHub itself, not the comms mailbox. Channel: the dedicated landings one when `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` is set, else the main channel |
 | another machine | ssh push + poll | `adapters/remote/` -- one machine's mailbox is the hub; the other pushes rows into it and pulls its slice back, over plain ssh. The hub runs no new code (only `bin/comms post`/`read`), and outbound rows queue locally while it is unreachable |
 | Hermes (NousResearch) | owed (adapter ready, unprobed) | `pre_llm_call` shell-hook shim around the one heartbeat, poll test and push probe owed; enrol with the session id as agent id (`adapters/hermes/`) |
 | any app (window) | cursor-free feed | `adapters/window/` -- `comms feed <runid> --follow` emits rendered NDJSON for an app-owned UI without Discord |
@@ -398,10 +398,13 @@ tails mailbox files and posts each row to a webhook, and it is built for two
 channels with two different jobs:
 
 - **The dashboard lane** (default): a machine-level feed. Agents announce
-  themselves as they enroll, and the GitHub landings watcher
-  (`adapters/github/`) posts what actually shipped: 🟣 merged PR, ❌ PR closed
-  unmerged, ✅ issue closed -- each with who merged or closed it, discovered by
-  polling `gh api` across every repo you pushed to recently.
+  themselves as they enroll, and -- unless you give landings a channel of
+  their own -- the GitHub landings watcher (`adapters/github/`) posts what
+  actually shipped here too: 🟣 merged PR, ❌ PR closed unmerged, ✅ issue
+  closed, each with who merged or closed it, discovered by polling `gh api`
+  across every repo you pushed to recently. Landings appear in this channel
+  ONLY when `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` is unset; set it and the same
+  feed goes to that channel instead.
 - **The conversation lane** (`--lane convo`): agent-to-agent traffic only --
   unicast rows and conversational kinds. This is where you watch one agent
   challenge another mid-run.
@@ -423,9 +426,11 @@ What the rendering does so a human can actually read it:
   crash-looping.
 
 Wiring: create a webhook per channel in Discord, export
-`DISCORD_COMMS_WEBHOOK_URL` (dashboard) and `DISCORD_COMMS_CONVO_WEBHOOK_URL`
-(conversation), then run `adapters/discord/install.sh` -- it preflights and
-prints the exact run commands, and deliberately writes nothing.
+`DISCORD_COMMS_WEBHOOK_URL` (dashboard), `DISCORD_COMMS_CONVO_WEBHOOK_URL`
+(conversation) and, optionally, `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` (a
+landings-only channel; without it landings fall back to the dashboard one),
+then run `adapters/discord/install.sh` -- it preflights and prints the exact
+run commands, and deliberately writes nothing.
 
 ### Who is reading the channel? One switch, two vocabularies
 
