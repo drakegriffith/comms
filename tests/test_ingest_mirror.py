@@ -354,6 +354,37 @@ def test_ingest_enabled_only_literal_zero_disables(monkeypatch):
     assert im.ingest_enabled() is False
 
 
+def test_ingest_enabled_tolerates_whitespace_around_zero(monkeypatch):
+    # A value copied from a plist or shell with a stray space must still
+    # disable -- " 0" quietly leaving the posts on is the trap (kimi-review
+    # finding 2, 2026-08-31).
+    monkeypatch.setenv(im.ENABLE_VAR, " 0 ")
+    assert im.ingest_enabled() is False
+    monkeypatch.setenv(im.ENABLE_VAR, "0\n")
+    assert im.ingest_enabled() is False
+
+
+def test_tail_once_disabled_after_rotation_saves_the_reset_cursor(webhook, monkeypatch):
+    # Rotation while the switch is off: the offset>size reset must be SAVED
+    # on the disabled pass, not left stale (codex-review finding 4,
+    # 2026-08-31), so re-enabling resumes from the new file's end.
+    _enroll("agentA", "alpha", topics=[])
+    swarm_mailbox.post(RUNID, "beta", "finding", "row1", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    url = os.environ["DISCORD_COMMS_CONVO_WEBHOOK_URL"]
+    assert im.tail_once(url) == 0                 # enabled pass posts row1
+    assert len(webhook.requests) == 1
+    path = im._log_path()
+    with open(path, "w") as fh:                   # rotation: shorter file
+        fh.write(json.dumps({"at": "y", "agent_id": "agentA", "runid": RUNID,
+                             "topic": "default", "rows_inspected": 1,
+                             "delta_emitted": 1, "short_circuit": False}) + "\n")
+    monkeypatch.setenv(im.ENABLE_VAR, "0")
+    assert im.tail_once(url) == 0
+    assert im._load_offset() == os.path.getsize(path)  # reset saved
+    assert len(webhook.requests) == 1             # disabled pass posted nothing
+
+
 def test_tail_once_disabled_advances_cursor_and_posts_nothing(webhook, monkeypatch):
     monkeypatch.setenv(im.ENABLE_VAR, "0")
     _enroll("agentA", "alpha", topics=[])

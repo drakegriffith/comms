@@ -530,8 +530,10 @@ def _find_config_var(var):
     line scan of the secrets file ($COMMS_SECRETS_FILE, else
     ~/.secrets/comms.env). Returns None when both miss. No side effects -- both
     webhook vars share this one code path so they can never drift apart in how
-    they are read."""
-    val = os.environ.get(var)
+    they are read. Env values are stripped, matching the file scan below: a
+    whitespace-only value would otherwise count as configured, block the
+    fallback var, and hand delivery an unpostable URL."""
+    val = (os.environ.get(var) or "").strip()
     if val:
         return val
     path = os.environ.get("COMMS_SECRETS_FILE") or os.path.expanduser(

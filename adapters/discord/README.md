@@ -563,6 +563,13 @@ replay of the backlog accumulated meanwhile. Mailbox-row mirroring in the
 convo lane is untouched by this knob -- unicasts and `comment`/`reply` rows
 post exactly as before.
 
+One hazard the general concurrency warning above does not cover: never run a
+DISABLED standalone pass (`DISCORD_COMMS_CONVO_INGEST=0 ingest_mirror.py
+--once`) while an ENABLED follower is live on the same state dir. The
+disabled pass advances the shared cursor without posting, so rows it read
+are delivered by neither process -- a silent drop, where two enabled pollers
+would at worst double-post.
+
 Same launchd safety as the row mirror: a missing `DISCORD_COMMS_CONVO_WEBHOOK_URL`
 warns once and backs off 60s under `--follow` instead of crash-looping; a
 per-pass exception is caught, named on one stderr line, and does not kill

@@ -697,6 +697,22 @@ def test_landings_var_absent_falls_back_to_main_var(monkeypatch):
     assert landings.resolve_webhook_url() == "http://127.0.0.1:1/main"
 
 
+def test_whitespace_only_landings_env_var_falls_back_to_main(monkeypatch):
+    # A whitespace-only env value must count as unset, not as a configured
+    # (unpostable) URL that blocks the fallback (codex-review finding 3 /
+    # kimi-review finding 4, 2026-08-31).
+    monkeypatch.setenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", "   ")
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/main")
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/main"
+
+
+def test_padded_env_webhook_value_is_stripped(monkeypatch):
+    monkeypatch.setenv(
+        "DISCORD_COMMS_LANDINGS_WEBHOOK_URL", " http://127.0.0.1:1/landings "
+    )
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/landings"
+
+
 def test_landings_var_read_from_secrets_file_beats_main_var_in_env(
     tmp_path, monkeypatch
 ):

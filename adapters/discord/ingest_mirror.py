@@ -73,9 +73,16 @@ INGEST WIRE-UP) -- no second launchd job. This module also has its own
 OFF-SWITCH: DISCORD_COMMS_CONVO_INGEST=0 silences this module's posts
 without silencing mirror.py's mailbox-row mirroring on the same lane. The
 gate sits inside tail_once, downstream of the tail and the cursor write, so
-BOTH entry points (follow_all's per-pass call and this module's own CLI)
-honour it identically and the cursor keeps advancing while it is off -- see
-tail_once for why that matters.
+both entry points (follow_all's per-pass call and this module's own CLI)
+run the same count-but-skip pass -- see tail_once for why the cursor keeps
+advancing. Two honest limits: the standalone CLI still requires the convo
+webhook secret to run at all (--once exits 2 without it, --follow backs
+off), knob or no knob; and the cursor advances on any pass that parses at
+least one line -- a pass reading ONLY blank/partial bytes returns before
+the gate (pre-existing early return in tail_once) and re-reads them next
+pass. NEVER run a disabled standalone pass beside a live enabled follower:
+the disabled pass advances the shared cursor, so rows it read are posted
+by neither process (see README.md, Turning it off).
 
 CLI:
   ingest_mirror.py --once
@@ -121,8 +128,10 @@ ATTRIB_NAME = "heartbeat-ingest.attrib.json"  # per (runid, agent_id) replay wat
 
 
 def ingest_enabled():
-    """False only when DISCORD_COMMS_CONVO_INGEST is exactly "0"."""
-    return os.environ.get(ENABLE_VAR, "1") != "0"
+    """False only when DISCORD_COMMS_CONVO_INGEST is "0" (stray whitespace
+    tolerated -- a value copied out of a plist or shell with a padding space
+    must not silently leave the posts on)."""
+    return os.environ.get(ENABLE_VAR, "1").strip() != "0"
 
 
 def _state_dir():
