@@ -63,7 +63,8 @@ with "@", so unicast and fan-out never collide and old rows (no "@" topic) are
 unaffected.
 
 THREADS ARE ABOUT-NESS AND CAN ALSO BE SUBSCRIBED. A row may carry `thread`, a key naming
-the DOCUMENT it concerns (thread_key turns a path into "doc:<repo>/<relpath>").
+the DOCUMENT it concerns (thread_key turns an EXISTING ABSOLUTE path into
+"doc:<repo>/<relpath>"; a relative one is a ValueError, never a guess).
 topic/to answer "who receives this"; thread answers "what is this about". They
 are orthogonal and compose: a unicast can be threaded, a fan-out can be
 threaded, and a row with no thread behaves exactly as before. A subscription
@@ -323,8 +324,9 @@ def _repo_name(root):
 
 
 def thread_key(path):
-    """The thread name for `path`: "doc:<repo>/<relpath>", or None if `path`
-    lives outside any repo.
+    """The thread name for an EXISTING, ABSOLUTE `path`:
+    "doc:<repo>/<relpath>", or None if that path lives outside any repo or is
+    not there at all. A relative path is a ValueError, never a guess.
 
     <repo> is the basename of the NEAREST ancestor holding a `.git` entry;
     <relpath> is the POSIX-spelled path from that ancestor down. `path` is
@@ -346,20 +348,71 @@ def thread_key(path):
     `git rev-parse` costs a process spawn on every keystroke-scale edit (it
     also appears nowhere else in this repo). The marker test is a stat.
 
-    ONE ARGUMENT, deliberately: no repo_root= override. A test builds a real
-    directory with a real `.git`; an override would widen a production
-    interface so a test could avoid making one.
+    A RELATIVE PATH IS A HARD ERROR, not a resolution against os.getcwd().
+    This function cannot know what a relative path is relative to; the caller
+    can. Guessing cost the board its identity on 2026-08-31: the Claude-Code
+    hook leg handed a REPO-ROOT-relative path to a hook process running from a
+    subdirectory of that repo, realpath resolved it against that
+    subdirectory, and the key came out with the prefix twice
+    ("doc:.claude/<prefix>/<prefix>/briefs/COMMON.md"). Both keys for one
+    document sat in one mailbox file, so two seats editing that file were
+    split across two threads and never saw each other -- the exact silent
+    failure this function exists to prevent, produced by the function itself.
+    A caller with a relative path has a base in hand (the tool payload's cwd,
+    the repo root porcelain spoke relative to); it must join it and say so.
+
+    ONE ARGUMENT STILL, deliberately: no repo_root= and no base=/cwd=
+    override. A test builds a real directory with a real `.git`; an override
+    would widen a production interface so a test could avoid making one, and
+    a base= parameter would merely relocate the guess -- every caller that
+    forgot to pass it would be back to os.getcwd() by default. Refusing the
+    input is the version that cannot be forgotten.
 
     OUTSIDE ANY REPO IS None, never a fabricated key like "doc:tmp/x.md": a
     row with no thread takes the unthreaded path, which is a visible
     non-grouping. A made-up key is an invisible mis-grouping.
+
+    A PATH THAT DOES NOT EXIST IS None, for the same reason and by the same
+    rule. os.path.realpath does not require existence and the marker walk
+    still finds a real `.git` above a phantom, so this function used to mint
+    confident keys for files that were never there -- contradicting the
+    paragraph directly above it. The doubled keys landed here, and so did the
+    quieter shape: a repo-root-relative porcelain path joined onto a
+    subdirectory cwd produces an absolute path that LOOKS real
+    (".../docs/panels/hooks/decisions/run.sh") and cannot be caught by eye.
+    Existence is the only test that catches that one, and it is one stat.
+    The honest cost, stated: a file deleted between the write and the beat
+    loses its thread. That is a visible non-grouping, which this function
+    already prefers to an invisible mis-grouping. A dangling symlink is None
+    on the same rule (realpath dereferences first).
+
+    None therefore means "no thread for this path", from either cause. Callers
+    already branch on falsy and skip; nothing needs to tell the two apart, and
+    a caller that does can stat for itself.
 
     The repo root itself keys on the repo alone ("doc:comms"), not
     "doc:comms/." -- a deviation from the design note's literal formula,
     because this string becomes a human-visible Discord thread name and a
     trailing "." carries no information.
     """
+    if not isinstance(path, str) or not path:
+        raise ValueError(
+            "thread_key needs a non-empty absolute path string, got %r" % (path,)
+        )
+    if not os.path.isabs(path):
+        raise ValueError(
+            "thread_key needs an ABSOLUTE path; got the relative %r. Resolving "
+            "it against os.getcwd() is what produced doubled thread keys; join "
+            "it onto the base the caller knows before calling." % (path,)
+        )
+    # May raise ValueError on an embedded NUL. Deliberately NOT caught: the
+    # caller's leg is wrapped (adapters/claude-code/swarm-heartbeat.sh's
+    # doc_enrol try/except, exercised by test_swarm_heartbeat.sh case (s)),
+    # and a garbage path is a caller bug that should be visible on stderr,
+    # not a row that quietly loses its thread.
     real = os.path.realpath(path)
+    if not os.path.exists(real):
+        return None
     cur = real if os.path.isdir(real) else os.path.dirname(real)
     while True:
         if os.path.exists(os.path.join(cur, _REPO_MARKER)):

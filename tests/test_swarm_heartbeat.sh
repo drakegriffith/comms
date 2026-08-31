@@ -554,6 +554,13 @@ run_suite() {  # one fully-isolated pass
     REPONAME="$(basename "$REPO")"
     mkdir -p "$REPO/.git" "$REPO/sub"
     : > "$REPO/sub/a.py"; : > "$REPO/sub/b.py"; : > "$REPO/sub/c.py"
+    # m.py / n.ipynb exist for the same reason a.py does: PostToolUse fires
+    # AFTER the tool ran, so a MultiEdit or NotebookEdit payload in the field
+    # always names a file that is on disk. thread_key refuses to mint a key
+    # for a path that is not there (that rule is what kills the fabricated
+    # doubled keys), so a payload naming a file this fixture never created
+    # would be testing a state the hook cannot actually observe.
+    : > "$REPO/sub/m.py"; : > "$REPO/sub/n.ipynb"
 
     run_hook_raw "$(write_payload agentS Write "$REPO/sub/a.py")"
     ck "(s) a Write beat exits 0" "0" "$HOOK_RC"
@@ -728,6 +735,10 @@ run_suite() {  # one fully-isolated pass
     git -C "$REPO2" init -q
     : > "$REPO2/tracked.py"
     git -C "$REPO2" add tracked.py
+    # Same reason as $REPO/sub/m.py above: apply_patch has already written
+    # sub/n.py by the time the hook beats, so the fixture must too, or the
+    # payload names a path thread_key is right to refuse.
+    : > "$REPO2/sub/n.py"; : > "$REPO2/sub/u.py"
 
     patch_add='*** Begin Patch
 *** Add File: sub/n.py
