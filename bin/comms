@@ -79,6 +79,18 @@ metrics (lib/swarm_threads.py; exit 0 ok, 2 usage or the positive control --
              COMMS_THREAD_ALIVE_SECONDS (1800) / COMMS_THREAD_ALIVE_SEATS (2),
              the same knobs the Discord board lane reads.)
 
+lint (lib/comms_counts.py; exit 0 scanned, 2 usage or the positive control --
+      rows_inspected == 0 is never a quiet pass):
+  counts    [--board DIR] [--json] [--list]
+            (scans a board directory of JSONL files and reports what fraction
+             of EVIDENTIARY rows (finding|comment|reply|blocker, minus
+             auto-emitted bridge and ambient shapes) state a subject count AND
+             name an enumerator. REPORT ONLY: it never rejects a post. Board
+             defaults to COMMS_BOARD_DIR, else /tmp/comms-machine-ops.
+             READ docs/subject-count-gate.md: shape is not truth, and on the
+             live board every row this scanner called compliant failed
+             hand re-derivation.)
+
 arming (lib/swarm_arm.py; exit 0 ok, 1 not-armed, 2 usage):
   arm       <runid> [--topic <set>]
   disarm    <runid>
@@ -175,6 +187,12 @@ case "$sub" in
     # re-parsed, no env default is injected, the module's own docstring is
     # the authority on flags and exit codes.
     exec python3 "$LIB/swarm_threads.py" threads "$@"
+    ;;
+  counts)
+    # Same PURE EXEC router pattern as `threads`: the module's own main()
+    # expects argv[1] to be the subcommand name, so nothing is re-parsed here
+    # and the module's exit codes reach the caller unchanged.
+    exec python3 "$LIB/comms_counts.py" counts "$@"
     ;;
   arm|disarm|enroll|status)
     exec python3 "$LIB/swarm_arm.py" "$sub" "$@"
