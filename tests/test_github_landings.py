@@ -54,6 +54,7 @@ def frozen_clock(monkeypatch):
 def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("COMMS_SECRETS_FILE", str(tmp_path / "comms.env"))
     monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     monkeypatch.delenv("COMMS_GH_REPOS", raising=False)
     monkeypatch.delenv("COMMS_GH_OWNER", raising=False)
@@ -672,6 +673,116 @@ def test_main_once_exits_2_on_missing_secret(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         landings.main(["landings.py", "--once"])
     assert exc.value.code == 2
+
+
+# ---- landings-channel split: DISCORD_COMMS_LANDINGS_WEBHOOK_URL first ------
+#
+# The dedicated-channel var wins wherever it is set (env or the secrets file);
+# the MAIN-channel var is only consulted when BOTH of those miss. The
+# fallback cases below are the regression guard for machines that never
+# configure the split -- their behavior must not change at all.
+
+
+def test_landings_var_wins_over_main_var_when_both_set_in_env(monkeypatch):
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/main")
+    monkeypatch.setenv(
+        "DISCORD_COMMS_LANDINGS_WEBHOOK_URL", "http://127.0.0.1:1/landings"
+    )
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/landings"
+
+
+def test_landings_var_absent_falls_back_to_main_var(monkeypatch):
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/main")
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/main"
+
+
+def test_whitespace_only_landings_env_var_falls_back_to_main(monkeypatch):
+    # A whitespace-only env value must count as unset, not as a configured
+    # (unpostable) URL that blocks the fallback (codex-review finding 3 /
+    # kimi-review finding 4, 2026-08-31).
+    monkeypatch.setenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", "   ")
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/main")
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/main"
+
+
+def test_padded_env_webhook_value_is_stripped(monkeypatch):
+    monkeypatch.setenv(
+        "DISCORD_COMMS_LANDINGS_WEBHOOK_URL", " http://127.0.0.1:1/landings "
+    )
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/landings"
+
+
+def test_landings_var_read_from_secrets_file_beats_main_var_in_env(
+    tmp_path, monkeypatch
+):
+    """The landings var's SECOND lookup step (the secrets-file line scan)
+    still outranks the main var -- precedence is per-var, not per-source."""
+    secrets = tmp_path / "comms.env"
+    secrets.write_text(
+        "DISCORD_COMMS_LANDINGS_WEBHOOK_URL=http://127.0.0.1:1/from-file\n"
+    )
+    monkeypatch.setenv("COMMS_SECRETS_FILE", str(secrets))
+    monkeypatch.setenv("DISCORD_COMMS_WEBHOOK_URL", "http://127.0.0.1:1/main")
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/from-file"
+
+
+def test_main_var_in_secrets_file_still_resolves_with_no_landings_var(
+    tmp_path, monkeypatch
+):
+    secrets = tmp_path / "comms.env"
+    secrets.write_text("DISCORD_COMMS_WEBHOOK_URL=http://127.0.0.1:1/main-file\n")
+    monkeypatch.setenv("COMMS_SECRETS_FILE", str(secrets))
+    monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
+    assert landings.resolve_webhook_url() == "http://127.0.0.1:1/main-file"
+
+
+def test_run_once_delivers_to_the_landings_channel_when_configured(
+    fake_gh, posted, monkeypatch
+):
+    """End to end: the split reaches the actual POST, not just the resolver."""
+    monkeypatch.setenv(
+        "DISCORD_COMMS_LANDINGS_WEBHOOK_URL", "http://127.0.0.1:1/landings"
+    )
+    monkeypatch.setenv("COMMS_GH_REPOS", "acme/widgets")
+    fake_gh.add(["api", PULLS_URL], [
+        _pr(1, "One", "a", merged_at="2026-08-24T10:00:00Z"),
+    ])
+    fake_gh.add(["api", ISSUES_URL], [])
+    fake_gh.add(["api", "repos/acme/widgets/pulls/1"], {"merged_by": {"login": "a"}})
+    assert landings.run_once() == 0
+    assert posted[0][0] == "http://127.0.0.1:1/landings"
+
+
+def test_missing_secret_message_names_both_vars(monkeypatch, capsys):
+    monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        landings.resolve_webhook_url()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "DISCORD_COMMS_LANDINGS_WEBHOOK_URL=" in err
+    assert "DISCORD_COMMS_WEBHOOK_URL=" in err
+    assert "http" not in err  # never echo a URL into the transcript
+
+
+def test_follow_missing_secret_ignores_an_unset_landings_var(monkeypatch, capsys):
+    """--follow's quiet check must not gain a second noisy failure mode from
+    the split: one stderr line, one 60s backoff, exactly as before."""
+    monkeypatch.delenv("DISCORD_COMMS_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_LANDINGS_WEBHOOK_URL", raising=False)
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(landings.time, "sleep", fake_sleep)
+    assert landings.follow(120) == 0
+    assert sleeps == [60]
+    assert capsys.readouterr().err.count("\n") == 1
 
 
 # ---- CLI --------------------------------------------------------------------

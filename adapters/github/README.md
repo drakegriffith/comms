@@ -1,9 +1,10 @@
 # GitHub landings watcher
 
-Posts merged/closed PRs and closed issues to the main comms Discord channel,
-WITH attribution -- "who actually merged this, who actually closed that" --
-so a human watching the channel sees the whole fleet's outcomes, not just its
-chatter:
+Posts merged/closed PRs and closed issues to a Discord channel -- the
+dedicated landings channel when `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` is set,
+otherwise the main comms channel -- WITH attribution, "who actually merged
+this, who actually closed that", so a human watching the channel sees the
+whole fleet's outcomes, not just its chatter:
 
     github landings (studio): 🟣 alice merged PR #12 on comms: feat(github): landings watcher
     github landings (studio): ❌ dave closed PR #14 without merging on comms: Abandoned idea
@@ -56,13 +57,20 @@ voice, so there is no seat to attribute the POST to.
 
 1. Requires the `gh` CLI, authenticated (`gh auth status`).
 
-2. Drop the webhook secret in (same var, same channel, as
-   `adapters/discord/mirror.py`'s default lane -- landings post to the MAIN
-   channel, not a conversation lane):
+2. Drop the webhook secret in. Landings are dashboard/outcome news, never a
+   conversation lane, so the channel is either one of their own or the MAIN
+   channel -- `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` is checked first, and when
+   it is set nowhere (env or secrets file) delivery falls back to
+   `DISCORD_COMMS_WEBHOOK_URL`, the same var and channel as
+   `adapters/discord/mirror.py`'s default lane:
    1. `open -e ~/.secrets/comms.env`
    2. add line: `DISCORD_COMMS_WEBHOOK_URL=<paste webhook URL from the main
       channel's settings>`
-   3. `chmod 600 ~/.secrets/comms.env`
+   3. optional, to split landings off into their own channel: add line
+      `DISCORD_COMMS_LANDINGS_WEBHOOK_URL=<paste webhook URL from that
+      channel's settings>` -- on a busy day a steady landings feed drowns the
+      main channel's human-readable traffic
+   4. `chmod 600 ~/.secrets/comms.env`
 
    The URL is a credential: never commit it, never echo it. Read from the
    environment first, then that file; only the drop-in instructions print
@@ -120,7 +128,8 @@ on a very chatty repo.
 | `COMMS_LANDINGS_INTERVAL` | `120` | `--follow` poll seconds (overridden by `--interval`) |
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor + skipped-event records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line lives |
-| `DISCORD_COMMS_WEBHOOK_URL` | *(required)* | the main channel's webhook (same var as `mirror.py`'s default lane) |
+| `DISCORD_COMMS_LANDINGS_WEBHOOK_URL` | *(unset)* | optional: a landings-only channel's webhook, checked FIRST |
+| `DISCORD_COMMS_WEBHOOK_URL` | *(required unless the landings var is set)* | the main channel's webhook (same var as `mirror.py`'s default lane); the FALLBACK, used whenever the landings var is set nowhere |
 | `COMMS_MACHINE_LABEL` | `hostname -s` | machine half of the author line |
 
 ## launchd safety

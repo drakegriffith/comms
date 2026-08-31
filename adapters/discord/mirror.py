@@ -1304,7 +1304,11 @@ def follow_all(interval, lane=DEFAULT_LANE):
     follow_all's whole-fleet pass rather than follow()'s single-run one;
     `follow(<runid>, lane="convo")` mirrors that run's mailbox rows only and
     does not tail ingest -- a deliberate scope choice, not an oversight (see
-    PR description)."""
+    PR description). That ingest tail can be silenced on its own with
+    DISCORD_COMMS_CONVO_INGEST=0; the call below is still made every pass
+    (ingest_mirror.tail_once keeps its byte-offset cursor moving so
+    re-enabling does not replay the backlog) and mailbox-row mirroring is
+    unaffected by that knob."""
     rc = 0
     while True:
         url = _find_webhook_url(lane)

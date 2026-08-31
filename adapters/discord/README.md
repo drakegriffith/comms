@@ -147,6 +147,12 @@ share a cursor, a skipped-rows log, or a secret:
 | `convo` | `DISCORD_COMMS_CONVO_WEBHOOK_URL` | `discord-mirror-convo/` | unicasts + `comment`/`reply` that carry no `thread`, on arrival |
 | `board` | `DISCORD_COMMS_FORUM_WEBHOOK_URL` | `discord-mirror-board/` | rows carrying a `thread`, into one forum thread per document, **once that document's conversation is alive** (see below) |
 
+GitHub landings are NOT a lane of this table: `adapters/github/landings.py`
+is a separate poller with its own source (`gh api`, not the mailbox) and its
+own secret, `DISCORD_COMMS_LANDINGS_WEBHOOK_URL`, falling back to
+`DISCORD_COMMS_WEBHOOK_URL` -- the `all` lane's channel -- when that var is
+set nowhere. See `adapters/github/README.md`.
+
 Set up the convo lane's secret the same way as the default lane's (Setup
 step 2 above), just with the `_CONVO_` var name and, in Discord, a second
 webhook pointed at a second channel.
@@ -477,6 +483,7 @@ before anything else lands on top of it.
 | `COMMS_STATE_DIR` | `~/.comms/state` | cursor, poller lock, skipped-row records |
 | `COMMS_SECRETS_FILE` | `~/.secrets/comms.env` | where the webhook line(s) live |
 | `COMMS_MIRROR_INTERVAL` | `5` | `--follow`/`--follow-all` poll seconds |
+| `DISCORD_COMMS_CONVO_INGEST` | `1` | convo lane: `0` stops posting the `👁️ read N row(s)` ingestion events; the cursor still advances, so re-enabling replays nothing (see Ingestion events) |
 | `COMMS_THREAD_ALIVE_SECONDS` | `1800` | board lane: how close two seats' rows must be for a document's conversation to count as alive |
 | `COMMS_THREAD_ALIVE_SEATS` | `2` | board lane: how many distinct non-`status` seats a document needs before it renders |
 | `COMMS_THREAD_HOLD_MAX` | `500` | board lane: rows one document may hold un-posted; past it the oldest are dropped and recorded in the skipped log |
@@ -548,6 +555,20 @@ docstring for this scope choice). It also has its own standalone CLI:
 
     python3 adapters/discord/ingest_mirror.py --once
     python3 adapters/discord/ingest_mirror.py --follow [--interval N]
+
+**Turning it off:** `DISCORD_COMMS_CONVO_INGEST=0` (default `1`) stops the
+convo lane posting these `👁️ read N row(s)` lines. The ingest cursor keeps
+advancing while it is off, so re-enabling it posts what happens NEXT, never a
+replay of the backlog accumulated meanwhile. Mailbox-row mirroring in the
+convo lane is untouched by this knob -- unicasts and `comment`/`reply` rows
+post exactly as before.
+
+One hazard the general concurrency warning above does not cover: never run a
+DISABLED standalone pass (`DISCORD_COMMS_CONVO_INGEST=0 ingest_mirror.py
+--once`) while an ENABLED follower is live on the same state dir. The
+disabled pass advances the shared cursor without posting, so rows it read
+are delivered by neither process -- a silent drop, where two enabled pollers
+would at worst double-post.
 
 Same launchd safety as the row mirror: a missing `DISCORD_COMMS_CONVO_WEBHOOK_URL`
 warns once and backs off 60s under `--follow` instead of crash-looping; a
