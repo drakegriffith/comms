@@ -385,15 +385,41 @@ def seat_identities(runid, state_dir=None):
     sorted filename order and the FIRST occurrence of a seat wins. The
     winner is therefore deterministic, never arbitrary.
 
-    THE CONSEQUENCE, NAMED: when two agents share seat "alpha", a unicast to
-    "@alpha" fans out to BOTH (a duplication, not a drop -- both receive it),
-    and both agents' rows render under the first one's identity, so a human
-    reading the board sees one agent where there are two. That is accepted,
-    not fixed here: rejecting a duplicate seat in enroll() would kill session
-    start (enroll runs at SessionStart and returns a bool) and would make a
-    legitimate re-enroll after a crash -- same seat, new agent_id -- run
-    UNENROLLED, i.e. invisible, which is strictly worse. seat_collisions()
-    below is the detector that makes the condition visible instead.
+    THE CONSEQUENCE, NAMED -- AND IT DEPENDS ON WHICH READ PATH: when two
+    agents share seat "alpha", a unicast to "@alpha" reaches both on any
+    STATELESS read (read_for/read_siblings), and both agents' rows render
+    under the first one's identity, so a human reading the board sees one
+    agent where there are two.
+
+    That much is accepted, not fixed here: rejecting a duplicate seat in
+    enroll() would kill session start (enroll runs at SessionStart and
+    returns a bool) and would make a legitimate re-enroll after a crash --
+    same seat, new agent_id -- run UNENROLLED, i.e. invisible, which is
+    strictly worse. seat_collisions() below is the detector that makes the
+    condition visible instead. That ruling stands.
+
+    CORRECTION (this docstring used to say "a duplication, not a drop -- both
+    receive it"; that is FALSE and was already false when written). It holds
+    only where the cursor is keyed by agent_id. Two cursors exist:
+
+      * heartbeat injection -- <state>/swarm-cursor/<runid>/<agent_id>.
+        Keyed by AGENT_ID, so colliding seats keep INDEPENDENT positions and
+        both really do receive the row. Duplication, no drop.
+      * `comms read` delivery -- swarm_mailbox._read_cursor_path, i.e.
+        <state>/read-cursor/<runid>/<seat>.<view>.json. Keyed by SEAT ALONE,
+        with no agent_id in it. Two agents on one seat therefore SHARE one
+        cursor: whichever reads first calls advance() and the second gets
+        ZERO rows. That is a silent DROP, not a duplication.
+
+    The seat-keyed delivery cursor landed in d0f61f8 (#33) about two hours
+    before this docstring was written in 190c22e (#40 D5, #42), so the
+    "never a drop" claim never covered the whole system. Reproduced by
+    tests/test_swarm_arm.py::test_two_agents_on_one_seat_share_a_delivery_cursor.
+
+    NOT FIXED HERE, ON PURPOSE: re-keying that cursor to include agent_id is
+    a change to lib/swarm_mailbox.py's cursor path, which this seat does not
+    own -- it is a cross-seat dependency on the write path, not a swarm_arm
+    change. Recorded here so the next reader does not re-derive it.
     """
     pdir = _participants_dir(runid, state_dir)
     try:
@@ -558,7 +584,7 @@ def _usage():
         "       swarm_arm.py enroll <runid> [--agent-id <id>] [--topics <set>] [--seat <name>]\n"
         "                    [--model <name>] [--project <repo>] [--area <path>]\n"
         "       swarm_arm.py is-participant <runid> <agent_id>\n"
-        "       swarm_arm.py status [<runid>]\n"
+        "       swarm_arm.py status [<runid>]   (adds \"seat_collisions\" when two agents share a seat)\n"
     )
 
 
@@ -620,7 +646,21 @@ def main(argv):
         if pos:
             m = meta(pos[0])
             parts = sorted(os.listdir(_participants_dir(pos[0]))) if is_armed(pos[0]) else []
-            print(json.dumps({"runid": pos[0], "armed": is_armed(pos[0]), "meta": m, "participants": parts}))
+            out = {"runid": pos[0], "armed": is_armed(pos[0]), "meta": m, "participants": parts}
+            # Seat collisions are surfaced HERE, not only in the Discord mirror.
+            # Before this, seat_collisions() had exactly one consumer -- an
+            # optional adapter -- so on a board with no Discord webhook a
+            # duplicate seat was detectable in principle and invisible in
+            # practice. status is the one surface every operator already runs.
+            # ADDITIVE AND ABSENT WHEN CLEAN: the key appears only when the
+            # roster actually collides, so a clean run's JSON stays
+            # byte-identical to every previous version's and an older hub
+            # parsing this output sees no new field. Detection, not
+            # enforcement -- exit code is still 0, nothing is blocked.
+            collisions = seat_collisions(pos[0])
+            if collisions:
+                out["seat_collisions"] = collisions
+            print(json.dumps(out))
         else:
             print(json.dumps({"armed_runs": armed_runs()}))
         return 0

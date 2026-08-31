@@ -625,3 +625,136 @@ def test_add_topics_that_cannot_lock_does_not_write_at_all(capsys, monkeypatch):
     assert "add_topics" in err
     assert "no locks available" in err
     assert err.count("\n") == 1
+
+
+# ---- issue #42 revisited: the collision reproduced end to end --------------
+#
+# The tests above pin the DETECTOR. These pin the BUG the detector detects, on
+# the two delivery paths that behave differently -- because a test that cannot
+# reproduce the bug proves nothing about a fix for it.
+#
+# Both helpers below enroll two DISTINCT host identities (agent-a, agent-b) on
+# one seat name. That is the whole gap: the roster is keyed by the
+# host-assigned agent_id, so the two agents are two separate participant
+# files, but every mailbox surface is keyed by the free-text SEAT, which they
+# share.
+
+
+def _mailbox(tmp_path, monkeypatch):
+    """Load swarm_mailbox against the same isolated state dir as swarm_arm."""
+    import importlib.util
+
+    monkeypatch.setenv("COMMS_ROOT", str(tmp_path / "root"))
+    lib = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "swarm_mailbox_i42", os.path.join(lib, "swarm_mailbox.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _two_agents_one_seat(runid="r1"):
+    swarm_arm.arm(runid)
+    swarm_arm.enroll(runid, "agent-a", seat="alpha", model="Claude")
+    swarm_arm.enroll(runid, "agent-b", seat="alpha", model="Kimi")
+
+
+def test_two_agents_on_one_seat_are_two_roster_rows_but_one_identity():
+    """The identity mis-render, stated as a value: agent-b enrolled as Kimi and
+    renders as Claude, because sorted filename order resolves agent-a first.
+    Two participants, one identity."""
+    _two_agents_one_seat()
+    assert sorted(os.listdir(swarm_arm._participants_dir("r1"))) == [
+        "agent-a",
+        "agent-b",
+    ]
+    assert swarm_arm.seat_identities("r1") == {"alpha": {"model": "Claude"}}
+    assert swarm_arm.seat_collisions("r1") == {"alpha": ["agent-a", "agent-b"]}
+
+
+def test_unicast_to_a_colliding_seat_reaches_both_on_a_stateless_read(
+    tmp_path, monkeypatch
+):
+    """Path 1 -- no cursor. A unicast to "@alpha" is visible to the seat, and
+    both agents read that same seat, so both see it. This is the DUPLICATION
+    the original docstring named, and it is unchanged by this commit."""
+    mb = _mailbox(tmp_path, monkeypatch)
+    _two_agents_one_seat()
+    mb.init("r1")
+    mb.post("r1", "boss", "comment", "for alpha only", to="alpha")
+    rows = mb.read_for("r1", "alpha")
+    assert [r["text"] for r in rows] == ["for alpha only"]
+    # There is no per-agent filtering to apply: agent-a and agent-b issue the
+    # identical call, because the call takes a seat and they share one.
+    assert mb.read_for("r1", "alpha") == rows
+
+
+def test_two_agents_on_one_seat_share_a_delivery_cursor(tmp_path, monkeypatch):
+    """Path 2 -- the seat-keyed delivery cursor, and the reason this commit
+    corrects seat_identities' docstring. The read cursor is keyed on the SEAT
+    alone, so the two agents share one position: agent-a reads and advances,
+    and agent-b then gets NOTHING. A silent DROP, not a duplication.
+
+    This is a CROSS-SEAT dependency, not a bug fixed here: the cursor path
+    lives in swarm_mailbox, which this seat does not own. The test pins
+    today's behavior so the fix, when the mailbox owner makes it, has a
+    failing test already waiting for it."""
+    mb = _mailbox(tmp_path, monkeypatch)
+    _two_agents_one_seat()
+    mb.init("r1")
+    mb.post("r1", "boss", "comment", "for alpha only", to="alpha")
+
+    rows_a, advance_a = mb.read_delta("r1", "alpha", subs=True)
+    assert [r["text"] for r in rows_a] == ["for alpha only"]
+    advance_a()
+
+    rows_b, _ = mb.read_delta("r1", "alpha", subs=True)
+    assert rows_b == []  # THE DROP: agent-b never sees the row addressed to it
+
+    # The cursor filename is the proof of the cause: no agent_id in it.
+    view = "subs-" + mb.subscription_digest("r1", "alpha")
+    assert os.path.basename(mb._read_cursor_path("r1", "alpha", view)).startswith(
+        "alpha."
+    )
+
+
+# ---- the visibility this commit adds: status reports the collision ---------
+
+
+def test_status_reports_seat_collisions_when_the_roster_collides(capsys):
+    _two_agents_one_seat()
+    assert swarm_arm.main(["swarm_arm.py", "status", "r1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["seat_collisions"] == {"alpha": ["agent-a", "agent-b"]}
+
+
+def test_status_omits_the_collision_key_entirely_on_a_clean_roster(capsys):
+    """Absent, not empty. A clean run's status JSON stays byte-identical to
+    every previous version's, so an older hub parsing it sees no new field."""
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "agent-a", seat="alpha")
+    swarm_arm.enroll("r1", "agent-b", seat="beta")
+    assert swarm_arm.main(["swarm_arm.py", "status", "r1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "seat_collisions" not in payload
+
+
+def test_status_still_exits_0_on_a_collision_detection_not_enforcement(capsys):
+    """The ruling adjudicated: nothing is blocked. A colliding roster is
+    reported and the command still succeeds."""
+    _two_agents_one_seat()
+    assert swarm_arm.main(["swarm_arm.py", "status", "r1"]) == 0
+
+
+def test_a_seatless_participant_never_collides_external_seats_degrade_safely(capsys):
+    """An external seat (kimi, codex, a remote hub) that enrolls with no seat
+    -- and no Claude Code session id behind its agent_id -- is not a claimant
+    and never trips the report. Nothing here requires a host session id."""
+    swarm_arm.arm("r1")
+    swarm_arm.enroll("r1", "kimi-1")
+    swarm_arm.enroll("r1", "codex-1")
+    assert swarm_arm.main(["swarm_arm.py", "status", "r1"]) == 0
+    assert "seat_collisions" not in json.loads(capsys.readouterr().out)
