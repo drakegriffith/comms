@@ -37,6 +37,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_COMMS_CONVO_WEBHOOK_URL", raising=False)
     monkeypatch.setenv("COMMS_MACHINE_LABEL", "studio")
     monkeypatch.delenv("COMMS_AUDIENCE", raising=False)
+    monkeypatch.delenv("DISCORD_COMMS_CONVO_INGEST", raising=False)  # ambient off-switch never leaks in
     monkeypatch.setattr(mirror, "_PINNED_AUDIENCE", None)
     yield tmp_path
 
@@ -337,6 +338,81 @@ def test_tail_once_offset_persists_across_calls_no_repost(webhook):
     assert im.tail_once(url) == 0
     assert len(webhook.requests) == 2
     assert "row1" not in json.dumps(webhook.requests[1])
+
+
+# ---- DISCORD_COMMS_CONVO_INGEST off-switch ---------------------------------
+
+
+def test_ingest_enabled_only_literal_zero_disables(monkeypatch):
+    monkeypatch.delenv(im.ENABLE_VAR, raising=False)
+    assert im.ingest_enabled() is True
+    monkeypatch.setenv(im.ENABLE_VAR, "1")
+    assert im.ingest_enabled() is True
+    monkeypatch.setenv(im.ENABLE_VAR, "false")  # not "0": still enabled
+    assert im.ingest_enabled() is True
+    monkeypatch.setenv(im.ENABLE_VAR, "0")
+    assert im.ingest_enabled() is False
+
+
+def test_tail_once_disabled_advances_cursor_and_posts_nothing(webhook, monkeypatch):
+    monkeypatch.setenv(im.ENABLE_VAR, "0")
+    _enroll("agentA", "alpha", topics=[])
+    swarm_mailbox.post(RUNID, "beta", "finding", "row1", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    before = im._load_offset()
+    url = os.environ["DISCORD_COMMS_CONVO_WEBHOOK_URL"]
+    assert im.tail_once(url) == 0
+    assert webhook.requests == []                 # nothing reached Discord
+    assert im._load_offset() > before             # cursor still advanced
+    assert im._load_offset() == os.path.getsize(im._log_path())
+
+
+def test_tail_once_posts_when_knob_unset_or_one(webhook, monkeypatch):
+    # regression guard: the default path is exactly what it was before.
+    monkeypatch.delenv(im.ENABLE_VAR, raising=False)
+    _enroll("agentA", "alpha", topics=[])
+    swarm_mailbox.post(RUNID, "beta", "finding", "row1", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    url = os.environ["DISCORD_COMMS_CONVO_WEBHOOK_URL"]
+    assert im.tail_once(url) == 0
+    assert len(webhook.requests) == 1
+    monkeypatch.setenv(im.ENABLE_VAR, "1")
+    swarm_mailbox.post(RUNID, "gamma", "finding", "row2", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    assert im.tail_once(url) == 0
+    assert len(webhook.requests) == 2
+
+
+def test_tail_once_re_enable_does_not_flood_with_the_disabled_backlog(webhook, monkeypatch):
+    _enroll("agentA", "alpha", topics=[])
+    # Three beats logged while the switch is off: all skipped, none posted.
+    for i in range(3):
+        swarm_mailbox.post(RUNID, "beta", "finding", "old%d" % i, topic="default")
+        _log_event("agentA", RUNID, delta_emitted=1)
+    monkeypatch.setenv(im.ENABLE_VAR, "0")
+    url = os.environ["DISCORD_COMMS_CONVO_WEBHOOK_URL"]
+    assert im.tail_once(url) == 0
+    assert webhook.requests == []
+    # Re-enabled, then ONE new beat appended: exactly one post, for that beat
+    # only -- the three-beat backlog is never replayed.
+    monkeypatch.setenv(im.ENABLE_VAR, "1")
+    swarm_mailbox.post(RUNID, "gamma", "finding", "fresh", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    assert im.tail_once(url) == 0
+    assert len(webhook.requests) == 1
+
+
+def test_tail_once_disabled_makes_no_webhook_call_at_all(monkeypatch):
+    # Stronger than counting requests: post_content is never reached.
+    monkeypatch.setenv(im.ENABLE_VAR, "0")
+    calls = []
+    monkeypatch.setattr(mirror, "post_content",
+                        lambda *a, **k: calls.append(a) or True)
+    _enroll("agentA", "alpha", topics=[])
+    swarm_mailbox.post(RUNID, "beta", "finding", "row1", topic="default")
+    _log_event("agentA", RUNID, delta_emitted=1)
+    assert im.tail_once("http://127.0.0.1:1/never") == 0
+    assert calls == []
 
 
 # ---- CLI ---------------------------------------------------------------

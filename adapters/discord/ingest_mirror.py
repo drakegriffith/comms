@@ -70,6 +70,13 @@ once per pass, in the same process (see mirror.py's follow_all docstring,
 INGEST WIRE-UP) -- no second launchd job. This module also has its own
 --once/--follow CLI for a standalone run or direct testing.
 
+OFF-SWITCH: DISCORD_COMMS_CONVO_INGEST=0 silences this module's posts
+without silencing mirror.py's mailbox-row mirroring on the same lane. The
+gate sits inside tail_once, downstream of the tail and the cursor write, so
+BOTH entry points (follow_all's per-pass call and this module's own CLI)
+honour it identically and the cursor keeps advancing while it is off -- see
+tail_once for why that matters.
+
 CLI:
   ingest_mirror.py --once
   ingest_mirror.py --follow [--interval N]
@@ -93,6 +100,11 @@ import mirror  # noqa: E402  (post_content, build_author, machine_label, lane st
 
 LANE = "convo"
 
+# Off-switch for this module's telemetry posts. Only the literal "0"
+# disables; anything else (including unset) leaves it on -- same
+# read-the-env idiom as COMMS_MIRROR_INTERVAL below.
+ENABLE_VAR = "DISCORD_COMMS_CONVO_INGEST"
+
 # Must match adapters/claude-code/swarm-heartbeat.sh's CAP -- the per-beat
 # delivery truncation this module replays when reconstructing sender seats.
 CAP = 10
@@ -106,6 +118,11 @@ _NO_SEAT_PLACEHOLDER = "ingest-mirror-no-seat"
 
 CURSOR_NAME = "heartbeat-ingest.cursor"      # byte offset into the log
 ATTRIB_NAME = "heartbeat-ingest.attrib.json"  # per (runid, agent_id) replay watermark
+
+
+def ingest_enabled():
+    """False only when DISCORD_COMMS_CONVO_INGEST is exactly "0"."""
+    return os.environ.get(ENABLE_VAR, "1") != "0"
 
 
 def _state_dir():
@@ -283,9 +300,25 @@ def process_events(events):
 def tail_once(url):
     """One pass: read whatever is new in the heartbeat log, post one message
     per delivery event to the convo webhook, then advance the byte-offset
-    cursor. Returns 0 all delivered (or nothing new) / 1 some post failed."""
+    cursor. Returns 0 all delivered (or nothing new) / 1 some post failed.
+
+    OFF-SWITCH (DISCORD_COMMS_CONVO_INGEST=0): count-but-skip, the repo's
+    existing idiom -- the log is STILL tailed and the byte-offset cursor is
+    STILL advanced, only the posting is suppressed. The cursor must keep
+    moving: swarm-heartbeat.log grows ~24 MB/day, so a frozen cursor would
+    make re-enabling flood the convo channel with the entire backlog;
+    advancing it silently means re-enable resumes from now. The accepted
+    cost (decided by Drake 2026-08-31) is that while disabled the skipped
+    telemetry rows are dropped with no witness beyond the cursor advance --
+    nothing records what was passed over. The attribution watermark
+    (heartbeat-ingest.attrib.json) is likewise not advanced while disabled,
+    so the first post after re-enabling may reconstruct rows older than that
+    beat; that mismatch is named on stderr by process_events, not hidden."""
     events, new_offset = read_new_events()
     if not events:
+        return 0
+    if not ingest_enabled():
+        _save_offset(new_offset)
         return 0
     posts = process_events(events)
     rc = 0
