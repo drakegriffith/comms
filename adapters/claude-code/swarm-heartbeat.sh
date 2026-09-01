@@ -75,16 +75,26 @@
 #   header in tool_input.command is resolved against the payload cwd; Delete
 #   File is ignored because nobody is editing a deleted document.
 #
-#   A write-shaped Bash beat (heredoc, redirect-shaped `>`/`>>` excluding fd
-#   redirects, sed -i, tee, mv, cp, git apply or patch) asks git status for
-#   changed paths, bounded to two seconds, then accepts only paths whose
-#   BASENAME occurs in the command. Read-shaped Bash never spawns git. Dropping
-#   the bare `>` marker avoids git work caused by a decorative marker in 34.6%
-#   of 6,549 measured Bash calls (PreToolUse recorder, 2026-08-25). The dirty
-#   path scan itself has no cap; the basename gate bounds enrol count by command
-#   text, not by tree size. The basename gate is attribution, not discovery: if
-#   one week of measurement shows it rejects most true writes, fall back to
-#   enrol-only for every git-found path.
+#   A Bash beat is PARSED, not inferred (rewritten 2026-08-31, panel
+#   2026-08-31-4514-board-integrity). The command is tokenized with shell
+#   quoting rules and heredoc bodies removed, and the announced paths are the
+#   ones the command itself names as write targets: redirect targets and the
+#   operands of tee/touch/cp/mv/install/ln/rsync/sed -i/perl -i/dd of=. Each is
+#   resolved against the payload cwd (moved by a literal `cd`) and must EXIST as
+#   a regular file. It spawns no process at all -- the `git status` call and its
+#   two-second timeout are gone.
+#
+#   The rule this replaced -- "announce every dirty path whose basename occurs
+#   anywhere in the command" -- announced files the seat never opened. The
+#   nastiest instance: a `git commit -F - <<'MSG'` whose COMMIT MESSAGE
+#   mentioned a filename, in a tree several sessions were writing, announced two
+#   peer-owned paths (2026-08-31T22:48:09Z). Command text is not a write, a
+#   basename is not a path, and another session's dirt is not this seat's work.
+#   _bash_write_targets carries the full history and, more importantly, the list
+#   of writes this parser still cannot see (git apply, patch, whatever a program
+#   writes on its own, anything built by expansion). Every one of those is
+#   SILENCE, never a guess: a board row is read as authorship, so a wrong row
+#   costs more than a missing one.
 #
 #   Every entry path keeps the same four load-bearing properties:
 #   it never enrols non-participants, never narrows subscribe-all, never blocks
@@ -279,7 +289,6 @@ import datetime
 import json
 import os
 import re
-import subprocess
 import sys
 
 lib_dir = os.environ.get("HB_SWARM_LIB") or ""
@@ -789,10 +798,22 @@ def _auto_claim(runid, key):
 
 
 def _enrol_paths(paths):
-    """Feed every discovered path through the one enrol + claim pipeline."""
+    """Feed every discovered path through the one enrol + claim pipeline.
+
+    THE ABSOLUTE-PATH GUARD IS LOAD-BEARING, not belt-and-braces.
+    swarm_mailbox.thread_key RAISES ValueError on a relative path rather than
+    resolving it against the hook process's cwd (04ff12a) -- the right call,
+    and it makes a relative path a live failure mode on a hook that runs after
+    EVERY tool call of every session. The outer wrapper would catch the raise,
+    but it would also abandon the REST of this beat's paths and print a line
+    into every terminal. One choke point, before the call, so no future leg can
+    reintroduce it: a relative path is dropped here, silently, like every other
+    path this hook cannot vouch for."""
     import swarm_mailbox
 
     for file_path in paths:
+        if not os.path.isabs(file_path):
+            continue
         key = swarm_mailbox.thread_key(file_path)
         if not key:
             continue  # outside any repo -- no thread, never a fabricated key
@@ -808,42 +829,346 @@ def _enrol_paths(paths):
                 _auto_claim(runid, key)
 
 
-def _bash_changed_paths(command, cwd):
-    write_markers = ("<<", "sed -i", "tee ", "mv ", "cp ", "git apply", "patch ")
-    redirect = re.compile(r"(?:^|[^0-9&<>=!-])>>?\s*(?![&=])")
-    if not any(marker in command for marker in write_markers) and not redirect.search(command):
-        return []  # fast path: a read-shaped command must not spawn git
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            cwd=cwd, check=False, capture_output=True, timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        sys.stderr.write("swarm-heartbeat: doc-enrol git status failed: %s\n" % exc)
-        return []
-    if result.returncode == 128:
-        return []  # documented outside-any-repo case, not a hook failure
-    if result.returncode != 0:
-        sys.stderr.write(
-            "swarm-heartbeat: doc-enrol git status failed: exit %s\n"
-            % result.returncode
-        )
-        return []
+# ---- BASH WRITE TARGETS ---------------------------------------------------
+# A Bash beat carries no file_path, so this leg has to derive one from the
+# command. It derives it from what the command SAYS IT WRITES -- redirect
+# targets and the operands of a short list of write verbs -- and never from
+# what happens to be dirty in the tree.
+#
+# WHAT THIS REPLACED, AND WHY (panel 2026-08-31-4514-board-integrity).
+# The rule used to be: run `git status` in the payload cwd, then announce every
+# dirty path whose BASENAME occurred anywhere in the command string. Four
+# separate ways that lied, each now a red-before-green case in
+# tests/test_heartbeat_bash_targets.sh:
+#   * PROSE IS NOT A WRITE. `git commit -F - <<'MSG' ... MSG` announced the
+#     paths its COMMIT MESSAGE mentioned. On 2026-08-31T22:48:09Z one seat
+#     announced two files it never opened; its actual write set was six files
+#     in a different checkout.
+#   * SUBSTRING CONTAINMENT. "hook_health.py" is a substring of
+#     "test_hook_health.py", so ONE prose mention announced TWO files.
+#   * SHARED-TREE ATTRIBUTION. The dirty set of a tree several sessions write
+#     to is not this seat's work. Six seats across four sessions announced one
+#     peer's dirty file that day.
+#   * CWD DOUBLING. `git status --porcelain` prints REPO-ROOT-relative paths;
+#     joining them onto a payload cwd BELOW the root fabricated
+#     <cwd>/<repo-rel>, and thread_key minted a key for the phantom.
+# Deleting the git call also removes the only subprocess this leg ever spawned,
+# so a write-shaped Bash beat now costs a string scan instead of a process --
+# the 2-second timeout and its failure branches went with it.
+#
+# WHAT IT STILL MISSES, said plainly. A target this parser cannot see is not
+# announced. Silence is the designed answer; a confident wrong row is not:
+#   * `git apply`, `patch`, `git checkout|restore|stash pop|merge`: the written
+#     paths live inside a diff or an object, never on the command line.
+#   * whatever a program writes on its own (`python build.py`, `make`, `npm i`).
+#   * targets built by expansion -- $VAR, $(...), globs. An unexpandable word is
+#     dropped, not guessed at.
+#   * a command nested inside a quoted string: `bash -c "printf x > f"` is one
+#     word to this parser, and one level of parsing is where it stops.
+#   * `cd` is tracked textually and leaks out of `( ... )` and `if` bodies, so
+#     the base directory can be wrong; the existence check is what stops a wrong
+#     base from producing a row.
+#   * a command longer than _MAX_COMMAND. The lexer costs about half a
+#     microsecond per character of CODE (heredoc bodies are skipped whole, not
+#     lexed), so a 128 KiB command is ~60ms on a hook that runs after EVERY tool
+#     call. Above the cap this leg says nothing rather than spend the beat.
+#     Truncating instead was discarded and must not be reintroduced: a cut that
+#     lands inside a heredoc opener turns the body back into code, which is
+#     precisely the prose-as-write bug this rewrite removed.
+# claim-guard's _cg_bash_targets (~/.claude/hooks/lib/claim_guard_core.sh:435)
+# makes the same trade with the same shape of gap -- it extracts nothing from
+# `claim.sh --release`. This is a verb list, and a verb list is always partial.
 
-    fields = result.stdout.decode("utf-8", "surrogateescape").split("\0")
-    paths = []
+_ARG_VERBS = ("tee", "touch")                       # every operand is a target
+_DEST_VERBS = ("cp", "mv", "install", "ln", "rsync")  # the LAST operand is
+_INPLACE_VERBS = ("sed", "perl", "ruby")            # ...only with -i
+_WRITE_VERBS = _ARG_VERBS + _DEST_VERBS + _INPLACE_VERBS + ("dd",)
+# Cheap pre-filter: derived FROM the verb list so it cannot drift out of sync.
+# A command with no ">" and no write verb cannot yield a target, and skipping
+# the tokenizer keeps a read-shaped beat as close to free as it was.
+_SHAPE_RE = re.compile(
+    r">|(?<![\w./-])(?:%s)(?![\w-])" % "|".join(sorted(_WRITE_VERBS))
+)
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Words that introduce a command without being one.
+_CMD_PREFIXES = ("env", "sudo", "doas", "command", "nohup", "time", "exec",
+                 "builtin", "stdbuf", "xargs")
+_SHELL_WORDS = ("{", "}", "!", "then", "else", "elif", "fi", "do", "done",
+                "in", "esac")
+_WRITE_OPS = (">", ">>", ">|", "&>", "&>>")
+# Operators whose operand is a source or a file descriptor, never a target.
+_SKIP_OPS = ("<", "<<<", "<&", ">&", "<>")
+# Longest first: ">>" must win over ">", "<<<" over "<<" over "<".
+_OPS = ("&>>", "<<<", "<<-", "&>", ">>", ">|", ">&", "<&", "<>", "<<",
+        "||", "|&", "&&", ";;", ">", "<", "|", "&", ";", "(", ")", "\n")
+_MAX_TARGETS = 16
+_MAX_COMMAND = 128 * 1024
+
+
+def _match_op(text, i):
+    for op in _OPS:
+        if text.startswith(op, i):
+            return op
+    return None
+
+
+def _skip_heredoc_body(text, i, delim, strip_tabs):
+    """Consume the body that follows a `<<DELIM`, returning the index just past
+    the terminator line. An unterminated heredoc eats the rest of the command,
+    which is what the shell does too."""
+    n = len(text)
+    while i < n:
+        end = text.find("\n", i)
+        line = text[i:] if end < 0 else text[i:end]
+        i = n if end < 0 else end + 1
+        if (line.lstrip("\t") if strip_tabs else line) == delim:
+            return i
+    return n
+
+
+def _lex(command):
+    """Split a shell command into (kind, value, unsafe) tokens.
+
+    kind is "word", "write", "skip" or "sep". `unsafe` marks a word that the
+    shell would still have expanded ($, backtick, glob), which makes it
+    unresolvable here.
+
+    HEREDOC BODIES ARE CONSUMED HERE, where quoting is known: `<<` inside
+    quotes is a literal, and the body of a real heredoc is data the shell
+    hands to a program -- a commit message, a file being catted -- never text
+    the shell reads for filenames. That distinction is the whole DEF-1 fix, so
+    it belongs in the one place that can tell the two apart.
+    """
+    tokens = []
+    pending = []          # heredoc delimiters still owed a body
+    want_delim = None     # set to strip_tabs when the next word is a delimiter
+    cur = []
+    have = False
+    unsafe = False
     i = 0
-    while i < len(fields) and fields[i]:
-        entry = fields[i]
-        i += 1
-        if len(entry) < 4:
+    n = len(command)
+
+    def flush():
+        nonlocal cur, have, unsafe, want_delim
+        if not have:
+            return
+        value = "".join(cur)
+        cur = []
+        have = False
+        was_unsafe = unsafe
+        unsafe = False
+        if want_delim is not None:
+            pending.append((value, want_delim))
+            want_delim = None
+            return
+        tokens.append(("word", value, was_unsafe))
+
+    while i < n:
+        c = command[i]
+        if c == "\\":
+            if i + 1 < n and command[i + 1] != "\n":
+                cur.append(command[i + 1])
+                have = True
+            i += 2
             continue
-        status, relpath = entry[:2], entry[3:]
-        if "R" in status or "C" in status:
-            i += 1  # porcelain -z follows the destination with the source
-        if os.path.basename(relpath) in command:
-            paths.append(os.path.join(cwd, relpath))
-    return paths
+        if c == "'":
+            j = command.find("'", i + 1)
+            if j < 0:
+                cur.append(command[i + 1:])
+                have = True
+                i = n
+                continue
+            cur.append(command[i + 1:j])
+            have = True
+            i = j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n:
+                ch = command[i]
+                if ch == "\\" and i + 1 < n:
+                    cur.append(command[i + 1])
+                    i += 2
+                    continue
+                if ch == '"':
+                    i += 1
+                    break
+                if ch in "$`":
+                    unsafe = True
+                cur.append(ch)
+                i += 1
+            have = True
+            continue
+        if c in " \t":
+            flush()
+            i += 1
+            continue
+        op = _match_op(command, i)
+        if op is not None:
+            flush()
+            i += len(op)
+            if op in ("<<", "<<-"):
+                want_delim = (op == "<<-")   # the next word is the delimiter
+                continue
+            if op == "\n":
+                while pending:
+                    delim, strip_tabs = pending.pop(0)
+                    i = _skip_heredoc_body(command, i, delim, strip_tabs)
+                tokens.append(("sep", op, False))
+                continue
+            if op in _WRITE_OPS:
+                tokens.append(("write", op, False))
+            elif op in _SKIP_OPS:
+                tokens.append(("skip", op, False))
+            else:
+                tokens.append(("sep", op, False))
+            continue
+        if c in "$`*?":
+            unsafe = True
+        cur.append(c)
+        have = True
+        i += 1
+    flush()
+    return tokens
+
+
+def _resolve(raw, unsafe, base):
+    """An announceable absolute path, or None. Existence is REQUIRED: it is the
+    one test that catches a target resolved against the wrong base directory,
+    and it drops the parser's own noise (a sed script, an `install -m` mode)
+    without a second rule."""
+    if unsafe or not raw or raw.startswith("-"):
+        return None
+    try:
+        path = os.path.expanduser(raw) if raw.startswith("~") else raw
+        if not os.path.isabs(path):
+            path = os.path.join(base, path)
+        path = os.path.normpath(path)
+        if not os.path.isfile(path):
+            return None
+    except (OSError, ValueError):
+        return None  # an embedded NUL or an over-long name is not a target,
+                     # and must not cost the OTHER paths on this beat
+    return path
+
+
+def _add(out, raw, unsafe, base):
+    path = _resolve(raw, unsafe, base)
+    if path and path not in out and len(out) < _MAX_TARGETS:
+        out.append(path)
+
+
+def _has_inplace_flag(flags):
+    for flag in flags:
+        if flag == "--in-place" or flag.startswith("--in-place="):
+            return True
+        if flag.startswith("--") or not flag.startswith("-"):
+            continue
+        if "i" in flag[1:].split("=")[0].split(".")[0]:
+            return True   # -i, -i.bak, -pi
+    return False
+
+
+def _segment_targets(items, base, out):
+    """Read one simple command. Appends its write targets to `out` and returns
+    the base directory the NEXT segment runs in (a literal `cd` moves it)."""
+    words = []
+    i = 0
+    while i < len(items):
+        kind, value, unsafe = items[i]
+        nxt = items[i + 1] if i + 1 < len(items) else None
+        if kind == "write":
+            if nxt is not None and nxt[0] == "word":
+                _add(out, nxt[1], nxt[2], base)
+                i += 2
+                continue
+        elif kind == "skip":
+            if nxt is not None and nxt[0] == "word":
+                i += 2
+                continue
+        else:
+            words.append((value, unsafe))
+        i += 1
+
+    while words and (_ASSIGN_RE.match(words[0][0])
+                     or words[0][0] in _SHELL_WORDS
+                     or os.path.basename(words[0][0]) in _CMD_PREFIXES):
+        words.pop(0)
+    if not words:
+        return base
+    verb = os.path.basename(words[0][0])
+    args = words[1:]
+    operands = [a for a in args if not a[0].startswith("-")]
+
+    if verb in ("cd", "pushd"):
+        if len(operands) == 1:
+            moved = _resolve_dir(operands[0][0], operands[0][1], base)
+            if moved:
+                return moved
+        return base
+    if verb in _ARG_VERBS:
+        for value, unsafe in operands:
+            _add(out, value, unsafe, base)
+    elif verb in _DEST_VERBS:
+        if len(operands) >= 2:
+            dest, dest_unsafe = operands[-1]
+            dest_dir = _resolve_dir(dest, dest_unsafe, base)
+            if dest_dir:
+                # `cp a b dir/` writes dir/a and dir/b, not dir.
+                for value, unsafe in operands[:-1]:
+                    _add(out, os.path.join(dest_dir, os.path.basename(value)),
+                         unsafe, base)
+            else:
+                _add(out, dest, dest_unsafe, base)
+    elif verb in _INPLACE_VERBS:
+        flags = [a[0] for a in args if a[0].startswith("-")]
+        if _has_inplace_flag(flags):
+            rest = operands
+            has_script_flag = any(
+                f.startswith("-e") or f.startswith("-f")
+                or f in ("--expression", "--file") for f in flags
+            )
+            if rest and not has_script_flag:
+                rest = rest[1:]   # the first operand is the script, not a file
+            for value, unsafe in rest:
+                _add(out, value, unsafe, base)
+    elif verb == "dd":
+        for value, unsafe in args:
+            if value.startswith("of="):
+                _add(out, value[3:], unsafe, base)
+    return base
+
+
+def _resolve_dir(raw, unsafe, base):
+    if unsafe or not raw or raw.startswith("-"):
+        return None
+    try:
+        path = os.path.expanduser(raw) if raw.startswith("~") else raw
+        if not os.path.isabs(path):
+            path = os.path.join(base, path)
+        path = os.path.normpath(path)
+        return path if os.path.isdir(path) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _bash_write_targets(command, cwd):
+    """ABSOLUTE paths this command says it writes. Absolute because thread_key
+    refuses a relative path by contract (lib/swarm_mailbox.py) -- the base
+    belongs to the caller that knows it, which is this function."""
+    if len(command) > _MAX_COMMAND or not _SHAPE_RE.search(command):
+        return []
+    out = []
+    base = cwd
+    segment = []
+    for token in _lex(command):
+        if token[0] == "sep":
+            base = _segment_targets(segment, base, out)
+            segment = []
+        else:
+            segment.append(token)
+    _segment_targets(segment, base, out)
+    return out
 
 
 def doc_enrol():
@@ -851,23 +1176,36 @@ def doc_enrol():
     if not isinstance(tool_input, dict):
         return
     tool_name = payload.get("tool_name")
+    cwd = payload.get("cwd")
+    # A base directory that is not itself absolute cannot make anything
+    # absolute. Treat it as absent rather than joining onto it.
+    if not (isinstance(cwd, str) and os.path.isabs(cwd)):
+        cwd = None
     paths = []
     if tool_name in FILE_TOOLS:
         file_path = tool_input.get("file_path")
         # Keep the established Write/Edit behavior: only a non-empty string.
         if isinstance(file_path, str) and file_path:
-            paths = [file_path]
+            # Runtimes send an absolute file_path, but thread_key REFUSES a
+            # relative one rather than resolving it against the hook process's
+            # cwd (lib/swarm_mailbox.py), so the base is joined here, by the
+            # one caller that knows it. No payload cwd and a relative path =>
+            # no base, and this leg says nothing.
+            if os.path.isabs(file_path):
+                paths = [file_path]
+            elif cwd:
+                paths = [os.path.normpath(os.path.join(cwd, file_path))]
     elif tool_name == "apply_patch":
         command = tool_input.get("command")
-        cwd = payload.get("cwd")
-        if isinstance(command, str) and isinstance(cwd, str):
+        if isinstance(command, str) and cwd:
             for relpath in re.findall(r"^\*\*\* (?:Add|Update) File: (.+)$", command, re.M):
-                paths.append(relpath if os.path.isabs(relpath) else os.path.join(cwd, relpath))
+                paths.append(os.path.normpath(
+                    relpath if os.path.isabs(relpath)
+                    else os.path.join(cwd, relpath)))
     elif tool_name == "Bash":
         command = tool_input.get("command")
-        cwd = payload.get("cwd")
-        if isinstance(command, str) and isinstance(cwd, str):
-            paths = _bash_changed_paths(command, cwd)
+        if isinstance(command, str) and cwd:
+            paths = _bash_write_targets(command, cwd)
     if paths:
         # Import/thread-key failures cost this leg only via the outer wrapper.
         _enrol_paths(paths)
